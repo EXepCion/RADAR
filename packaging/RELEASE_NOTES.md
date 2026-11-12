@@ -1,5 +1,23 @@
 RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID.
 
+**New in 1.0.6** (connecting the dots across accounts)
+
+- Known attacker addresses: what any check proves about an address (a stolen session, a phishing proxy, a
+  password that worked, a reported MFA prompt ...) is remembered for 7 days and counts in every check, for every
+  account. Other accounts tried from such an address raise an alert of their own.
+- Wave of unusual sign-ins: several accounts with an odd sign-in at the same time from one new network or one
+  never-seen client - each alone too little to report.
+- Attack chains now also run across accounts (same attacker address, or a suspected account acting on another),
+  look back 30 days, follow slow attacks between strong steps, and can be completed in hindsight by a finding that
+  was only logged. A reported MFA prompt is a chain step.
+- New window *Incidents*: alerts that belong together as one incident with a timeline; its open reminders can be
+  dismissed together.
+- An alert's details say which incident it belongs to and lead there. Open windows now follow every change: the
+  details of an alert, the incidents and the alert history update themselves after each scan.
+- Windows open at once also while a scan is running (before, a details window could take many seconds).
+- Alert details use their space better: the story, the details and the risk assessment stand side by side when
+  there is room. The right-click menu is drawn in the app's own look.
+
 **New in 1.0.5**
 
 - The address behind a reported MFA prompt is remembered for 7 days: every sign-in from it, to any account, is rated

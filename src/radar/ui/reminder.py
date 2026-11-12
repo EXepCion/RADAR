@@ -413,5 +413,18 @@ class ReminderWindow:
             on_snooze=lambda a: (self.app.alerts.snooze([a.id], self._snooze_minutes()), self._after_change()),
             snooze_label=self.snooze_var.get())
 
+    def refresh_details(self) -> int:
+        """Bring every open alert details window up to date with the stored alert (after a scan, a dismissal ...).
+        Returns how many were redrawn; a window whose alert did not change is not touched."""
+        redrawn = 0
+        for alert_id, win in list(self._details.items()):
+            if not win.exists():
+                del self._details[alert_id]
+                continue
+            fresh = self.app.alerts.get(alert_id)
+            if fresh is not None and win.update_alert(fresh):
+                redrawn += 1
+        return redrawn
+
     def _snooze_minutes(self) -> int:
         return dict(SNOOZE_CHOICES).get(self.snooze_var.get(), 15)

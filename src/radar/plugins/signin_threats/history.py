@@ -1,12 +1,13 @@
 """Local sign-in history (SQLite) used for baselines, windowed detections and risk scoring."""
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from . import netintel
 from .models import AccountChange, SignIn
@@ -89,6 +90,17 @@ CREATE TABLE IF NOT EXISTS changes (
     data     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_changes_ts ON changes(ts);
+-- Addresses an attacker demonstrably used (see indicators.py); additive, no schema bump needed
+CREATE TABLE IF NOT EXISTS indicators (
+    kind     TEXT NOT NULL,
+    value    TEXT NOT NULL,
+    source   TEXT NOT NULL,
+    user_id  TEXT NOT NULL,
+    ts       REAL NOT NULL,
+    expires  REAL NOT NULL,
+    data     TEXT NOT NULL,
+    PRIMARY KEY (kind, value, source, user_id)
+);
 -- Activity record: when each person's device was active from which address, kept for the whole retention time.
 -- One row per run of sign-ins (same person, device and address, no pause longer than ACTIVITY_GAP), built from ALL
 -- successful sign-ins while they are stored - the background sign-ins themselves are purged after a few hours.
@@ -299,6 +311,36 @@ class SignInHistory:
         sql = "SELECT data FROM changes WHERE ts>=? AND ts<=?" + (" AND user_id=?" if user_id else "") + " ORDER BY ts"
         params = (start.timestamp(), end.timestamp()) + ((user_id,) if user_id else ())
         return [AccountChange.from_json(r[0]) for r in self._conn.execute(sql, params)]
+
+    def add_indicators(self, indicators: Sequence[Any]) -> None:
+        """Remember attacker addresses (the same address from the same finding again: the later time counts)."""
+        self._conn.executemany(
+            "INSERT INTO indicators(kind, value, source, user_id, ts, expires, data) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(kind, value, source, user_id) DO UPDATE SET ts=excluded.ts, expires=excluded.expires, "
+            "data=excluded.data WHERE excluded.ts>=indicators.ts",
+            [(i.kind, i.value, i.source, i.user_id, i.when.timestamp(), i.expires.timestamp(), i.to_json()) for i in indicators])
+        self._conn.commit()
+
+    def indicators(self, now: datetime) -> list[Any]:
+        from .indicators import Indicator
+
+        return [Indicator.from_json(r[0]) for r in self._conn.execute(
+            "SELECT data FROM indicators WHERE expires>? AND ts<=? ORDER BY ts", (now.timestamp(), now.timestamp()))]
+
+    def purge_indicators(self, now: datetime) -> None:
+        self._conn.execute("DELETE FROM indicators WHERE expires<=?", (now.timestamp(),))
+        self._conn.commit()
+
+    def user_agent_seen(self, user_agent: str, before: datetime) -> bool:
+        """Was this exact user agent used by anybody before ``before``? (Only asked for the few candidates of a wave.)"""
+        needle = '"user_agent": ' + json.dumps(user_agent)
+        return self._conn.execute("SELECT 1 FROM signins WHERE ts<? AND instr(data, ?)>0 LIMIT 1",
+                                  (before.timestamp(), needle)).fetchone() is not None
+
+    def ip_regular_users(self, ip: str, before: datetime) -> int:
+        """How many accounts already signed in successfully from this address before ``before``."""
+        return self._conn.execute("SELECT COUNT(DISTINCT user_id) FROM profile WHERE kind='ip' AND value=? AND first_ts<?",
+                                  (ip, before.timestamp())).fetchone()[0]
 
     def incomplete(self, since: datetime, limit: int = 10) -> list[SignIn]:
         """Recent rows that look like Entra's preliminary record (user known, UPN not filled in yet)."""

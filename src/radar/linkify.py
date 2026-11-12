@@ -174,10 +174,11 @@ ACTIONS: dict[str, list[tuple[str, str]]] = {
     "tenant": [("Which organisation is this tenant?", "tenant"), ("Cross-tenant access settings (Entra)", "xtenant")],
     "partner": [("Cross-tenant access settings (Entra)", "xtenant")],
     "alert": [("Open this alert", "open_alert")],
+    "incident": [("Show this incident", "open_incident")],
     "guid": [("Find this ID in Entra", "find_id")],
     "id": [],
 }
-IN_APP_ACTIONS = {"view_signin", "view_audit", "view_correlation", "open_alert"}
+IN_APP_ACTIONS = {"view_signin", "view_audit", "view_correlation", "open_alert", "open_incident"}
 #: what a directory lookup of an unknown ID opens, by the kind of object found
 PRIMARY_ACTION = {"user": "user", "app": "app", "group": "group", "device": "device", "policy": "policy",
                   "tenant": "tenant", "role": "role_docs", "application": "app_registration"}

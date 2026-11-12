@@ -171,24 +171,19 @@ class LinkHandler:
         items = [(label, lambda a=action: self.run(entity, a, row)) for label, action in linkify.actions(entity)]
         return items + [(f"Copy  {entity.short}", lambda: self.copy(entity.value))]
 
-    def popup(self, event: tk.Event, groups: list[tuple[str, list[tuple[str, Callable[[], None]]]]]) -> tk.Menu | None:
-        """Context menu of (title, items) groups; a title is shown greyed out when there are several groups."""
+    def popup(self, event: tk.Event, groups: list[tuple[str, list[tuple[str, Callable[[], None]]]]]) -> "ContextMenu | None":
+        """Context menu of (title, items) groups; a title is shown when there are several groups. Drawn in the
+        app's own look (ui/menu.py), not as the classic Windows menu Tk would show."""
+        from .menu import ContextMenu
+
         groups = [(t, items) for t, items in groups if items]
         if not groups:
             return None
-        menu = tk.Menu(self.widget, tearoff=False)
-        for i, (title, items) in enumerate(groups):
-            if i:
-                menu.add_separator()
-            if title and len(groups) > 1:
-                menu.add_command(label=title, state="disabled")
-            for label, fn in items:
-                menu.add_command(label=label, command=fn)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-        return menu
+        previous = getattr(self, "_menu", None)
+        if previous is not None:
+            previous.close()
+        self._menu = ContextMenu(self.widget, groups, event.x_root, event.y_root)
+        return self._menu
 
 
 def autoscroll(scrollbar: ttk.Scrollbar) -> Callable[[str, str], None]:

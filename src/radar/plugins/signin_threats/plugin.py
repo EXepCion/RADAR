@@ -8,7 +8,7 @@ from typing import Any
 from ... import tenant_settings
 from ...graph import GraphError
 from ...plugin_api import Finding, Plugin, PluginContext, Rule
-from . import apps, netintel, overview, rules
+from . import apps, indicators, netintel, overview, rules
 from .accounts import AccountDirectory, sync_directory
 from .asnames import AsnNameResolver
 from .history import SignInHistory
@@ -83,14 +83,18 @@ class SignInThreatsPlugin(Plugin):
         "mfa_change": {"lookback_hours": 24, "include_guests": False, "new_account_days": 7},
         # fresh MFA through a hosting network (AiTM proxy) / session moving networks right after a fresh MFA
         "aitm_replay": {"window_minutes": 180},
+        # addresses another finding proved to be an attacker's count against every sign-in from them, to any
+        # account, for this many days (indicators.py)
+        "hostile_indicators": {"enabled": True, "days": 7},
+        # several accounts with an odd sign-in (past the password, outside their usual surroundings) within the
+        # window, all from one network new to the tenant / a hosting or VPN network, or with one never-seen client
+        "signin_wave": {"window_hours": 6, "min_accounts": 4},
         "password_not_completed": {"settle_minutes": 15, "window_hours": 3},
         # a user reported an MFA prompt as not theirs: the audit entries that say so (by name), how close in time the
         # failed sign-in must be to count as the one that caused the prompt, and how long to wait for it
         "mfa_report": {"activities": ["Suspicious activity reported"], "lookback_hours": 24,
                        "match_seconds_before": 180, "match_seconds_after": 60, "wait_minutes": 120,
-                       # the address of a reported prompt that was not the user's own counts against every sign-in
-                       # from it, to any account, for this many days
-                       "mark_days": 7, "setting_check_hours": 24},
+                       "setting_check_hours": 24},
         "attack_tooling": {"min_failures": 3},
         "new_shared_ip": {"min_accounts": 2, "new_ip_hours": 24},
         # Risk scoring: trusted_asns lower nothing but stop "VPN/hosting" points (e.g. your own ZTNA/VPN
@@ -139,12 +143,20 @@ class SignInThreatsPlugin(Plugin):
             rc.learning = frozenset(learning)
             findings: list[Finding] = []
             for rule in RULES:
-                if not ctx.rule_enabled(rule.meta.id) or (rule.meta.id == "mfa_report" and report_off):
+                if not ctx.rule_enabled(rule.meta.id) or (rule.meta.id == "mfa_report" and report_off) \
+                        or rule.meta.id == "hostile_reuse":
                     continue
                 try:
                     findings.extend(rule.evaluate(rc))
                 except Exception:
                     ctx.log.exception("Rule %s failed", rule.meta.id)
+            try:  # what these findings prove about attacker addresses is remembered and used from here on
+                marked = indicators.apply(rc, findings, reuse=ctx.rule_enabled("hostile_reuse"))
+                if marked:
+                    ctx.log.info("%d attacker address(es) remembered: %s", len({m.value for m in marked}),
+                                 ", ".join(sorted({f"{m.value} ({m.source})" for m in marked}))[:300])
+            except Exception:
+                ctx.log.exception("Attacker addresses could not be worked out")
             resolver.save()
             if ctx.rule_enabled("app_signins"):
                 findings.extend(self._app_signins(ctx, history, now))

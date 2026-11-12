@@ -23,7 +23,8 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
 ## What it does
 
 - **Watches sign-ins** (every 10 minutes): password spray, brute force, password guessing from rotating addresses,
-  MFA fatigue, MFA prompts a user reported as not theirs, a correct password stopped by MFA, session token theft and AiTM phishing, impossible travel, sign-ins
+  MFA fatigue, MFA prompts a user reported as not theirs, waves of unusual sign-ins across several accounts, a
+  correct password stopped by MFA, session token theft and AiTM phishing, impossible travel, sign-ins
   from new countries (by hand and in the background), legacy protocols, device-code sign-ins, risky sign-ins flagged
   by Entra, accounts excluded from MFA, break-glass and disabled accounts, apps signing in with their own secrets.
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
@@ -32,7 +33,10 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
 - **Scores every finding** from 0 to 100 and explains the score: the network (hosting, VPN, the person's usual
   one), the device (managed, known, never seen), the kind of MFA, the account (admin, excluded from MFA, disabled).
   Low scores are only logged; from *Low* on a reminder pops up.
-- **Connects findings**: steps that together look like an account takeover become one "possible attack chain".
+- **Connects findings**: steps that together look like an account takeover become one "possible attack chain" -
+  also across accounts, when they share an attacker's address or one suspected account acts on another. An
+  address that one finding proves to be an attacker's counts against every other sign-in from it, for any
+  account. Alerts that belong together are shown as one *incident*.
   What was done about an account - sessions revoked, password reset, account disabled - is linked to the alerts it
   answers and lowers their risk; if successful sign-ins continue afterwards, the risk goes up instead.
 - **Shows the state on demand**: *Ongoing attacks* (who is being attacked right now, from where), an *MFA exposure
@@ -144,6 +148,9 @@ failed, blue while scanning, grey while paused.
   playback device unless that device is muted. *Open item* shows the details: what happened, the risk assessment
   factor by factor, the evidence rows, the recommended action and links into the Entra admin center. *Dismiss* and
   *Snooze* hide a reminder; it returns by itself if it gets worse.
+- **Incidents** - alerts that belong to one story (the same account or the same attacker address, within days)
+  as one line each, with the story as a timeline: what happened in which order, which accounts and addresses are
+  involved, what was already done. The open reminders of an incident can be dismissed together.
 - **Alert history** - every alert RADAR still keeps (90 days), with filters and a search box. *Reactivate* brings a
   dismissed alert back.
 - **Ongoing attacks** - password guessing, known passwords, stolen sessions and the attacking addresses, computed

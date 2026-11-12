@@ -94,3 +94,83 @@ def test_other_accounts_and_reactions_do_not_mix():
                        title="Account disabled", occurred_at=NOW - timedelta(days=1), subjects=[USER])
     ac = store(step("pwok", "password_not_completed", 60, 2), disabled)
     assert chain_for(ac) == []
+
+
+# ----------------------------------------------- reported prompts, hindsight, slow attacks
+def test_a_reported_mfa_prompt_is_password_known_unless_it_was_the_users_own():
+    ac = store(step("rep", "mfa_report", 75, 2), step("mfa", "mfa_change", 30, 1))
+    assert chain_for(ac)[0].fields["Chain"] == "Password known -> Persistence"
+    own = step("rep", "mfa_report", 25, 2)
+    own.title += " (probably their own sign-in)"
+    assert chain_for(store(own, step("mfa", "mfa_change", 30, 1))) == []
+
+
+def test_a_harmless_finding_completes_a_chain_in_hindsight_but_never_makes_one():
+    ac = store(step("pwok", "password_not_completed", 60, 2), step("mfa", "mfa_change", 30, 1),
+               step("role", "role_assignment", 15, 0.5))
+    f = chain_for(ac)[0]
+    assert f.fields["Chain"] == "Password known -> Persistence -> Escalation"
+    assert f.score == 60 + chains.STEP_POINTS + chains.WEAK_STEP_POINTS + 10
+    assert any(points == chains.WEAK_STEP_POINTS and reason.endswith("(harmless on its own)") for points, reason in f.factors)
+    # one real step plus a harmless one, or a harmless one first: nothing
+    assert chain_for(store(step("dpa", "distributed_attack", 50, 2), step("mfa", "mfa_change", 15, 1))) == []
+    assert chain_for(store(step("pwok", "password_not_completed", 15, 3), step("mfa", "mfa_change", 30, 2),
+                           step("role", "role_assignment", 15, 1))) == []
+    assert chain_for(store(step("pwok", "password_not_completed", 60, 2), step("mfa", "mfa_change", 5, 1))) == []
+
+
+def test_a_slow_attack_is_followed_between_two_strong_steps_only():
+    assert chain_for(store(step("pwok", "password_not_completed", 60, 9), step("st", "session_theft", 70, 1)))
+    assert chain_for(store(step("pwok", "password_not_completed", 60, 9), step("st", "session_theft", 30, 1))) == []
+    assert chain_for(store(step("pwok", "password_not_completed", 60, 13), step("st", "session_theft", 70, 1))) == []
+    assert chains.LOOKBACK_DAYS == 30
+
+
+# ------------------------------------------------------------- across accounts
+BEA = "bea@contoso.com"
+ADDRESS = {chains.ATTACKER_ADDRESS_FIELD: "203.0.113.77 - a stolen session (anna@contoso.com, 08.11. 10:00)"}
+
+
+def spread_for(ac):
+    return chains.spread_findings(ac.since(NOW - timedelta(days=30)), NOW)
+
+
+def with_fields(finding, **fields):
+    finding.fields.update(fields)
+    return finding
+
+
+def test_two_accounts_that_name_the_same_attacker_address_are_one_chain():
+    a = with_fields(step("pwok", "password_not_completed", 60, 3), **ADDRESS)
+    b = with_fields(step("mfa", "mfa_change", 40, 1, user=BEA), **ADDRESS)
+    ac = store(a, b)
+    assert chain_for(ac) == []                      # neither account has a chain of its own
+    out = spread_for(ac)
+    assert len(out) == 1
+    f = out[0]
+    assert f.rule_id == "attack_spread" and f.subjects == [USER, BEA] and f.fields["Chain"] == "Password known -> Persistence"
+    assert f.score == 69 + chains.SPREAD_POINTS and f.severity == Severity.HIGH
+    assert f.title.startswith("Attack across 2 accounts: anna@contoso.com, bea@contoso.com")
+    assert [r["Account"] for r in f.evidence] == [USER, BEA]
+    # without the shared address they are two unrelated things
+    assert spread_for(store(step("pwok", "password_not_completed", 60, 3), step("mfa", "mfa_change", 40, 1, user=BEA))) == []
+    # the same address on alerts of ONE account is the ordinary chain, not a spread
+    assert spread_for(store(with_fields(step("pwok", "password_not_completed", 60, 3), **ADDRESS),
+                            with_fields(step("mfa", "mfa_change", 40, 1), **ADDRESS))) == []
+
+
+def test_an_account_under_suspicion_that_acts_on_another_extends_the_chain_to_it():
+    acted = with_fields(step("reset", "mfa_change", 50, 2, user=BEA), **{"Initiated by": USER})
+    ac = store(step("pwok", "password_not_completed", 60, 3), acted, step("role", "role_assignment", 55, 1, user=BEA))
+    f = spread_for(ac)[0]
+    assert f.fields["Chain"] == "Password known -> Persistence -> Escalation" and f.subjects == [USER, BEA]
+    assert [r["Account"] for r in f.evidence] == [USER, f"{USER}, {BEA}", BEA]
+    assert any(points == chains.SPREAD_POINTS for points, _ in f.factors)
+    # an admin nobody suspects resets someone's MFA: the two accounts are not taken together
+    ac = store(with_fields(step("reset", "mfa_change", 50, 2, user=BEA), **{"Initiated by": "admin@contoso.com"}),
+               step("pwok", "password_not_completed", 60, 3, user="carl@contoso.com"),
+               step("role", "role_assignment", 55, 1, user=BEA))
+    assert spread_for(ac) == []
+    # suspected only AFTER acting (the alert about the actor is younger): no link either
+    ac = store(step("pwok", "password_not_completed", 60, 1), acted, step("role", "role_assignment", 55, 0.5, user=BEA))
+    assert spread_for(ac) == []

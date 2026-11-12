@@ -30,9 +30,15 @@ ENTRA_SIGNIN_LOGS = linkify.SIGNIN_LOGS_URL
 DEFAULT_HINT = ("Text with the link icon is a link: click it to open it, right-click for more options. Text can be "
                 "selected and copied.")
 WIDTH, HEIGHT = 1120, 1040
+WIDTH_ROOMY = 1500   # opening width for an alert with details and a risk assessment (when the screen has it)
 WIDE_FROM = 1700      # from this window width the evidence stands beside the cards instead of below them
 BODY_MARGIN = 20      # px left and right of the cards / evidence area
 MIN_EVIDENCE = 260    # px the evidence keeps when the cards need more room than there is
+TWO_COLUMNS_FROM = 860  # px: from this width of the cards area the details stand beside the story, not below it
+
+
+def _some(values: list[str], limit: int = 3) -> str:
+    return ", ".join(values[:limit]) + (f" +{len(values) - limit}" if len(values) > limit else "")
 
 
 def portal_hint(request_id: str, tab: str, date: str) -> str:
@@ -107,11 +113,36 @@ class DetailsWindow:
         (``self.age``, a freshness.DataAge)."""
         self.app = app
         self._on_refresh = on_refresh
-        self.age = None
         self.alert = alert
         self._on_dismiss = on_dismiss
         self._on_snooze = on_snooze
         self._snooze_label = snooze_label
+        self._resize_bound = False
+        self._reset()
+        self._root = root
+        top = self.top = theme.new_window(root)
+        top.title(alert.title)
+        height = min(px(HEIGHT), int(top.winfo_screenheight() * 0.9))
+        roomy = bool(alert.fields) and bool(alert.factors)  # story | details | risk side by side
+        width = max(px(WIDTH), min(px(WIDTH_ROOMY), int(top.winfo_screenwidth() * 0.94))) if roomy else px(WIDTH)
+        top.geometry(f"{width}x{height}")
+        top.minsize(px(680), px(480))
+        self._icon = ImageTk.PhotoImage(icons.badge(alert.severity, px(44)), master=root)
+        self._small = ImageTk.PhotoImage(icons.bell(32), master=root)
+        top.iconphoto(False, self._small)
+        top.bind("<Escape>", lambda _e: top.destroy())
+        self._build()
+        self._shown = self._signature()
+        theme.style_window(top, prepare=self._fit_panes)  # panes are split before the window is visible
+        top.attributes("-topmost", True)
+        top.lift()
+        top.focus_force()
+        top.after(400, lambda: top.attributes("-topmost", False))
+        top.after(120, self._animate_risk)
+
+    def _reset(self) -> None:
+        """What a (re)build of the window's content starts from."""
+        self.age = None
         self.tree: ttk.Treeview | None = None
         self.body: ttk.Frame | None = None  # holds the cards and the evidence (only with evidence)
         self._paneds: dict[bool, ttk.PanedWindow] = {}  # wide? -> splitter (side by side / one above the other)
@@ -124,22 +155,51 @@ class DetailsWindow:
         self.row_text = None
         self.side: ttk.Frame | None = None
         self._rows: dict[str, dict[str, str]] = {}
-        top = self.top = theme.new_window(root)
-        top.title(alert.title)
-        height = min(px(HEIGHT), int(top.winfo_screenheight() * 0.9))
-        top.geometry(f"{px(WIDTH)}x{height}")
-        top.minsize(px(680), px(480))
-        self._icon = ImageTk.PhotoImage(icons.badge(alert.severity, px(44)), master=root)
-        self._small = ImageTk.PhotoImage(icons.bell(32), master=root)
-        top.iconphoto(False, self._small)
-        top.bind("<Escape>", lambda _e: top.destroy())
+
+    def _signature(self) -> tuple:
+        """Everything of the alert the window shows: when this changes, the window is out of date."""
+        a = self.alert
+        incident = self._incident()
+        return (a.title, int(a.severity), a.score, a.status, a.summary, a.recommendation, tuple(a.fields.items()),
+                tuple(map(tuple, a.factors)), repr(a.evidence), tuple(map(tuple, a.links)), self._when(),
+                (incident.id, incident.title, incident.state_text, tuple(incident.accounts)) if incident else None)
+
+    def update_alert(self, alert: Alert) -> bool:
+        """The stored alert as it is now (after a scan, a response, a dismissal). When anything the window shows
+        changed, its content is drawn again in one go - same window, same place and size, the selected evidence
+        row kept where possible - and the status line says so. Returns whether it was redrawn."""
+        if not self.exists():
+            return False
+        previous, self.alert = self.alert, alert
+        signature = self._signature()
+        if signature == self._shown:
+            return False
+        selected = self.tree.selection()[0] if self.tree is not None and self.tree.selection() else None
+        if self._fit_job is not None:
+            try:
+                self.top.after_cancel(self._fit_job)
+            except tk.TclError:
+                pass
+        for child in self.top.winfo_children():
+            child.destroy()
+        self._reset()
+        self.top.title(alert.title)
+        if alert.severity != previous.severity:
+            self._icon = ImageTk.PhotoImage(icons.badge(alert.severity, px(44)), master=self._root)
         self._build()
-        theme.style_window(top, prepare=self._fit_panes)  # panes are split before the window is visible
-        top.attributes("-topmost", True)
-        top.lift()
-        top.focus_force()
-        top.after(400, lambda: top.attributes("-topmost", False))
-        top.after(120, self._animate_risk)
+        self._shown = signature
+        self._fit_panes()
+        if selected is not None and self.tree is not None and self.tree.exists(selected):
+            self.tree.selection_set(selected)
+            self.tree.focus(selected)
+            self.tree.see(selected)
+            self._show_row()
+        try:
+            self._draw_bar(1.0)
+        except AttributeError:
+            pass
+        self.status.show(f"Updated {theme.local_time(alert.last_seen, '%H:%M')}: this alert changed while the window was open.")
+        return True
 
     def exists(self) -> bool:
         try:
@@ -214,7 +274,9 @@ class DetailsWindow:
             info = self._info_pane = ttk.Frame(body)
             self._evidence_pane = self._evidence(body)
             self._arrange(False)
-            top.bind("<Configure>", self._top_resized, add="+")
+            if not self._resize_bound:  # (the content is built again when the alert changes: bind once)
+                top.bind("<Configure>", self._top_resized, add="+")
+                self._resize_bound = True
         else:
             info = ttk.Frame(top)
             info.pack(fill="both", expand=True, padx=px(20), pady=(0, px(6)))
@@ -225,13 +287,39 @@ class DetailsWindow:
         quick = quick_links(a)
         if a.factors or quick:
             self._side_column(parent, quick)
-        box = ttk.Frame(parent)
+        box = self._cards_box = ttk.Frame(parent)
         box.pack(side="left", fill="both", expand=True)
-        # one scrolling text drawn as separate cards (What happened / Details / Recommended action)
-        text = self.info = scrolled_text(box, self.links, height=8)
+        # The story (What happened / Part of an incident / Recommended action) and the facts (Details).
+        # In a narrow window they are one scrolling text of cards, one below the other. When the area is wide
+        # enough, short cards one below the other would leave half of it empty while the risk column and the
+        # evidence are short of room: the facts then stand BESIDE the story, with the Entra links below them.
+        # One text holds everything; for the two-column form its Details card is hidden and shown in a second text.
+        main = ttk.Frame(box)
+        main.grid(row=0, column=0, sticky="nsew")
+        facts_frame = self._facts_frame = ttk.Frame(box)
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=11)
+        text = self.info = scrolled_text(main, self.links, height=8)
         pad = text.card_blocks(padding=20)
         rows = list(a.fields.items())
         text.set_key_width([k for k, _ in rows] or ["Details"], cap=280, indent=pad)
+        self._two_columns: bool | None = None
+        self.facts = None
+        if rows:
+            facts = self.facts = scrolled_text(facts_frame, self.links, height=8)
+            facts.set_key_width([k for k, _ in rows], cap=240, indent=facts.card_blocks(padding=20))
+            facts.begin_card("Details", first=True)
+            for k, v in rows:
+                facts.write_field(k, v, name_tag="muted", tags=("card",))
+            facts.end_card()
+            if quick and a.factors:  # (without a risk card the links stay in the side column: shown once)
+                facts.begin_card("Open in Entra")
+                facts.tag_configure("quick", spacing3=px(6))
+                for entity, action, label in quick:
+                    facts.write_link(label, entity, tags=("card", "quick"), action=action)
+                    facts.write("\n", "card", "quick")
+                facts.end_card()
+            box.bind("<Configure>", lambda e: self._set_columns(e.width >= px(TWO_COLUMNS_FROM)), add="+")
         first = True
         if a.summary:
             text.begin_card("What happened", first=True)
@@ -239,10 +327,16 @@ class DetailsWindow:
             text.write("\n", "card")
             text.end_card()
             first = False
-        if rows:
-            text.begin_card("Details", first=first)
-            for k, v in rows:
-                text.write_field(k, v, name_tag="muted", tags=("card",))
+        incident = self._incident()
+        if incident is not None:
+            # this alert is one of several that belong together: say so, and lead to the whole story
+            others = len(incident.reminders) - 1
+            text.begin_card("Part of an incident", first=first)
+            text.write_link(incident.title, Entity("incident", incident.id), tags=("card",))
+            text.write("\n", "card")
+            text.write_value(f"{incident.state_text} This alert and {others} other{'s' if others != 1 else ''} about "
+                             f"{_some(incident.accounts) or 'the same attacker address'} belong together.", tags=("card",))
+            text.write("\n", "card")
             text.end_card()
             first = False
         if a.recommendation:
@@ -250,6 +344,47 @@ class DetailsWindow:
             text.write_value(a.recommendation, tags=("card",))
             text.write("\n", "card")
             text.end_card()
+            first = False
+        if rows:
+            start = text.index("end-1c")
+            text.begin_card("Details", first=first)
+            for k, v in rows:
+                text.write_field(k, v, name_tag="muted", tags=("card",))
+            text.end_card()
+            text.tag_add("facts_card", start, "end-1c")  # hidden while the facts stand beside the story
+            first = False
+
+    def _set_columns(self, two: bool) -> bool:
+        """Facts beside the story (wide cards area) or below it. Returns whether the arrangement changed."""
+        if self.facts is None or two == self._two_columns:
+            return False
+        self._two_columns = two
+        box = self._cards_box
+        self.info.tag_configure("facts_card", elide=two)
+        if self.side is not None and self.alert.factors:
+            self.side_text.tag_configure("quick_card", elide=two)  # (without a risk card the links are all it has)
+        if two:
+            self._facts_frame.grid(row=0, column=1, sticky="nsew", padx=(px(12), 0))
+            box.columnconfigure(1, weight=9)
+        else:
+            self._facts_frame.grid_remove()
+            box.columnconfigure(1, weight=0)
+        return True
+
+    def _info_need(self) -> int:
+        """Height the cards need in the current arrangement."""
+        need = self.info.text_height()
+        if self._two_columns and self.facts is not None:
+            need = max(need, self.facts.text_height())
+        return need + px(4)
+
+    def _incident(self):
+        """The incident this alert belongs to, if any (not for a live finding that is not stored)."""
+        find = getattr(self.app, "incident_of", None)
+        try:
+            return find(self.alert) if find else None
+        except Exception:  # noqa: BLE001 - the details must open whatever the grouping does
+            return None
 
     def _when(self) -> str:
         """'occurred Tue 10.11.2026 11:02 · detected 11:58 · updated 12:40' (dates only where they differ)."""
@@ -310,12 +445,14 @@ class DetailsWindow:
                 text.write("\n", "card", "factor")
             text.end_card()
         if quick:
+            start = text.index("end-1c")
             text.begin_card("Open in Entra", first=not a.factors)
             text.tag_configure("quick", spacing3=px(6))
             for entity, action, label in quick:
                 text.write_link(label, entity, tags=("card", "quick"), action=action)
                 text.write("\n", "card", "quick")
             text.end_card()
+            text.tag_add("quick_card", start, "end-1c")  # hidden while the links stand below the facts instead
 
     def score_text(self) -> str:
         try:
@@ -469,12 +606,15 @@ class DetailsWindow:
             self._arrange(width >= px(WIDE_FROM), width)
             if self._wide != was_wide:
                 self.top.update_idletasks()
+            # the cards area has its width now: facts beside or below the story, before the heights are measured
+            if self._set_columns(self._cards_box.winfo_width() >= px(TWO_COLUMNS_FROM)):
+                self.top.update_idletasks()
             many = len(self.alert.evidence) > 3
             detail_need = min(self.row_text.text_height(), px(260 if self._wide else 160))
             if self._wide:
                 self._set_sash(self.paned, self._cards_width(width))
             else:
-                info_need = max(self.info.text_height() + px(4), self._side_need())
+                info_need = max(self._info_need(), self._side_need())
                 tree_need = px(56) + min(len(self.alert.evidence), 12) * px(28)  # heading + rows + scrollbar
                 evidence_need = px(80) + tree_need + min(detail_need, px(120))  # + card padding, title row, sash
                 if info_need + evidence_need <= height:

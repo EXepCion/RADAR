@@ -69,6 +69,7 @@ class App:
         from .ui.reminder import ReminderWindow
 
         theme.set_dpi_awareness()
+        theme.keep_ui_responsive()  # before the scheduler starts working
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.report_callback_exception = lambda *exc: log.error("UI error", exc_info=exc)
@@ -240,6 +241,7 @@ class App:
         if popped:
             log.info("%d new alert(s) from %s: %s", len(popped), plugin_id, "; ".join(a.title for a in popped))
             self.ui_call(self.reminders.show, True)
+            self.ui_call(self._refresh_open_windows)  # incidents, history and open alert details follow too
         else:
             self.ui_call(self._refresh_reminders_if_visible)
         self._refresh_tray()
@@ -253,7 +255,9 @@ class App:
             return []
         try:
             recent = self.alerts.since(datetime.now(timezone.utc) - timedelta(days=chains.LOOKBACK_DAYS + 1))
-            return self.alerts.ingest(chains.CHAIN_PLUGIN, chains.chain_findings(recent, datetime.now(timezone.utc)),
+            now = datetime.now(timezone.utc)
+            return self.alerts.ingest(chains.CHAIN_PLUGIN,
+                                      chains.chain_findings(recent, now) + chains.spread_findings(recent, now),
                                       self.min_severity())
         except Exception:
             log.exception("Attack-chain correlation failed")
@@ -268,12 +272,25 @@ class App:
     def _refresh_reminders_if_visible(self) -> None:
         if self.reminders and self.reminders.visible:
             self.reminders.refresh()
+        self._refresh_open_windows()
+
+    def _refresh_open_windows(self) -> None:
+        """Every open window that shows stored alerts follows a change (Tk thread): the incidents, the alert
+        history, and the details of each alert that is open - no window keeps showing what was true when it was
+        opened."""
         self._refresh_history_if_open()
+        refresh = getattr(self.reminders, "refresh_details", None)
+        if refresh:
+            try:
+                refresh()
+            except Exception:
+                log.exception("Open alert details could not be updated")
 
     def _refresh_history_if_open(self) -> None:
-        win = getattr(self, "_history", None)
-        if win is not None and win.exists():
-            win.refresh()
+        for name in ("_history", "_incidents"):
+            win = getattr(self, name, None)
+            if win is not None and win.exists():
+                win.refresh()
 
     def _refresh_tray(self) -> None:
         if self.tray:
@@ -281,8 +298,7 @@ class App:
 
     def on_alerts_changed(self) -> None:
         self._refresh_tray()
-        if getattr(self, "_history", None) is not None:
-            self.ui_call(self._refresh_history_if_open)  # on the UI thread, after the change that called us
+        self.ui_call(self._refresh_open_windows)  # on the UI thread, after the change that called us
 
     # ========================================================= alert history
     def show_history(self) -> None:
@@ -297,6 +313,39 @@ class App:
                 return
             self._history = HistoryWindow(self.root, self)
         self.ui_call(show)
+
+    def show_incidents(self, select: str | None = None) -> None:
+        """Tray: alerts that belong to one story (same account or same attacker address), as one incident each.
+        ``select``: the incident to show (from the link in an alert's details)."""
+        from .ui.incidents import IncidentsWindow
+
+        def show() -> None:
+            win = getattr(self, "_incidents", None)
+            if win is not None and win.exists():
+                win.refresh()
+                win.focus()
+            else:
+                win = self._incidents = IncidentsWindow(self.root, self)
+            if select:
+                win.select(select)
+        self.ui_call(show)
+
+    def incident_of(self, alert: Alert):
+        """The incident a stored alert belongs to (radar.incidents), or None."""
+        from . import incidents
+
+        if not alert.id:
+            return None
+        now = datetime.now(timezone.utc)
+        for incident in incidents.group(self.alerts.since(now - timedelta(days=incidents.LOOKBACK_DAYS + 1)), now):
+            if any(a.id == alert.id for a in incident.alerts):
+                return incident
+        return None
+
+    def on_alerts_dismissed(self) -> None:
+        """Reminders were dismissed from another window: the reminders, the history and the tray follow."""
+        self._refresh_tray()
+        self._refresh_reminders_if_visible()
 
     def open_alert(self, alert: Alert) -> None:
         """The details window of a stored alert (the same one the reminders open)."""
@@ -415,6 +464,8 @@ class App:
         elif action == "open_alert":
             if not self.open_alert_titled(entity.value):
                 say(f"Alert '{entity.short}' is no longer stored (purged after the retention period).", True)
+        elif action == "open_incident":
+            self.show_incidents(select=entity.value)
         else:
             self._resolve_and_open(entity, action, say)
 

@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from ...plugin_api import Finding, Rule, Severity
-from . import netintel
+from . import indicators, netintel
 from .history import SignInHistory
 from .models import CHANGE_KINDS, REPORT_KIND, AccountChange, SignIn, os_family, parse_time  # noqa: F401  (os_family re-exported)
 from .accounts import AccountDirectory  # noqa: F401  (type of RuleContext.accounts)
@@ -103,7 +103,7 @@ class RuleContext:
     learning: frozenset[str] = frozenset()  # MFA-excluded accounts whose pattern is not learned yet
     _assessor: Assessor | None = None
     _computer_nets: dict = field(default_factory=dict)  # user id -> networks the user's computers sign in from
-    _reported: dict | None = None  # ip -> ReportedAddress (see reported_addresses)
+    _hostile: dict | None = None  # address -> [Indicator] (see hostile_index)
 
     @classmethod
     def build(cls, new: list[SignIn], history: SignInHistory, settings: dict, now: datetime,
@@ -148,22 +148,23 @@ class RuleContext:
         value = self.settings.get(rule_id)
         return value if isinstance(value, dict) else {}
 
-    def reported_addresses(self) -> dict[str, "ReportedAddress"]:
-        """Addresses an attacker demonstrably used: a user reported the MFA prompt of a sign-in from there as not
-        theirs, and the sign-in did not come from that user's own surroundings (a prompt of their own, reported by
-        mistake, marks nothing). Remembered for ``mfa_report.mark_days``; every rule's assessment of a sign-in
-        from such an address - to whatever account - is raised (see Assessor.assess)."""
-        if self._reported is None:
-            self._reported = {}
-            if self.rule_on("mfa_report"):
-                days = float(self.cfg("mfa_report").get("mark_days", 7))
-                for c in self.history.changes(self.now - timedelta(days=days), self.now):
-                    if c.kind != REPORT_KIND or c.upn in self.ignore_users:
-                        continue
-                    s = _report_prompt(self, c)
-                    if s is not None and s.ip and s.ip not in self.ignore_ips and _foreign_to_user(self, s):
-                        self._reported[s.ip] = ReportedAddress(s.ip, c.created, c.upn or c.user_id, c.user_id, s.id, c.id)
-        return self._reported
+    def hostile_index(self) -> dict[str, list]:
+        """Addresses an attacker demonstrably used, from earlier findings (indicators.py): address -> indicators."""
+        if self._hostile is None:
+            self._hostile = {}
+            if indicators.settings(self)[0]:
+                for ind in self.history.indicators(self.now):
+                    if ind.kind == "ip":
+                        self._hostile.setdefault(ind.value, []).append(ind)
+        return self._hostile
+
+    def hostile(self, s: SignIn) -> "indicators.Indicator | None":
+        """The strongest indicator that counts against this sign-in: its address was used in an attack - on another
+        account, or on this one before this sign-in (never the sign-ins the indicator was derived from)."""
+        if not s.ip or self.trusted(s):
+            return None
+        hits = [i for i in self.hostile_index().get(s.ip, ()) if i.user_id != s.user_id or s.created > i.when]
+        return max(hits, key=lambda i: (i.points, i.when), default=None)
 
     def rule_on(self, rule_id: str) -> bool:
         return self.enabled_rules is None or rule_id in self.enabled_rules
@@ -218,16 +219,6 @@ class RuleContext:
 
 
 # ------------------------------------------------------------- helpers
-@dataclass(frozen=True)
-class ReportedAddress:
-    ip: str
-    when: datetime      # of the report
-    upn: str            # who reported
-    user_id: str
-    signin_id: str      # the sign-in that caused the reported prompt
-    report_id: str
-
-
 def _report_prompt(rc: RuleContext, c: AccountChange) -> SignIn | None:
     """The sign-in that caused a reported MFA prompt: the account's sign-in that failed at the MFA step closest to
     the report (the two logs share no id; the audit entry is written seconds after the sign-in)."""
@@ -1716,7 +1707,7 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
     cfg = rc.cfg("mfa_report")
     lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
     wait = timedelta(minutes=float(cfg.get("wait_minutes", 120)))
-    out = _reported_address_findings(rc)
+    out = []
     for c in rc.history.changes(rc.now - lookback, rc.now):
         if c.kind != REPORT_KIND or c.upn in rc.ignore_users:
             continue
@@ -1778,30 +1769,124 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
     return out
 
 
-def _reported_address_findings(rc: RuleContext) -> list[Finding]:
-    """What else came from an address whose MFA prompt a user reported as not theirs: other accounts tried from it,
-    and anybody - the reporter included - who got in from it. Sign-ins from a device the account already used are
-    left out (a colleague on the same hotel or mobile network)."""
-    days = float(rc.cfg("mfa_report").get("mark_days", 7))
+def signin_wave(rc: RuleContext) -> list[Finding]:
+    """Several accounts, within hours, each with one sign-in that is odd for it - and all of them share where it
+    came from: a network nobody in the tenant used before (or a hosting / VPN network), or a client nobody used
+    before. One such sign-in is a new phone or a trip and stays below every rule; several at once are a phishing
+    wave (the proxy's network, the kit's client) or one attacker working through a list of passwords.
+
+    Counted are sign-ins that got at least past the password, from outside the account's own surroundings (no
+    office, no device, network or address it used before) - so a team at a conference on their own laptops is no
+    wave."""
+    cfg = rc.cfg("signin_wave")
+    window = timedelta(hours=float(cfg.get("window_hours", 6)))
+    minimum = int(cfg.get("min_accounts", 4))
+    start = rc.now - window
+    rows = [s for s in rc.keep(rc.history.query(start, rc.now, interactive_only=True))
+            if s.user_id and not rc.trusted(s) and not rc.on_virtual_host(s)
+            and (s.success or s.error_code in PASSWORD_ACCEPTED_CODES or s.error_code == MFA_DENIED_CODE)]
+    foreign: dict[str, bool] = {}
+    clusters: dict[tuple[str, str], dict[str, list[SignIn]]] = defaultdict(lambda: defaultdict(list))
+    for s in rows:
+        if s.id not in foreign:
+            foreign[s.id] = _foreign_to_user(rc, s)
+        if not foreign[s.id]:
+            continue
+        if s.asn:
+            clusters[("network", str(s.asn))][s.user_id].append(s)
+        if s.user_agent:
+            clusters[("client", s.user_agent)][s.user_id].append(s)
+    out, reported_users = [], []
+    for (kind, value), by_user in sorted(clusters.items(), key=lambda kv: (kv[0][0] != "network", -len(kv[1]))):
+        if len(by_user) < minimum:
+            continue
+        if any(set(by_user) <= users for users in reported_users):
+            continue  # the same accounts already reported for their network: not again for their client
+        signins = sorted((s for items in by_user.values() for s in items), key=lambda s: s.created)
+        first = signins[0]
+        if kind == "network":
+            net = rc.assessor.network(first)
+            new_to_tenant = rc.history.asn_user_count(int(value), start) == 0
+            if not new_to_tenant and not (net and net[1] != "cloud"):
+                continue  # an ordinary provider people already use: several new customers a day are normal
+            what = f"the network {rc.assessor.asn_label(int(value))}"
+            factors = [Factor(45, f"{len(by_user)} accounts signed in from {what} within "
+                                  f"{int(window.total_seconds() // 3600)} h, each from outside its usual surroundings")]
+            if net and net[1] != "cloud":
+                factors.append(Factor(15, f"{net[1].capitalize()} network: {net[0]}"))
+            if new_to_tenant:
+                factors.append(Factor(10, "Nobody in the tenant used this network before"))
+        else:
+            if rc.history.user_agent_seen(value, start):
+                continue
+            what = f"the client '{value[:70]}'"
+            factors = [Factor(45, f"{len(by_user)} accounts signed in with a client nobody used before, within "
+                                  f"{int(window.total_seconds() // 3600)} h, each from outside its usual surroundings")]
+            tool = rc.assessor.suspicious_agent(first)
+            if tool:
+                factors.append(Factor(15, f"Attack-tool fingerprint: {tool}"))
+        if len(by_user) > minimum:
+            factors.append(Factor(min(20, 5 * (len(by_user) - minimum)), f"{len(by_user)} accounts (from {minimum} it counts as a wave)"))
+        successes = [s for s in signins if s.success]
+        if successes:
+            factors.append(Factor(15, f"{len({s.user_id for s in successes})} of them completed the sign-in"))
+        known = [s for s in signins if rc.hostile(s)]
+        if known:
+            factors.append(Factor(15, f"Known attacker address among them: {known[0].ip}"))
+        score = max(0, min(100, sum(f.points for f in factors)))
+        accounts = sorted({s.who for s in signins})
+        reported_users.append(set(by_user))
+        out.append(Finding(
+            key=f"wave|{kind}|{value[:60]}|{_day(first.created)}", rule_id="signin_wave", severity=severity_for(score),
+            score=score, factors=[(f.points, f.text) for f in factors],
+            title=f"Wave of unusual sign-ins: {len(accounts)} accounts from {what}"[:160],
+            subjects=sorted({s.upn for s in signins if s.upn}),
+            summary=(f"Within {int(window.total_seconds() // 3600)} hours {len(accounts)} accounts each had a sign-in that "
+                     f"got past the password from outside their usual surroundings, all from {what}. Each one alone looks "
+                     f"like a new phone or a trip; together they look like a phishing wave or one attacker using several "
+                     f"stolen passwords."),
+            occurred_at=first.created,
+            fields={"Accounts": ", ".join(accounts)[:300], "Shared": what,
+                    "Completed sign-ins": str(len(successes)), "Risk score": f"{score}/100"},
+            evidence=_evidence(signins),
+            recommendation="Ask two or three of these people what they did at that time (a phishing mail? a new app "
+                           "rollout?). If it was not their own doing: revoke the sessions and reset the passwords of all "
+                           "of them, and block the network or address.",
+            links=[("Entra: sign-in logs", SIGNIN_LOGS_URL)],
+        ))
+    return out
+
+
+def hostile_reuse(rc: RuleContext) -> list[Finding]:
+    """What else came from an address another finding proved to be an attacker's (indicators.py): other accounts
+    tried from it, and anybody who got in from it afterwards. Only addresses with proven access count (a stolen
+    session, a phishing proxy, a password that worked, a reported MFA prompt) - not mere attack traffic. Sign-ins
+    from a device the account already used are left out (a colleague on the same hotel or mobile network)."""
+    days = indicators.settings(rc)[1]
     out = []
-    for mark in rc.reported_addresses().values():
-        rows = rc.keep(rc.history.query(mark.when - timedelta(days=days), rc.now, ip=mark.ip))
+    for ip, marks in rc.hostile_index().items():
+        proven = [m for m in marks if m.points >= indicators.HIGH]
+        if not proven:
+            continue
+        first = min(proven, key=lambda m: m.when)
+        victims = {m.user_id: m for m in proven}
+        rows = rc.keep(rc.history.query(first.when - timedelta(days=days), rc.now, ip=ip))
         hits = []
         for s in rows:
-            if not s.user_id or s.id == mark.signin_id or rc.trusted(s):
+            if not s.user_id or rc.trusted(s):
                 continue
-            if s.user_id == mark.user_id and not s.success:
-                continue  # further attempts on the reporter: that is the report's own alert
+            mark = victims.get(s.user_id)
+            if mark is not None and (not s.success or s.created <= mark.when):
+                continue  # the sign-ins the address was marked for, and further attempts on that account
             if s.device_id and s.device_id in rc.history.user_devices(s.user_id, s.created):
                 continue
             hits.append(s)
         if not hits:
             continue
-        others = sorted({s.who for s in hits if s.user_id != mark.user_id})
+        others = sorted({s.who for s in hits if s.user_id not in victims})
         successes = [s for s in hits if s.success]
         accepted = [s for s in hits if s.error_code in PASSWORD_ACCEPTED_CODES or s.error_code == MFA_DENIED_CODE]
-        when = f"{mark.when.astimezone():%d.%m. %H:%M}"
-        factors = [(45, f"Sign-ins from {mark.ip}: {mark.upn} reported an MFA prompt from this address as not theirs ({when})")]
+        factors = [(45, f"Sign-ins from {ip}, an address used in {first.describe()}")]
         if len(others) > 1:
             factors.append((min(15, 5 * (len(others) - 1)), f"{len(others)} other accounts were tried from it"))
         if accepted:
@@ -1811,26 +1896,26 @@ def _reported_address_findings(rc: RuleContext) -> list[Finding]:
             factors.append((35, f"{len(successes)} successful sign-in(s) from it: {', '.join(sorted({s.who for s in successes}))}"))
         score = min(100, sum(p for p, _ in factors))
         got_in = sorted({s.who for s in successes})
-        title = (f"Signed in from the address of a reported MFA prompt: {', '.join(got_in)[:120]}" if got_in else
-                 f"Address of a reported MFA prompt also used on {len(others)} other account(s): {mark.ip}")
+        title = (f"Signed in from a known attacker address: {', '.join(got_in)[:120]}" if got_in else
+                 f"Known attacker address also used on {len(others)} other account(s): {ip}")
         s0 = hits[-1]
         out.append(Finding(
-            key=f"reported-ip|{mark.ip}|{_day(mark.when)}", rule_id="mfa_report", severity=severity_for(score), score=score,
-            factors=factors, title=title,
-            summary=(f"{mark.upn} reported an MFA prompt as not theirs at {when}; the sign-in behind it came from {mark.ip} "
-                     f"({s0.location}). From the same address there were {len(hits)} more sign-in(s)"
+            key=f"hostile-ip|{ip}|{_day(first.when)}", rule_id="hostile_reuse", severity=severity_for(score), score=score,
+            factors=factors, title=title, subjects=sorted({s.upn for s in hits if s.upn}),
+            summary=(f"{ip} ({s0.location}) was used in {first.describe()}. From the same address there were "
+                     f"{len(hits)} more sign-in(s)"
                      + (f" to {len(others)} other account(s)" if others else "")
                      + (f", {len(successes)} of them successful" if successes else ", none of them successful")
-                     + ". Whoever is behind that address has at least one password of yours and is trying more accounts."),
+                     + ". Whoever is behind that address is working on more than one account."),
             occurred_at=min(s.created for s in hits),
-            fields={"IP address": mark.ip, "Accounts": ", ".join(sorted({s.who for s in hits}))[:300],
-                    "Reported by": f"{mark.upn} ({when})", "Risk score": f"{score}/100"},
+            fields={"IP address": ip, "Accounts": ", ".join(sorted({s.who for s in hits}))[:300],
+                    "Known from": first.describe(), "Risk score": f"{score}/100"},
             evidence=_evidence(hits),
             recommendation=("Treat every account that signed in successfully from this address as taken over: revoke its "
                             "sessions and reset its password. " if successes else "")
                            + "Block the address, reset the passwords the attacker got right, and make sure the other "
                              "accounts use MFA.",
-            links=[("Entra: sign-in logs", SIGNIN_LOGS_URL), ("Look up IP (AbuseIPDB)", f"https://www.abuseipdb.com/check/{mark.ip}")],
+            links=[("Entra: sign-in logs", SIGNIN_LOGS_URL), ("Look up IP (AbuseIPDB)", f"https://www.abuseipdb.com/check/{ip}")],
         ))
     return out
 
@@ -1845,6 +1930,10 @@ RULES: list[RuleDef] = [
     RuleDef(Rule("mfa_fatigue", "MFA fatigue", "Repeated MFA denials"), mfa_fatigue),
     RuleDef(Rule("mfa_report", "MFA prompt reported by the user",
                  "A user reported an MFA prompt as not theirs (needs 'Report suspicious activity' in Entra)"), mfa_report),
+    RuleDef(Rule("signin_wave", "Wave of unusual sign-ins",
+                 "Several accounts with an odd sign-in at the same time from the same new network or client"), signin_wave),
+    RuleDef(Rule("hostile_reuse", "Known attacker address reused",
+                 "An address proven to be an attacker's by another finding is used on other accounts"), hostile_reuse),
     RuleDef(Rule("password_not_completed", "Correct password, MFA not completed",
                  "Password accepted from an unfamiliar place but MFA/CA stopped it"), password_not_completed),
     RuleDef(Rule("session_theft", "Session token theft",

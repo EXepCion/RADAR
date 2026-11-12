@@ -34,7 +34,7 @@ HEADING_TEXT_SHIFT = 4  # Tk draws cell text this much further in than heading t
 LIGHT = {
     "window": "#f3f3f3", "card": "#ffffff", "border": "#e5e5e5", "track": "#e6e6e6", "heading_bg": "#f9f9f9",
     "text": "#1a1a1a", "muted": "#5d5d5d", "link": "#005fb8", "select": "#cce4f7",
-    "row_select": "#dcebf8", "new_row": "#eef5fc", "attention": "#fff4ce",
+    "row_select": "#dcebf8", "new_row": "#eef5fc", "attention": "#fff4ce", "menu_hover": "#f0f0f0",
     "error": "#a4262c", "pos": "#a4262c", "neg": "#107c10", "warn": "#8a5300",
     "sev_high_bg": "#fde7e9", "sev_high_fg": "#a4262c", "sev_medium_bg": "#fdeadb", "sev_medium_fg": "#8a3b00",
     "sev_low_bg": "#fff4ce", "sev_low_fg": "#7a4600", "sev_info_bg": "#ebebeb", "sev_info_fg": "#5d5d5d",
@@ -42,7 +42,7 @@ LIGHT = {
 DARK = {
     "window": "#202020", "card": "#2b2b2b", "border": "#3d3d3d", "track": "#454545", "heading_bg": "#323232",
     "text": "#f3f3f3", "muted": "#ababab", "link": "#60cdff", "select": "#264f78",
-    "row_select": "#2e4a66", "new_row": "#26333f", "attention": "#4a3b10",
+    "row_select": "#2e4a66", "new_row": "#26333f", "attention": "#4a3b10", "menu_hover": "#383838",
     "error": "#ff99a4", "pos": "#ff99a4", "neg": "#6ccb5f", "warn": "#fcb76a",
     "sev_high_bg": "#4a2327", "sev_high_fg": "#ff99a4", "sev_medium_bg": "#4a2f1a", "sev_medium_fg": "#ffb86b",
     "sev_low_bg": "#4a3b10", "sev_low_fg": "#f9e2a6", "sev_info_bg": "#3a3a3a", "sev_info_fg": "#ababab",
@@ -654,6 +654,22 @@ def humanize(dt: datetime | None, now: datetime | None = None) -> str:
             n = int(seconds // size)
             return f"{n} {unit}{'s' if n != 1 else ''} ago"
     return "Now"
+
+
+UI_SWITCH_INTERVAL = 0.0005  # seconds
+
+
+def keep_ui_responsive() -> None:
+    """Let the windows answer at once while a scan is working in the background.
+
+    Building a window is thousands of tiny calls into Tk, and Python hands the interpreter back to a busy
+    background thread at each of them - by default for up to 5 ms every time. While a scan parses sign-ins, a
+    window that opens in half a second would take many seconds (measured: 0.4 s idle, 16 s during a scan, 0.45 s
+    with this). A shorter switch interval costs the scan a little and gives the user the window."""
+    import sys
+
+    if sys.getswitchinterval() > UI_SWITCH_INTERVAL:
+        sys.setswitchinterval(UI_SWITCH_INTERVAL)
 
 
 def local_time(dt: datetime | None, fmt: str = "%A %d.%m.%Y %H:%M") -> str:

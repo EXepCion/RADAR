@@ -14,7 +14,9 @@ them into a local history and runs these rules:
 | Password spray | one IP, failed password for ≥ 5 accounts in 60 min (skipped if the IP is mostly successful traffic) | 80 (90 if an account then succeeded) |
 | Brute force | ≥ 10 failed passwords for one account in 60 min; escalates if a success from the same IP follows | 55 → 85 |
 | MFA fatigue | ≥ 3 MFA denials (500121) in 60 min | 75 |
-| MFA prompt reported by the user | The user reported an MFA prompt as not theirs (Authenticator: *No, it's not me* > report; phone: the reporting code). Entra writes the audit entry `Suspicious activity reported`; a prompt is only sent after the right password, so a true report means the password is known. The sign-in that caused the prompt is a separate row in the sign-in log (failed MFA step, same account, seconds before the report) that Entra delivers **up to 1-2 hours later**. Until it arrives: Medium. With it, the alert is judged by where that sign-in came from: the account's own managed device and usual network → Low ("probably their own sign-in", reported by mistake); an unfamiliar network or device → High. No such row after `wait_minutes` (120) → High. A password reset or disabling the account answers it. **Needs the tenant setting *Report suspicious activity*** (Entra ID > Authentication methods > Settings; "Microsoft managed" means off): while it is off the rule is inactive and the menu says so; when the setting cannot be read with the sign-in used (it needs `Policy.Read.All`) the rule stays active. The connection check shows the state. **The attacker's address is remembered**: when the reported prompt did not come from the user's own surroundings, its address counts +25 in every rule's assessment of any sign-in from it, to any account, for `mark_days` (7). Sign-ins from it to other accounts - or a successful one to anybody - raise an alert of their own ("Address of a reported MFA prompt also used on ...": 45, +20 when a password was right, +35 when a sign-in succeeded); sign-ins from a device the account already used are left out (a colleague on the same hotel network). A report judged as the user's own prompt marks nothing. Settings: `mfa_report` (`activities`: the audit entry names, `match_seconds_before/after`, `wait_minutes`, `mark_days`). | 50 → 25-100 |
+| MFA prompt reported by the user | The user reported an MFA prompt as not theirs (Authenticator: *No, it's not me* > report; phone: the reporting code). Entra writes the audit entry `Suspicious activity reported`; a prompt is only sent after the right password, so a true report means the password is known. The sign-in that caused the prompt is a separate row in the sign-in log (failed MFA step, same account, seconds before the report) that Entra delivers **up to 1-2 hours later**. Until it arrives: Medium. With it, the alert is judged by where that sign-in came from: the account's own managed device and usual network → Low ("probably their own sign-in", reported by mistake); an unfamiliar network or device → High. No such row after `wait_minutes` (120) → High. A password reset or disabling the account answers it. **Needs the tenant setting *Report suspicious activity*** (Entra ID > Authentication methods > Settings; "Microsoft managed" means off): while it is off the rule is inactive and the menu says so; when the setting cannot be read with the sign-in used (it needs `Policy.Read.All`) the rule stays active. The connection check shows the state. When the reported prompt did not come from the user's own surroundings, its address is remembered as an attacker's (see *Known attacker addresses* below). Settings: `mfa_report` (`activities`: the audit entry names, `match_seconds_before/after`, `wait_minutes`). | 50 → 25-100 |
+| Wave of unusual sign-ins | Within `window_hours` (6), at least `min_accounts` (4) accounts each have a sign-in that got past the password from outside their own surroundings (no office; no device, network or address the account used before) - and all share where it came from: one network nobody in the tenant used before or a hosting/VPN network, or one client (user agent) nobody used before. Each alone stays below every rule; together they are a phishing wave or one attacker working through stolen passwords. A team abroad on their own known laptops is not counted. Settings: `signin_wave`. | 45 +10 new network, +15 hosting/VPN, +5 per further account, +15 completed sign-ins |
+| Known attacker address reused | An address another finding proved to be an attacker's (see below) is used on other accounts, or somebody signs in from it afterwards. Sign-ins from a device the account already used are left out. | 45, +20 password right, +35 successful sign-in |
 | Correct password, MFA not completed | password accepted, then MFA/CA stopped the sign-in and the user never finished it, from a network/country unusual for the user (settled for 15 min) | scored |
 | Session token theft | the same session used from another country **and** another device (AiTM / cookie theft). Sign-ins of Microsoft back-end services acting for the user (Microsoft-owned app + server credential + no user agent, e.g. "Olympus", the Office policy service) never count as the second device: they log whichever network path the device used (eSIM breakout, roaming, VPN) and often lack a device id | scored |
 | AiTM phishing / session replay | (1) a **fresh** MFA (not "previously satisfied") completed through a hosting/datacenter network without device identity, not the user's habitual network - phishing proxies must do the MFA themselves; (2) the session of a fresh MFA sign-in used from another network within 3 h (also same country, also when neither side has a device id - the gaps of session theft). Both usual networks of the user (Wi-Fi/mobile switch) or alternating use: discounted | base 35 / 40, scored |
@@ -149,6 +151,35 @@ reaches 3+, or covers three stages - so "abroad, then a new passkey" stays quiet
 two different detections; a step must be at least Low on its own (score >= 25); an "access" step whose sign-ins
 all failed counts as targeting. Score = strongest step + 10 per further step (+10 if the password was known and
 something followed); two-step chains stay Medium unless a step is High on its own.
+
+*In hindsight:* a finding that was only logged (score 10-24) can be a step of a chain that two real steps already
+make (+5 instead of +10); it never starts a chain and never makes one. *Slow attacks:* the look-back is 30 days,
+and two steps that are each at least Medium (45) may lie up to 10 days apart instead of 3.
+
+**Known attacker addresses** (`signin_threats/indicators.py`, setting `hostile_indicators`: `enabled`, `days` = 7).
+Rules judge one account at a time; what one of them proves about an address is kept and used by all. After every
+scan the findings of at least Medium from these rules mark the addresses of their sign-ins: a reported MFA prompt,
+session theft, AiTM / session replay, a password attack that got past the password, a guessed password (+25 on any
+later assessment), and a correct password stopped by MFA, a new address shared by several accounts, attack-tool
+sign-ins, a password spray (+15). Only sign-ins foreign to their account mark an address (no office network; no
+device, network or address the account used before), never an address three or more accounts regularly sign in
+from (a hotel, a mobile carrier). The mark then counts in **every rule's assessment** of a sign-in from that
+address - to any account, or to the same account later - as "Known attacker address: used in ...", except for
+sign-ins from a device the account already used. It never counts against the sign-ins it was derived from. Alerts
+whose evidence contains such an address get the field *Known attacker address*.
+
+**Attacks across accounts** (`chains.spread_findings`). Accounts are taken together when their alerts name the
+same known attacker address, or when an account that was already under suspicion (password known or worse) acted
+on another one afterwards (*Initiated by* / *Invited by*: reset its MFA, gave it a role, invited it ...). An
+administrator nobody suspects joins nothing. Over the alerts of such a group the same chain is looked for; when it
+runs across at least two accounts it is raised as "Attack across N accounts: ..." (chain score +15).
+
+**Incidents** (`radar/incidents.py`, tray > Incidents...). Alerts that were reminders (at least Low, not only
+logged) about the same account or the same known attacker address, no more than 7 days apart, are one incident;
+chains of such pairs join. Chain alerts name the incident; responses (sessions revoked, password reset, account
+disabled) and logged-only findings are shown with it as context but neither make an incident nor join two. The
+window lists the incidents of the last 30 days with their alerts in order; the open reminders of one incident can
+be dismissed together.
 
 **Microsoft 365 support cases.** Opening a case in the admin center adds the Microsoft Support tenant
 (`b4c546a4-…`) as cross-tenant service provider (actor: the admin, recorded silently); while an engineer works on it,

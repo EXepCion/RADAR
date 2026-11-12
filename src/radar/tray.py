@@ -149,6 +149,7 @@ class Tray:
         n, unseen = a.alerts.count_active(), a.alerts.count_unseen()
         label = f"Show reminders ({n}" + (f", {unseen} new)" if unseen else ")") if n else "Show reminders"
         yield Item(label, self._act(a.show_reminders_from_tray), default=True)
+        yield Item("Incidents...", self._act(a.show_incidents))
         yield Item("Alert history...", self._act(a.show_history))
 
     def _view_items(self) -> Iterator[Item]:

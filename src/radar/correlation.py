@@ -65,7 +65,7 @@ class Response:
 RESPONSE_PREFIX = "Response: "
 # Alerts where a sign-in, session or token may be in the wrong hands: revoking the sessions ends that. It does
 # nothing about password guessing from outside or a password that is known - those are not in the list.
-_SESSION_RULES = frozenset({"session_theft", "aitm_replay", "risky_signin", "new_country", "new_country_background",
+_SESSION_RULES = frozenset({"session_theft", "aitm_replay", "hostile_reuse", "signin_wave", "risky_signin", "new_country", "new_country_background",
                             "impossible_travel", "device_code", "account_state", "pinned_accounts", "sensitive_app",
                             "legacy_auth", "mfa_exempt_watch"})
 # A disabled account cannot sign in at all: that also takes the point out of attacks on its password.
@@ -74,7 +74,8 @@ _ACCOUNT_RULES = _SESSION_RULES | {"distributed_attack", "brute_force", "passwor
 # Alerts where somebody knew or may have used the PASSWORD: a new password ends that. (Tokens that were already
 # handed out live on until the sessions are revoked - that is the other response; after a reset Entra usually
 # revokes them too, and then both are on record.) Not session theft: a stolen token does not need the password.
-_PASSWORD_RULES = frozenset({"password_not_completed", "mfa_fatigue", "mfa_report", "risky_signin", "new_country", "new_country_background",
+_PASSWORD_RULES = frozenset({"password_not_completed", "mfa_fatigue", "mfa_report", "hostile_reuse", "signin_wave",
+                             "risky_signin", "new_country", "new_country_background",
                              "impossible_travel", "mfa_exempt_watch", "pinned_accounts", "legacy_auth"})
 RESPONSES = [
     # Password guessing from outside is only answered by a reset when the guessing got somewhere.

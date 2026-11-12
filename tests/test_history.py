@@ -136,7 +136,7 @@ def test_tray_menu_layout():
         plugin_status_text=lambda rt: "ok", paused=False, exposure_reminder=True, dark_mode=False, animations=True,
         sound_enabled=True, respect_mute=True, identity_label="own app registration", setup_done=True,
         updates=SimpleNamespace(available=None), check_updates=True)
-    for name in ("show_reminders_from_tray", "show_history", "show_attacks", "show_map", "show_exposure_report", "scan_now", "toggle_pause",
+    for name in ("show_reminders_from_tray", "show_history", "show_incidents", "show_attacks", "show_map", "show_exposure_report", "scan_now", "toggle_pause",
                  "quit", "show_offices", "show_hosts", "toggle_exposure_reminder", "toggle_dark_mode", "toggle_animations", "toggle_startup",
                  "sign_in", "use_windows_account", "open_config", "open_log", "open_data_dir", "open_plugins_dir", "reload_plugins",
                  "toggle_sound", "toggle_respect_mute", "test_sound", "toggle_plugin", "toggle_rule", "show_setup", "toggle_check_updates", "look_for_update", "open_update_page"):
@@ -149,7 +149,7 @@ def test_tray_menu_layout():
         return [i.text for i in items if i is not pystray.Menu.SEPARATOR]
 
     top = list(tray._items())
-    assert texts(top)[2:] == ["Show reminders (3, 1 new)", "Alert history...", "Ongoing attacks...", "Live map...",
+    assert texts(top)[2:] == ["Show reminders (3, 1 new)", "Incidents...", "Alert history...", "Ongoing attacks...", "Live map...",
                               "MFA exposure report...", "Scan now", "Pause monitoring", "Settings", "Exit"]
     assert [i.text for i in top if i.default] == ["Show reminders (3, 1 new)"]
     settings = list(next(i for i in top if i.text == "Settings").submenu.items)

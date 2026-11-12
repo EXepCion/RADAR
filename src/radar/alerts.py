@@ -63,6 +63,7 @@ class Alert:
     # record (sessions revoked ...). Escalation is judged against this one, so a lowered alert does not "escalate"
     # back with every scan.
     base_severity: Severity | None = None
+    dismissed_at: datetime | None = None  # when the user dismissed it (None while it is a reminder)
 
     @classmethod
     def from_row(cls, r) -> "Alert":
@@ -84,6 +85,7 @@ class Alert:
             score=score, factors=factors,
             seen=bool(r["seen_at"]),
             subjects=json.loads(r["subjects"] or "[]"), signal=r["signal"] or "",
+            dismissed_at=_parse(r["dismissed_at"]) if "dismissed_at" in r.keys() else None,
         )
 
     @classmethod
