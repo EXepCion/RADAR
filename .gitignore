@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# private working notes (never published)
+PLAN.md
+private/
+
+# local tooling / editor
+.vscode/
+.idea/
+*.log
+
+# packaging output
+packaging/build/
+*.spec.bak
+Output/

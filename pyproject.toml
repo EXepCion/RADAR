@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radar-for-entra-id"
+dynamic = ["version"]
+description = "RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID: a Windows tray app that watches sign-in and audit logs for threats"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "msal[broker]>=1.31,<2",
+    "pystray==0.19.5",
+    "pillow>=11.3",
+    "requests>=2.32.4",
+    "sv-ttk>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.gui-scripts]
+RADAR = "radar.__main__:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "radar.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"radar.mapview" = ["static/*", "*.gz"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

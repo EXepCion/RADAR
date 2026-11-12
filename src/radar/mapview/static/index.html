@@ -1,0 +1,1529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live sign-in map - RADAR</title>
+<link rel="icon" type="image/png" sizes="32x32" href="icon.png?size=32">
+<link rel="icon" type="image/png" sizes="256x256" href="icon.png?size=256">
+<style>
+:root {
+  --window: #f3f3f3; --card: #ffffff; --line: #e2e2e2; --text: #1a1a1a; --muted: #5d5d5d;
+  --accent: #005fb8; --acct: #7a52c7; --sea: #e9eef3; --land: #fbfbfb; --land-line: #c9d1d9; --land-hover: #eef4fa;
+  --attack: #c42b1c; --breach: #c65d00; --ok: #0f7b0f; --office: #1a1a1a; --person: #005fb8;
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, monospace;
+}
+:root[data-theme="dark"] {
+  --window: #202020; --card: #2b2b2b; --line: #3a3a3a; --text: #f3f3f3; --muted: #ababab;
+  --accent: #60cdff; --acct: #b9a2ff; --sea: #171a1d; --land: #2a2e33; --land-line: #454c54; --land-hover: #333a42;
+  --attack: #ff6b5e; --breach: #ffaa44; --ok: #6ccb5f; --office: #f3f3f3; --person: #60cdff; color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--window); color: var(--text); font: 14px/1.45 var(--font); padding: 14px 16px; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+button { font: inherit; color: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px 14px; white-space: nowrap; min-width: 0; }
+.bar > * { flex: none; }
+.bar h1 { font: 600 20px/1.2 var(--display); margin: 0 6px 0 0; }
+.grow { flex: 1 1 auto; }
+.chips { display: flex; flex-wrap: nowrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 16px;
+  border: 1px solid var(--line); background: var(--card); font-size: 13px; }
+.chip i { width: 9px; height: 9px; border-radius: 50%; background: var(--c, var(--muted)); }
+.chip[aria-pressed="false"] { background: transparent; color: var(--muted); }
+.chip[aria-pressed="false"] i { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
+.btn { padding: 6px 14px; border-radius: 4px; border: 1px solid var(--line); background: var(--card); min-width: 84px; }
+.btn:hover, .chip:hover { border-color: var(--muted); }
+.bar > .grow { flex: 1 1 0; }
+.bar > .live { flex: 0 1 250px; min-width: 14px; }
+.live { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; justify-content: flex-end; overflow: hidden; }
+.live span { overflow: hidden; text-overflow: ellipsis; }
+.live b { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+.live.off b { background: var(--muted); } .live.err { color: var(--attack); } .live.err b { background: var(--attack); }
+.stage { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 10px; }
+.mapcard { position: relative; background: var(--sea); border-radius: 8px; overflow: hidden; min-height: 0; }
+#map { position: absolute; inset: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 5px 10px; font-size: 13px; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--card); color: var(--text); font-weight: 600; }
+.label { color: var(--muted); font-size: 13px; }
+.legend { position: absolute; left: 12px; bottom: 12px; display: grid; gap: 4px; padding: 9px 12px; border-radius: 6px;
+  background: var(--card); opacity: .92; font-size: 12px; color: var(--muted); }
+.legend span { display: flex; align-items: center; min-height: 17px; }
+/* closed (the default) it shows only the signs; a click opens the explanations sideways, another one closes them */
+.legend { cursor: pointer; }
+.legend em { font-style: normal; white-space: nowrap; overflow: hidden; max-width: 0; margin-left: 0; opacity: 0;
+  transition: max-width .38s cubic-bezier(.2, .7, .2, 1), margin-left .38s cubic-bezier(.2, .7, .2, 1), opacity .25s ease-out; }
+.legend[aria-expanded="true"] em { max-width: 700px; margin-left: 8px; opacity: 1; }
+.legend.still em { transition: none; }
+.legend:hover { opacity: 1; }
+.legend i { width: 18px; height: 0; border-top: 2px solid var(--c); }
+.legend i.dot { width: 9px; height: 9px; border: 0; border-radius: 50%; background: var(--c); margin: 0 4.5px; }
+.legend i.sq { width: 10px; height: 10px; border: 0; border-radius: 2px; background: var(--c); margin: 0 4px; }
+.legend i.dash { border-top-style: dashed; }
+.notice { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); pointer-events: none; }
+.panel { background: var(--card); border-radius: 8px; display: flex; flex-direction: column; min-height: 0; }
+.tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--line); }
+.tab { border: 0; background: none; padding: 7px 12px 9px; border-bottom: 2px solid transparent; color: var(--muted); }
+.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.body { padding: 14px 16px 16px; overflow: auto; min-height: 0; flex: 1 1 auto; }
+.body h2 { font: 600 16px/1.25 var(--display); margin: 0; overflow-wrap: anywhere; }
+.body h3 { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; margin: 16px 0 6px; }
+.sub { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+.tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.tag { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: var(--window); color: var(--muted); }
+.tag.bad { color: var(--attack); } .tag.warn { color: var(--breach); }
+.rows { display: grid; gap: 7px; }
+/* a new entry of the live feed: it opens up at the top (pushing the others down smoothly) and glows for a moment */
+.fresh { overflow: hidden; border-radius: 6px; animation: feed-in .5s cubic-bezier(.2, .7, .2, 1) both, feed-glow 2.2s ease-out both; }
+@keyframes feed-in { from { max-height: 0; margin-bottom: -7px; opacity: 0; transform: translateY(-10px); }
+                     to { max-height: 240px; margin-bottom: 0; opacity: 1; transform: none; } }
+/* opening the map: the entries on screen come in one after the other, top first (they are not new: no glow) */
+.fresh.intro { animation: feed-intro .42s cubic-bezier(.2, .7, .2, 1) both; animation-delay: calc(var(--i, 0) * 45ms); }
+@keyframes feed-intro { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+@keyframes feed-glow { from { background: color-mix(in srgb, var(--c, var(--person)) 30%, transparent); } to { background: transparent; } }
+.row { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 8px; align-items: baseline; font-size: 13px; }
+.row .t { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: pre; text-align: right; }
+.row.today .t { color: var(--text); font-weight: 600; }
+.row.older { opacity: .62; }
+.row.quiet { opacity: .68; }
+.row.acct .pip { border-radius: 2px; }  /* account events: a square mark, sign-ins and attacks are round */
+.idle { color: var(--muted); font-size: 12px; padding-left: 22px; opacity: .8; }
+.idle::before { content: "\22ee\00a0\00a0"; }
+.row em { font-style: normal; color: var(--muted); display: block; font-size: 12px; overflow-wrap: anywhere; }
+.pip { width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--person)); align-self: center; }
+.pip.ring { background: transparent; box-shadow: inset 0 0 0 1.5px var(--c, var(--muted)); }
+.mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.linkrow { border: 0; background: none; padding: 0; text-align: left; width: 100%; }
+.linkrow:hover .row > div > span { text-decoration: underline; }
+.empty { color: var(--muted); }
+.acts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; }
+.act { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; }
+.act:hover { text-decoration: underline; }
+.act::before { content: "\2197\00a0"; }
+h3 .act { font: inherit; letter-spacing: inherit; text-transform: inherit; color: var(--muted); }
+h3 .act::before { content: ""; }
+.back::before { content: "\2190\00a0"; }
+.sent { color: var(--muted); font-size: 12px; min-height: 1.4em; margin-top: 4px; }
+.entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: start; }
+.entry .act { font-size: 12px; white-space: nowrap; padding-top: 1px; }
+.back { float: right; }
+.stats { flex: none; display: flex; flex-wrap: nowrap; justify-content: space-between; gap: 6px 14px; padding: 2px 2px 0; white-space: nowrap; overflow: hidden; }
+.stat { display: flex; align-items: baseline; gap: 7px; flex: none; }
+.mapnote { position: absolute; right: 12px; top: 10px; max-width: 60%; font-size: 12px; color: var(--muted); text-align: right;
+  pointer-events: none; text-shadow: 0 0 4px var(--sea), 0 0 4px var(--sea); }
+/* smaller windows: the bars tighten instead of breaking into a second line */
+@media (max-width: 1560px) {
+  .stat { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .bar { gap: 8px 10px; } .bar h1 { font-size: 18px; margin-right: 2px; }
+  .chip { padding: 5px 9px; gap: 6px; } .seg button { padding: 5px 8px; } .btn { min-width: 70px; padding: 6px 10px; }
+}
+@media (max-width: 1360px) {
+  .bar h1 { font-size: 16px; } .chip, .seg button, .label, .live, .btn { font-size: 12px; }
+  .chip { padding: 4px 8px; gap: 5px; } .chips { gap: 4px; } .seg button { padding: 4px 7px; } .bar { gap: 8px; }
+  .stat b { font-size: 16px; } .stat span { font-size: 11px; } .stats { gap: 6px 10px; }
+}
+@media (max-width: 1180px) {
+  .bar h1 { display: none; } .bar .label { display: none; }
+  .chip { padding: 4px 7px; } .btn { min-width: 0; }
+}
+@media (max-width: 1040px) {
+  .chip, .seg button, .btn { font-size: 11px; } .chip { padding: 3px 6px; gap: 4px; } .chip i { width: 7px; height: 7px; }
+  .seg button { padding: 3px 5px; } .bar { gap: 5px; } .chips { gap: 3px; }
+  .stat b { font-size: 14px; } .stat span { font-size: 10px; } .stats { gap: 6px; }
+}
+.stat b { font: 600 18px/1 var(--display); font-variant-numeric: tabular-nums; min-width: 1.2em; }
+.stat span { color: var(--muted); font-size: 12px; }
+.stat.bad b { color: var(--attack); } .stat.warn b { color: var(--breach); }
+.statbtn { border: 0; background: none; padding: 0; font: inherit; color: inherit; }
+.statbtn:hover span { text-decoration: underline; }
+.legend i.ring { width: 7px; height: 7px; border: 2px solid var(--c); border-radius: 50%; margin: 0 4px; }
+.legend i.diaf { width: 8px; height: 8px; border: 0; background: var(--c); transform: rotate(45deg); margin: 0 5px; }
+.legend i.dia { width: 8px; height: 8px; border: 1.5px dashed var(--c); transform: rotate(45deg); margin: 0 5px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1>Live sign-in map</h1>
+  <div class="chips" role="group" aria-label="Layers">
+    <button class="chip" id="l-people" aria-pressed="true" style="--c: var(--person)"><i></i>People</button>
+    <button class="chip" id="l-offices" aria-pressed="true" style="--c: var(--office)"><i></i>Offices</button>
+    <button class="chip" id="l-attacks" aria-pressed="true" style="--c: var(--attack)"><i></i>Attacks</button>
+    <button class="chip" id="l-risk" aria-pressed="false" style="--c: var(--breach)"><i></i>Only unusual</button>
+    <button class="chip" id="l-offline" aria-pressed="false" style="--c: var(--muted)" title="Known accounts that are not signed in, where they were last seen"><i></i>Not signed in</button>
+    <button class="chip" id="l-guests" aria-pressed="false" style="--c: var(--person)" title="Guest accounts (invited from outside)"><i></i>Guests</button>
+  </div>
+  <span class="label">Attacks:</span>
+  <div class="seg" role="group" aria-label="Attack period">
+    <button id="w-1" aria-pressed="false">hour</button><button id="w-24" aria-pressed="true">24 h</button><button id="w-72" aria-pressed="false">72 h</button>
+  </div>
+  <button class="chip" id="l-dark" aria-pressed="true"><i></i>Dark map</button>
+  <span class="grow"></span>
+  <span class="live" id="live"><b></b><span id="livetext">Reading the data...</span></span>
+  <button class="btn" id="pause">Pause</button>
+</div>
+<div class="stage">
+  <div class="mapcard">
+    <div id="map"></div>
+    <div class="notice" id="notice" hidden></div>
+    <div class="mapnote" id="s-note"></div>
+    <div class="legend" id="legend" role="button" tabindex="0" aria-expanded="false" aria-label="Legend" title="Legend - click to show what the signs mean">
+      <span><i class="sq" style="--c: var(--office)"></i><em>Office with the people signed in there; blue frame / "Around" = with places close by</em></span>
+      <span><i class="dot" style="--c: var(--person)"></i><em>City outside an office (from the IP address); fainter = older</em></span>
+      <span><i class="ring" style="--c: var(--person)"></i><em>Person on an unmanaged or unidentified device</em></span>
+      <span><i class="diaf" style="--c: var(--person)"></i><em>Best guess: only a phone on mobile data is seen</em></span>
+      <span><i style="--c: var(--attack)"></i><em>Password attempts, blocked (fast arrows = last hour); the target pulses red</em></span>
+      <span><i class="ring" style="--c: var(--attack)"></i><em>Attacked account that is not signed in (where it was last seen)</em></span>
+      <span><i class="dot" style="--c: var(--muted); opacity: .6"></i><em>Not signed in, where last seen (switch "Not signed in")</em></span>
+      <span><i style="--c: var(--breach)"></i><em>Got past the password, stopped later</em></span>
+      <span><i class="dash" style="--c: var(--person)"></i><em>Movement of the selected person: today solid, yesterday faded</em></span>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="t-feed" aria-selected="true">Live feed</button>
+      <button class="tab" role="tab" id="t-sel" aria-selected="false">People</button>
+    </div>
+    <div class="body" id="body"></div>
+  </div>
+</div>
+<div class="stats">
+  <div class="stat" title="People with a successful sign-in in this time (guests only with the Guests switch)"><b id="s-people">-</b><span id="s-people-l">signed in (4 h)</span></div>
+  <div class="stat" title="Of them: signed in from an office network"><b id="s-office">-</b><span>in an office</span></div>
+  <div class="stat" title="Of them: signed in from outside the offices, shown at a city"><b id="s-remote">-</b><span>in a city</span></div>
+  <div class="stat" title="Of those in a city: placed by a best guess (only a phone on mobile data, or a hidden network)"><b id="s-country">-</b><span>best guess</span></div>
+  <button class="stat statbtn" id="s-unknown-btn" title="Signed in, but nothing tells where - click to show who"><b id="s-unknown">-</b><span>place unknown</span></button>
+  <div class="stat bad" title="Blocked password attempts from outside in the chosen time"><b id="s-att">-</b><span id="s-att-l">attacks (1 h)</span></div>
+  <div class="stat warn" title="Attempts that got past the password and were stopped later (MFA, Conditional Access)"><b id="s-breach">-</b><span>past password</span></div>
+  <div class="stat" title="Accounts that are not signed in but have a last known place - shown in grey with the 'Not signed in' switch"><b id="s-away">-</b><span>not signed in</span></div>
+  <div class="stat" title="Enabled accounts without any successful sign-in on record in the last 30 days: there is nothing to place them by"><b id="s-silent">-</b><span>no sign-in in 30 d</span></div>
+  <div class="stat" title="Enabled accounts that were active, but only through services acting for them, shared servers, VPNs or cloud networks - nothing that tells a place"><b id="s-noplace">-</b><span>no place on record</span></div>
+</div>
+
+<script src="static/echarts.min.js"></script>
+<script src="static/world.js"></script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var NUM_NUDGE = [0, 0.8];  // digits have no descenders: "middle" puts them a little high, this centres them
+  var NUM_MS = 500;  // how long a marker's number takes to count to a new value
+  var FLY_MS = 420;  // how long a person's dot takes to move between an opened marker and another place
+  var APART_ZOOM = 8, APART_LIMIT = 80;  // see buildSeries: when a city in the office's own town leaves the office marker
+  var POLL_MS = 20000, RECENT_MS = 60 * 60000, ACTIVE_MS = 6 * 60000, MERGE_PX = 30;
+  var reduced = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var state = { people: true, offices: true, attacks: true, risk: false, paused: false, tab: "feed",
+                data: null, places: {}, byId: {}, ghostById: {}, flyIn: {}, flyOut: [], markerFly: {}, blobs: [], hostOf: null, freshEvents: {}, knownEvents: null, nums: {}, numSeen: {}, counting: false, lastMemberAt: {}, lastMarkerAt: {}, ghostList: [], offline: false, guests: false, open: null, openKeys: [], ringT: 1, sel: null, detail: null, effects: true, window: 24,
+                dark: true };
+  try { state.dark = localStorage.getItem("map-theme") !== "light"; } catch (e) { /* storage not available */ }
+  document.documentElement.setAttribute("data-theme", state.dark ? "dark" : "light");
+  var chart = null;
+
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function token(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function hhmm(iso) {
+    if (!iso) return "";
+    var d = new Date(iso), today = new Date().toDateString() === d.toDateString();
+    var t = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+    return today ? t : ("0" + d.getDate()).slice(-2) + "." + ("0" + (d.getMonth() + 1)).slice(-2) + ". " + t;
+  }
+  function ago(iso) {
+    if (!iso) return "";
+    var m = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
+    return m < 1 ? "just now" : m < 60 ? m + " min ago" : m < 2880 ? Math.floor(m / 60) + " h ago" : Math.floor(m / 1440) + " days ago";
+  }
+  var regionNames = null;
+  try { regionNames = new Intl.DisplayNames(["en"], { type: "region" }); } catch (e) { /* older browser: codes only */ }
+  function countryName(code) { try { return (regionNames && regionNames.of(code)) || code; } catch (e) { return code; } }
+  // When a stop of somebody's movement was, as people there would say it: "today 09:12", "yesterday 17:40",
+  // "5 days ago" - days counted in the time zone of the place, with the zone named when it is not the viewer's.
+  function partsThere(iso, tz) {
+    var d = new Date(iso), now = new Date(), zone = tz || undefined;
+    function fmt(options, date) {
+      try { return new Intl.DateTimeFormat("en-GB", Object.assign({ timeZone: zone }, options)).format(date); }
+      catch (e) { zone = undefined; return new Intl.DateTimeFormat("en-GB", options).format(date); }
+    }
+    function dayNumber(date) {
+      var p = fmt({ year: "numeric", month: "2-digit", day: "2-digit" }, date).split("/");  // dd/mm/yyyy
+      return Date.UTC(+p[2], +p[1] - 1, +p[0]) / 86400000;
+    }
+    var days = Math.round(dayNumber(now) - dayNumber(d));
+    var time = fmt({ hour: "2-digit", minute: "2-digit", hour12: false }, d);
+    var mine = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
+    var zoneName = "";
+    if (zone && mine !== time) {
+      try {
+        new Intl.DateTimeFormat("en-GB", { timeZone: zone, timeZoneName: "short" }).formatToParts(d)
+          .forEach(function (x) { if (x.type === "timeZoneName") zoneName = x.value; });
+      } catch (e) { zoneName = ""; }
+    }
+    var day = days <= 0 ? "today" : days === 1 ? "yesterday" : days + " days ago";
+    return { days: days, day: day, time: time, zone: zoneName, date: fmt({ day: "numeric", month: "short" }, d) };
+  }
+  function whenThere(iso, tz, until) {  // for the movement list: when the stop began and, if it lasted, until when
+    var p = partsThere(iso, tz);
+    var text = p.day + (p.days > 1 ? " \u00b7 " + p.date : "") + "\n" + p.time + (p.zone ? " " + p.zone : "");
+    if (until && new Date(until).getTime() - new Date(iso).getTime() > 30 * 60000) {
+      var u = partsThere(until, tz);
+      text += "\nuntil " + (u.days === p.days ? "" : u.day + " ") + u.time;
+    }
+    return text;
+  }
+  function whenShort(iso, tz) {  // one short piece for the map
+    var p = partsThere(iso, tz);
+    return p.days <= 1 ? p.day + " " + p.time : p.day;
+  }
+  function xy(place) {
+    // a country marker stands in the middle of the country when the map knows it, else where its sign-ins were located
+    if (place.kind === "country" && chart) {
+      if (!place.center) {
+        var region = null;
+        try { region = chart.getModel().getComponent("geo").coordinateSystem.getRegion(countryName(place.country)); } catch (e) { region = null; }
+        place.center = region && region.center ? region.center.slice() : [place.lon, place.lat];
+      }
+      return place.center;
+    }
+    return [place.lon, place.lat];
+  }
+  function placeLabel(place) { return place.kind === "country" ? "Somewhere in " + countryName(place.country) : place.label; }
+  function fade(iso) {  // how current the evidence is: full for the last 15 minutes, normal up to an hour, then faded
+    var m = (Date.now() - new Date(iso).getTime()) / 60000;
+    return m <= 15 ? 1 : m <= 60 ? 0.85 : 0.5;
+  }
+  // who is shown: guests only with the "Guests" switch, with "Only unusual" only the unusual
+  function shown(p) { return (state.guests || !p.guest) && (!state.risk || p.unusual); }
+  function shownPeople() { return state.data.people.filter(shown); }
+  function shownUnlocated() { return (state.data.unlocated || []).filter(shown); }
+  function shownGhosts() {
+    // accounts without a person on the map: attacked ones that are not signed in (red), and - with the
+    // "Not signed in" switch - every known account that is not signed in (grey), each where it was last seen
+    var d = state.data, out = [], have = {};
+    // (an attacked account is unusual: "Only unusual" shows it also while the attack arrows are switched off)
+    (state.attacks || state.risk ? d.absent_targets || [] : []).concat(state.offline ? d.offline || [] : []).forEach(function (g) {
+      if (!have[g.id] && shown(g)) { have[g.id] = 1; out.push(g); }
+    });
+    return out;
+  }
+  function tagClass(t) {
+    return t === "under attack" ? "bad" : (t === "no MFA" || t === "VPN / proxy" || t === "MFA excluded" || t === "unmanaged device") ? "warn" : "";
+  }
+
+  // ------------------------------------------------------------------ map
+  function ringPositions(center, n) {
+    // person dots around an opened place: rings in screen space (so they keep their distance at every zoom)
+    var c = chart.convertToPixel({ geoIndex: 0 }, center), out = [], ring = 0, placed = 0;
+    out.offsets = [];
+    while (placed < n) {
+      var r = 34 + ring * 20, cap = Math.max(6, Math.floor(2 * Math.PI * r / 20)), k = Math.min(cap, n - placed);
+      for (var i = 0; i < k; i++) {
+        var a = -Math.PI / 2 + 2 * Math.PI * i / k + ring * 0.3 - (1 - state.ringT) * 0.9;  // a slight turn while opening
+        out.push(chart.convertFromPixel({ geoIndex: 0 }, [c[0] + r * state.ringT * Math.cos(a), c[1] + r * state.ringT * Math.sin(a)]));
+        out.offsets.push([r * Math.cos(a), r * Math.sin(a)]);
+      }
+      placed += k; ring++;
+    }
+    out.radius = (34 + (ring - 1) * 20) * state.ringT;  // px from the centre to the outermost dots
+    return out;
+  }
+  function buildSeries() {
+    var c = { text: token("--text"), muted: token("--muted"), card: token("--card"), attack: token("--attack"),
+              breach: token("--breach"), person: token("--person"), office: token("--office"), window: token("--window") };
+    var d = state.data, fx = state.effects && !state.paused, now = Date.now();
+    var people = shownPeople(), counts = {};
+    people.forEach(function (p) { counts[p.place] = (counts[p.place] || 0) + 1; });
+    // attacked accounts that are not signed in: no person to show, but the arrows need something to end on
+    var ghosts = shownGhosts(), ghostsAt = {};
+    state.ghostList = ghosts;
+    ghosts.forEach(function (g) { (ghostsAt[g.place] = ghostsAt[g.place] || []).push(g); });
+    // an office is always on the map (also with nobody in it); cities appear with the people in them
+    d.places.forEach(function (pl) { if ((pl.kind === "office" || ghostsAt[pl.key]) && !counts[pl.key]) counts[pl.key] = 0; });
+    var visible = d.places.filter(function (pl) {
+      return pl.kind === "office" ? state.offices && (counts[pl.key] || pl.configured) : (counts[pl.key] && state.people) || !!ghostsAt[pl.key]; });
+    // Cities that would overlap at this zoom are shown as one marker, and a city that would lie on an office is
+    // taken into the office's marker (its people are added to the number); zooming in separates them again.
+    // Nobody is ever dropped from the numbers by zooming.
+    var zoomNow = (chart.getOption().geo[0] || {}).zoom || 1.2;
+    var markers = [], active = {}, openSet = {}, openMarker = null;
+    function offlineAt(key) { return (ghostsAt[key] || []).filter(function (g) { return g.offline; }).length; }
+    (state.open ? state.openKeys : []).forEach(function (k) { openSet[k] = 1; });
+    people.forEach(function (p) { if (now - new Date(p.seen).getTime() < ACTIVE_MS) active[p.place] = 1; });
+    visible.slice().sort(function (a, b) { return (b.kind === "office") - (a.kind === "office") || counts[b.key] - counts[a.key]; })
+      .forEach(function (pl) {
+        if (openSet[pl.key]) {  // the opened marker: one place, or several merged ones shown as one
+          if (!openMarker) {
+            var main = state.places[state.open];
+            openMarker = { place: main, px: chart.convertToPixel({ geoIndex: 0 }, xy(main)), count: 0, own: 0, absent: 0, off: 0, keys: [],
+                           office: main.kind === "office", country: false, open: true, active: false };
+            markers.push(openMarker);
+          }
+          openMarker.count += counts[pl.key]; openMarker.absent += (ghostsAt[pl.key] || []).length; openMarker.off += offlineAt(pl.key);
+          if (pl.key === state.open) openMarker.own = counts[pl.key];
+          openMarker.keys.push(pl.key); openMarker.active = openMarker.active || !!active[pl.key];
+          return;
+        }
+        var px = chart.convertToPixel({ geoIndex: 0 }, xy(pl)), host = null;
+        if (pl.kind === "city" && state.open !== pl.key) {
+          // Which marker takes the city in: the NEAREST office it lies on, else the nearest bubble it lies on.
+          // Nearest, not first - so people around one office never jump over to another office that happens to be
+          // within reach as well when zoomed far out (and what is nearest does not change with the zoom).
+          var hostGap = Infinity;
+          for (var m = 0; m < markers.length; m++) {
+            var o = markers[m];
+            var gapX = Math.abs(o.px[0] - px[0]), gapY = Math.abs(o.px[1] - px[1]);
+            if (o.country || gapX >= MERGE_PX || gapY >= MERGE_PX) continue;
+            // A city practically at the office's own spot (the office's town) could never be zoomed apart from it:
+            // once zoomed in (APART_ZOOM) it stands next to the office instead of staying inside its number.
+            if (o.office && zoomNow >= APART_ZOOM && zoomNow * MERGE_PX / Math.max(gapX, gapY, 0.01) > APART_LIMIT) continue;
+            if (o.open && !o.office) continue;
+            var gap = gapX * gapX + gapY * gapY;
+            if (host && host.office && !o.office) continue;                        // an office goes before a bubble
+            if (!host || (o.office && !host.office) || gap < hostGap) { host = o; hostGap = gap; }
+          }
+          if (host && host.open) host = null;  // its office is opened right now: it joins that one (splitOpen), no other
+        }
+        var absentN = (ghostsAt[pl.key] || []).length, offN = offlineAt(pl.key);
+        if (host) { host.count += counts[pl.key]; host.absent += absentN; host.off += offN; host.keys.push(pl.key); host.active = host.active || !!active[pl.key]; }
+        else markers.push({ place: pl, px: px, count: counts[pl.key], own: counts[pl.key], absent: absentN, off: offN, keys: [pl.key], office: pl.kind === "office",
+                            country: pl.kind === "country", open: state.open === pl.key, active: !!active[pl.key] });
+      });
+    // A city bubble never lies on an office: it is moved aside (away from the office, not onto its label on the
+    // right) until both can be clicked. Attack lines and opened places still use the true position.
+    function size(m) {
+      if (m.office) return (m.count > 99 ? 30 : 25) + (m.place.hq ? 3 : 0);
+      if (m.country) return 24 + Math.min(10, Math.sqrt(m.count) * 2);
+      if (m.count === 0) return m.absent > 1 ? 14 + Math.min(10, Math.sqrt(m.absent) * 1.5) : 9;  // nobody signed in there
+      return m.count === 1 ? 9 : 15 + Math.min(13, Math.sqrt(m.count) * 2);
+    }
+    var offices = markers.filter(function (m) { return m.office; });
+    markers.forEach(function (m) {
+      m.at = xy(m.place);
+      if (m.office || m.open || m.country) return;
+      var moved = false;
+      for (var pass = 0; pass < 3; pass++) {
+        offices.forEach(function (o) {
+          var need = (size(m) + size(o)) / 2 + 6, dx = m.px[0] - o.px[0], dy = m.px[1] - o.px[1], dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist >= need) return;
+          if (dist < 1 || (dx > 0 && Math.abs(dy) < need * 0.6)) { dx = -0.75; dy = -0.66; dist = 1; }  // not onto the label
+          m.px = [o.px[0] + dx / dist * need, o.px[1] + dy / dist * need];
+          moved = true;
+        });
+      }
+      if (moved) m.at = chart.convertFromPixel({ geoIndex: 0 }, m.px);
+    });
+    var markerOf = {};
+    markers.forEach(function (m) { m.keys.forEach(function (k) { markerOf[k] = m; }); });
+    // Markers that split up or take each other in (zooming) do so visibly: a place that now stands alone moves out
+    // of the marker it was part of, a place that was taken in moves into the marker that took it.
+    var before = state.hostOf, beforeAt = state.lastMarkerAt, canFly = state.effects && before;
+    markers.forEach(function (m) {
+      var lead = m.place.key;
+      if (!canFly || m.open) return;
+      m.keys.forEach(function (k) {
+        var from = beforeAt[k];
+        if (before[k] === undefined || before[k] === lead || !from) return;
+        if (k === lead) { state.markerFly[lead] = { from: from, t0: now }; return; }
+        var same = state.blobs.filter(function (b) { return b.to === lead && b.t0 === now && b.from[0] === from[0] && b.from[1] === from[1]; })[0];
+        if (same) same.n += counts[k] || 0; else state.blobs.push({ from: from, to: lead, n: counts[k] || 0, t0: now });
+      });
+    });
+    state.hostOf = {};
+    state.lastMarkerAt = {};  // where each place is drawn right now (also the start of the next move)
+    markers.forEach(function (m) {
+      var f = state.markerFly[m.place.key];
+      if (f && !m.open && !m.office) { var mf = flight(f, m.at); if (!mf.done) m.at = mf.at; }
+      m.keys.forEach(function (k) { state.hostOf[k] = m.place.key; state.lastMarkerAt[k] = m.at; });
+    });
+    if ((Object.keys(state.markerFly).length || state.blobs.length) && !flyAnim) flyAnim = requestAnimationFrame(flyLoop);
+    // A number inside a marker counts up or down to its new value instead of jumping.
+    state.counting = false; state.numSeen = {};
+    function num(id, target) {
+      var t = state.nums[id];
+      state.numSeen[id] = 1;
+      if (!t || !state.effects) { state.nums[id] = { from: target, to: target, t0: 0 }; return target; }
+      function at(t) {
+        var k = Math.min(1, (now - t.t0) / NUM_MS);
+        return k >= 1 ? t.to : Math.round(t.from + (t.to - t.from) * (1 - Math.pow(1 - k, 2)));
+      }
+      if (t.to !== target) t = state.nums[id] = { from: at(t), to: target, t0: now };
+      var v = at(t);
+      if (v !== t.to) state.counting = true;
+      return v;
+    }
+    function flight(f, target) {  // where a flying dot is right now, and how far along (1 = arrived)
+      var t = Math.min(1, (now - f.t0) / FLY_MS), e = 1 - Math.pow(1 - t, 3);
+      return { at: [f.from[0] + (target[0] - f.from[0]) * e, f.from[1] + (target[1] - f.from[1]) * e], e: e, done: t >= 1 };
+    }
+    var atk = state.attacks ? d.attacks.filter(function (a) { return state.places[a.to]; }) : [];
+    var attacked = {};
+    atk.forEach(function (a) {
+      a.recent = now - new Date(a.last).getTime() < RECENT_MS;
+      (a.users || []).forEach(function (u) { attacked[u] = 1; });
+    });
+    // A person's dot: solid = a managed device, hollow = an unmanaged or unidentified device; orange = unusual;
+    // red frame = under attack; the older the evidence, the fainter.
+    function personStyle(p, hit) {
+      // an attacked account that is not signed in: a hollow red dot - there is no person there right now
+      if (p.offline) return { color: c.muted, borderColor: c.card, borderWidth: 1, opacity: 0.5 };  // not signed in: grey
+      if (p.absent) return { color: c.card, borderColor: c.attack, borderWidth: 2, opacity: 0.95 };
+      var color = p.unusual ? c.breach : c.person;
+      return { color: p.flagged ? c.card : color, borderColor: hit ? c.attack : p.flagged ? color : c.card,
+               borderWidth: hit ? 2.5 : p.flagged ? 2 : 1.5, opacity: fade(p.seen) };
+    }
+    function memberStyle(p, hit) {  // people of an opening / closing ring fade in and out with it
+      var st = personStyle(p, hit);
+      st.opacity *= Math.min(1, state.ringT * 1.4);
+      return st;
+    }
+    // a best guess (only a phone on mobile data is seen) is a diamond, everyone else a round dot
+    function personSymbol(p) { return p.precision === "guess" ? "diamond" : "circle"; }
+    // the people of the opened place, as dots around it
+    var members = [], memberAt = {}, ringR = 0, soloId = null;
+    var inside = state.open && state.places[state.open] && state.people ? people.filter(function (p) { return openSet[p.place]; }) : [];
+    if (state.open && state.places[state.open]) inside = inside.concat(ghosts.filter(function (g) { return openSet[g.place]; }));
+    if (inside.length === 1 && openMarker && !openMarker.office) {
+      // one person in a city: no separate dot next to the marker - the marker itself is the person
+      soloId = inside[0].id;
+      memberAt[soloId] = openMarker.at;
+      openMarker.solo = inside[0];
+    } else if (inside.length) {
+      var pos = ringPositions(xy(state.places[state.open]), inside.length);
+      ringR = pos.radius;
+      members = inside.map(function (p, i) {
+        var selected = state.sel && state.sel.type === "person" && state.sel.id === p.id, hit = !!attacked[p.id];
+        var fin = state.flyIn[p.id], spot = pos[i];
+        if (fin) { var fl = flight(fin, pos[i]); if (!fl.done) spot = fl.at; }
+        memberAt[p.id] = spot;
+        // The name stands on the outer side of the dot - right of dots on the right, left of dots on the left, above
+        // / below the ones at the top / bottom - and is pushed out past the outermost ring, so it never runs across
+        // the office icon or other people.
+        var dx = pos.offsets[i][0], dy = pos.offsets[i][1], reach = pos.radius || 1, side = Math.abs(dx) >= 0.5 * Math.sqrt(dx * dx + dy * dy);
+        var clear = side ? Math.max(0, Math.sqrt(Math.max(0, reach * reach - dy * dy)) - Math.abs(dx)) : Math.max(0, Math.sqrt(Math.max(0, reach * reach - dx * dx)) - Math.abs(dy));
+        var where = side ? (dx >= 0 ? "right" : "left") : (dy < 0 ? "top" : "bottom");
+        var push = side ? [(dx >= 0 ? 1 : -1) * clear, 0] : [0, (dy < 0 ? -1 : 1) * clear];
+        return { person: p, value: spot, symbol: personSymbol(p), symbolSize: (selected ? 15 : 10) + (p.precision === "guess" ? 2 : 0),
+                 label: { show: state.ringT === 1 && !fin && (inside.length <= 10 || selected || hit), formatter: p.name, position: where, offset: push,
+                          distance: 5, color: c.text, fontSize: 11 },
+                 itemStyle: memberStyle(p, hit) }; });
+    }
+    state.lastMemberAt = memberAt;
+    var dimTo = 1 - 0.75 * state.ringT;  // how far the other markers are dimmed while a place is (being) expanded
+    // An expanded place gets room: markers its ring would cover are hidden, all others are dimmed and lose their
+    // labels until it is closed again - nothing overlaps the people one is looking at.
+    if (openMarker && (ringR || openMarker.solo)) {
+      var nameWidth = openMarker.solo ? 18 + 7 * openMarker.solo.name.length : 0;  // room the name next to a single person takes
+      markers.forEach(function (m) {
+        if (m === openMarker) return;
+        var dx = m.px[0] - openMarker.px[0], dy = m.px[1] - openMarker.px[1], half = size(m) / 2;
+        var covered = ringR ? Math.sqrt(dx * dx + dy * dy) < ringR + half + 14
+                            : dx > -half - 8 && dx < nameWidth + half && Math.abs(dy) < 12 + half;
+        if (covered) m.hidden = true; else m.dim = true;
+      });
+    }
+    markers = markers.filter(function (m) { return !m.hidden; });
+    // Where an attack arrives on screen: at the attacked person's own dot when the place is opened, else at the
+    // marker that stands for the place (the office icon, the city bubble - also when it was moved aside or merged).
+    function arrival(a) {
+      var users = a.users || [];
+      if (openSet[a.to] && users.length === 1 && memberAt[users[0]]) return { at: memberAt[users[0]], size: 10, symbol: "circle" };
+      var m = markerOf[a.to];
+      if (m) return { at: m.at, size: size(m), symbol: m.office ? "roundRect" : "circle", quiet: !!(m.dim || m.hidden) };
+      return { at: xy(state.places[a.to]), size: 8, symbol: "circle" };
+    }
+    function lines(list) {
+      return list.map(function (a) {
+        return { attack: a, coords: [[a.lon, a.lat], arrival(a).at],
+                 lineStyle: { width: Math.min(3, 0.8 + a.count / 6), opacity: a.recent ? 0.5 : 0.2 } }; });
+    }
+    function pick(breach, recent) { return lines(atk.filter(function (a) { return a.breach === breach && a.recent === recent; })); }
+    // the attacked marker itself pulses red: rings grow out of the office icon / bubble / person dot
+    var targets = {};
+    atk.forEach(function (a) {
+      var t = arrival(a), key = t.at.join(",");
+      if (t.quiet) return;  // dimmed while another place is expanded: no pulsing there
+      if (!targets[key] || a.recent) targets[key] = { value: t.at, symbol: t.symbol, symbolSize: t.size + 3, recent: a.recent || (targets[key] && targets[key].recent) };
+    });
+    var trail = [], trailOld = [], hops = [];
+    if (state.detail && state.sel && state.sel.type === "person" && state.detail.id === state.sel.id) {
+      var h = state.detail.hops, me = memberAt[state.sel.id];
+      // Each stop is drawn where its place is shown (a bubble may be moved aside or merged). The trail ends at
+      // the person's own dot when the last stop is the place the person is in now - not at the place marker.
+      var person = state.byId[state.sel.id];
+      var at = h.map(function (hp, idx) {
+        if (idx === h.length - 1 && me && person && (hp.place === person.place || openSet[hp.place])) return me;
+        var m = markerOf[hp.place];
+        return m ? m.at : [hp.lon, hp.lat];
+      });
+      // When a move happened shows at a glance (days as people at that place count them): today's moves are solid
+      // and carry a flying dot, yesterday's are dashed and faded. Older ones are not drawn - they are in the list
+      // on the right - except the latest one when there is nothing newer, so that a selected person never has no trail.
+      var age = h.map(function (hp) { return partsThere(hp.when, hp.tz).days; }), drawn = {}, any = false;
+      for (var i = 1; i < h.length; i++) if (age[i] <= 1) any = true;
+      for (i = 1; i < h.length; i++) {
+        var old = age[i] > 1;
+        if (old && (any || i !== h.length - 1)) continue;
+        drawn[i - 1] = drawn[i] = true;
+        var leg = { coords: [at[i - 1], at[i]],
+                    lineStyle: { color: h[i].bad ? c.attack : c.person, width: age[i] <= 0 ? 2.5 : 2,
+                                 opacity: age[i] <= 0 ? 0.95 : old ? 0.28 : 0.45, type: age[i] <= 0 ? "solid" : old ? "dotted" : "dashed" } };
+        (age[i] <= 0 ? trail : trailOld).push(leg);
+      }
+      drawn[h.length - 1] = true;  // where the person is now
+      var labelled = [], showLabel = {};
+      for (var k = h.length - 1; k >= 0; k--) {  // newest first: it keeps its label
+        var spot = chart.convertToPixel({ geoIndex: 0 }, at[k]);
+        var clash = labelled.some(function (q) { return Math.abs(q[0] - spot[0]) < 130 && Math.abs(q[1] - spot[1]) < 16; });
+        var onRing = openMarker && ringR && Math.sqrt(Math.pow(spot[0] - openMarker.px[0], 2) + Math.pow(spot[1] - openMarker.px[1], 2)) < ringR + 10 && at[k] !== me;
+        if (!drawn[k]) continue;
+        if (!clash && !onRing) { labelled.push(spot); showLabel[k] = true; }
+      }
+      hops = h.map(function (hp, idx) {
+        if (!drawn[idx]) return null;
+        var last = idx === h.length - 1 && at[idx] === me, today = age[idx] <= 0;
+        return { value: at[idx], symbolSize: last ? 1 : today ? 9 : 7,
+                 label: { show: !!showLabel[idx], formatter: hp.label + " · " + whenShort(hp.when, hp.tz), position: last ? "bottom" : "top", distance: last ? 12 : 5,
+                          color: today ? c.text : c.muted, fontSize: 11, fontWeight: today ? 600 : 400 },
+                 itemStyle: { color: c.card, borderColor: hp.bad ? c.attack : c.person, borderWidth: last ? 0 : today ? 2 : 1.5,
+                              opacity: today ? 1 : age[idx] === 1 ? 0.6 : 0.35 } }; }).filter(Boolean);
+    }
+    // Every attack line carries a flying arrow, like in the design. Age shows in pace and strength: attempts of the
+    // last hour fly fast and bright, older ones of the chosen period slower and fainter.
+    function atkSeries(name, data, color, recent) {
+      return { name: name, type: "lines", coordinateSystem: "geo", zlevel: 1,
+               // Every arrow starts at a moment of its own, spread evenly over the whole flight time. (By default
+               // they all start within a third of it - the arrows then leave and arrive as one wave, which looks
+               // like the whole animation starting over again and again.)
+               effect: { show: fx, period: recent ? 2.4 : 4.6, trailLength: recent ? 0.45 : 0.3, symbol: "arrow",
+                         symbolSize: recent ? 8 : 6, color: color,
+                         delay: function (idx) { return ((idx * 0.6180339887) % 1) * (recent ? 2400 : 4600); } },
+               lineStyle: { color: color, curveness: 0.28, shadowBlur: recent && state.dark ? 8 : 0, shadowColor: color }, data: data };
+    }
+    var zoom = (chart.getOption().geo[0] || {}).zoom || 1.2;
+    var officeMarkers = markers.filter(function (m) { return m.office; }), cityMarkers = markers.filter(function (m) { return !m.office; });
+    return [
+      atkSeries("attacks-old", pick(false, false), c.attack, false),
+      atkSeries("attacks", pick(false, true), c.attack, true),
+      atkSeries("breaches-old", pick(true, false), c.breach, false),
+      atkSeries("breaches", pick(true, true), c.breach, true),
+      { name: "targets", type: "effectScatter", coordinateSystem: "geo", zlevel: 1, silent: true,
+        rippleEffect: { brushType: "stroke", scale: 2.6, period: 2.2 }, itemStyle: { color: c.attack },
+        data: fx ? Object.keys(targets).map(function (k) { return targets[k]; }) : [] },
+      { name: "trail-old", type: "lines", coordinateSystem: "geo", zlevel: 2, silent: true,
+        effect: { show: false }, lineStyle: { curveness: 0.2 }, data: trailOld },
+      { name: "trail", type: "lines", coordinateSystem: "geo", zlevel: 2, silent: true,
+        effect: { show: fx && trail.length > 0, period: 3.2, trailLength: 0.15, symbol: "circle", symbolSize: 5, color: c.person },
+        lineStyle: { curveness: 0.2 }, data: trail },
+      { name: "hops", type: "scatter", coordinateSystem: "geo", zlevel: 2, symbolSize: 9, silent: true, data: hops },
+      { name: "pulses", type: "effectScatter", coordinateSystem: "geo", zlevel: 2, symbolSize: 6, silent: true,
+        rippleEffect: { brushType: "stroke", scale: 6, period: 2 }, itemStyle: { color: c.person },
+        data: fx ? cityMarkers.filter(function (m) { return m.active; }).map(function (m) { return { value: m.at }; }) : [] },
+      { name: "places", type: "scatter", coordinateSystem: "geo", zlevel: 3,
+        data: cityMarkers.filter(function (m) { return !m.country; }).map(function (m) {
+          var pl = m.place, n = m.count, group = m.keys.length > 1, solo = m.solo;
+          var open = m.open && !solo;  // expanded into a ring of people
+          var one = solo || (n === 1 && !open ? people.filter(function (q) { return q.place === pl.key; })[0] : null) ||
+                    (n === 0 && !open && m.absent === 1 ? m.keys.map(function (k) { return (ghostsAt[k] || [])[0]; }).filter(Boolean)[0] : null);
+          var nobody = n === 0 && !one;  // only accounts that are not signed in: a grey bubble with their number
+          var style = one ? personStyle(one, !!attacked[one.id]) :
+            nobody ? { color: c.muted, borderColor: open ? c.breach : c.card, borderWidth: open ? 2.5 : 1, opacity: open ? 0.4 : 0.55 } :
+            { color: c.person, borderColor: open ? c.breach : c.card, borderWidth: open ? 2.5 : 1.2,
+              opacity: open ? 0.55 : group ? 0.95 : 0.85, shadowBlur: state.dark ? 6 : 0, shadowColor: c.person };
+          if (m.dim) style.opacity = Math.min(style.opacity == null ? 1 : style.opacity, dimTo);
+          return { place: pl, count: n, off: m.off, absent: m.absent, keys: m.keys, value: m.at, symbol: one ? personSymbol(one) : "circle",
+                   symbolSize: size(m) + (one && one.precision === "guess" ? 2 : 0) + (solo ? 5 : 0),
+                   label: solo ? { show: true, position: "right", distance: 6, color: c.text, fontSize: 12, fontWeight: 600, formatter: solo.name } :
+                          open ? { show: true, position: "top", offset: [0, -ringR - 22 + size(m) / 2], color: c.text, fontSize: 12, fontWeight: 600,
+                                   formatter: (group ? "Around " : "") + pl.label + "  " + n } :
+                          { show: (n > 1 || (nobody && m.absent > 1)) && !(m.dim && state.ringT > 0.5), position: "inside", offset: NUM_NUDGE, color: c.window, fontSize: 10,
+                            fontWeight: 600, formatter: nobody ? String(num("a:" + pl.key, m.absent)) : String(num("c:" + pl.key, n)) },
+                   itemStyle: style }; }) },
+      // only the country is known (a phone on mobile data): a hollow diamond in the middle of the country
+      { name: "countries", type: "scatter", coordinateSystem: "geo", zlevel: 3,
+        data: cityMarkers.filter(function (m) { return m.country; }).map(function (m) {
+          return { place: m.place, count: m.count, keys: m.keys, value: m.at, symbol: "diamond", symbolSize: size(m),
+                   label: { show: true, position: "inside", offset: NUM_NUDGE, color: c.person, fontSize: 10, fontWeight: 700, formatter: String(num("c:" + m.place.key, m.count)) },
+                   itemStyle: { color: c.window, borderColor: m.open ? c.breach : c.person, borderWidth: 1.6, borderType: "dashed",
+                                opacity: m.open ? 0.7 : 0.95 } }; }) },
+      // an office: a square with the number of people inside; the headquarters is a little bigger and has an HQ badge
+      { name: "offices", type: "scatter", coordinateSystem: "geo", zlevel: 3,
+        data: officeMarkers.map(function (m) {
+          var pl = m.place;
+          return { place: pl, count: m.count, own: m.own, off: m.off, absent: m.absent, keys: m.keys, value: m.at, symbol: "roundRect", symbolSize: size(m),
+                   label: { show: true, position: "inside", offset: NUM_NUDGE, color: c.window, fontSize: m.count > 99 ? 10 : 11, fontWeight: 700,
+                            formatter: String(num("c:" + m.place.key, m.count)) },
+                   // a blue frame (the colour of the city bubbles) = the number includes places close by that lie on the
+                   // office at this zoom; the headquarters is told by its HQ badge and its size, not by the frame
+                   itemStyle: { color: c.office, borderColor: m.open ? c.breach : m.keys.length > 1 ? c.person : c.card,
+                                borderWidth: m.open || m.keys.length > 1 ? 2.5 : 1.2, opacity: m.dim ? dimTo : m.open ? 0.7 : m.count ? 1 : 0.5,
+                                shadowBlur: state.dark && !m.dim ? 6 : 0, shadowColor: c.office } }; }) },
+      { name: "office-names", type: "scatter", coordinateSystem: "geo", zlevel: 3, silent: true, symbolSize: 1,
+        itemStyle: { color: "rgba(0,0,0,0)" },
+        data: officeMarkers.filter(function (m) { return !(m.dim && state.ringT > 0.5); }).map(function (m) {
+          var pl = m.place, where = [pl.city, pl.country].filter(Boolean).join(", ");
+          return { value: m.at,
+                   // the name of an expanded office moves above its ring of people
+                   label: { show: true, position: m.open && ringR > 20 ? "top" : "right",
+                            offset: m.open && ringR > 20 ? [0, -ringR - 22] : [size(m) / 2 + 3, 0],
+                            formatter: "{n|" + (m.keys.length > 1 && !m.open ? "Around " : "") + pl.label + "}" + (pl.hq ? " {hq|HQ}" : "") + (where && zoom >= 2.4 ? "\n{c|" + where + "}" : ""),
+                            rich: { n: { color: c.text, fontSize: 12, fontWeight: 600, lineHeight: 16 },
+                                    hq: { color: c.window, backgroundColor: c.person, borderRadius: 3, padding: [2, 5], fontSize: 10, fontWeight: 700 },
+                                    c: { color: c.muted, fontSize: 11, lineHeight: 15 } } } }; }) },
+      // accounts that are not signed in, at an office or a place where people are: a number at its corner, so the
+      // marker's own number plus this one is exactly what opening the place shows
+      { name: "absent-badges", type: "scatter", coordinateSystem: "geo", zlevel: 4, silent: true,
+        data: markers.filter(function (m) { return m.absent && !m.open && !m.country && (m.count || m.office) && !(m.dim && state.ringT > 0.5); })
+          .map(function (m) {
+            var h = size(m) / 2;
+            // placed by its own screen position (a symbol offset would shift the circle but not quite its number)
+            return { value: chart.convertFromPixel({ geoIndex: 0 }, [m.px[0] + h - 1, m.px[1] + 1 - h]), symbol: "circle",
+                     symbolSize: m.absent > 99 ? 22 : m.absent > 9 ? 17 : 15,
+                     label: { show: true, position: "inside", offset: NUM_NUDGE, color: m.absent > m.off ? c.text : c.window, fontSize: 9, fontWeight: 700, formatter: String(num("a:" + m.place.key, m.absent)) },
+                     // red frame: at least one of them is under attack (such accounts are shown also without the switch)
+                     itemStyle: m.absent > m.off ? { color: c.card, borderColor: c.attack, borderWidth: 1.5, opacity: m.dim ? dimTo : 1 }
+                                                 : { color: c.muted, borderColor: c.card, borderWidth: 1, opacity: m.dim ? dimTo : 1 } }; }) },
+      { name: "members", type: "scatter", coordinateSystem: "geo", zlevel: 4, data: members },
+      // a place that was taken into another marker: its bubble moves over there and fades
+      { name: "merging", type: "scatter", coordinateSystem: "geo", zlevel: 3, silent: true,
+        data: state.blobs.map(function (b) {
+          var m = markerOf[b.to], lead = state.markerFly[b.to];
+          if (!m || (lead && lead.t0 === b.t0)) return null;  // the marker it joined is itself moving out from the same spot
+          var fl = flight(b, m.at);
+          if (fl.done) return null;
+          return { value: fl.at, symbol: "circle", symbolSize: (b.n <= 1 ? 9 : 15 + Math.min(13, Math.sqrt(b.n) * 2)) * (1 - 0.3 * fl.e),
+                   itemStyle: { color: b.n ? c.person : c.muted, borderColor: c.card, borderWidth: 1, opacity: 0.85 * (1 - 0.7 * fl.e) } };
+        }).filter(Boolean) },
+      // people leaving an opened marker (zoomed in: their place stands alone again) fly over to where they now are
+      { name: "leaving", type: "scatter", coordinateSystem: "geo", zlevel: 4, silent: true,
+        data: state.flyOut.map(function (f) {
+          var m = markerOf[f.place], fl = flight(f, m ? m.at : xy(state.places[f.place] || { lon: f.from[0], lat: f.from[1] }));
+          if (fl.done) return null;
+          var st = personStyle(f.person, !!attacked[f.person.id]);
+          st.opacity = (st.opacity == null ? 1 : st.opacity) * (1 - 0.5 * fl.e);
+          return { value: fl.at, symbol: personSymbol(f.person), symbolSize: 10, itemStyle: st }; }).filter(Boolean) }
+    ];
+  }
+  var mapMoved = true, drawCount = 0, lastLineSig = "";
+  function draw() {
+    if (!chart || !state.data) return;
+    // Redrawing must not disturb the flying arrows. The chart library, on every redraw, (1) wipes the layer the
+    // arrows' tails are painted on and (2) hides every arrow until its next step - with all arrows blinking at once
+    // it looks as if the animation started over. So when the lines are exactly the same as in the last drawing
+    // (same lines, same ends, same colours - nothing switched off, nothing moved), the wipe is held back for this
+    // redraw, and the arrows are put back right after it. Any change to the lines gets the normal, clean redraw.
+    var zr = chart.getZr(), keep = [], series = buildSeries();
+    var lineSig = state.dark + "|" + series.filter(function (x) { return x.type === "lines"; }).map(function (x) {
+      return x.name + ":" + (x.effect && x.effect.show) + ":" + (x.data || []).map(function (l) {
+        return l.coords.join(";") + "/" + (l.lineStyle ? l.lineStyle.color + l.lineStyle.type : ""); }).join(","); }).join("|");
+    if (lineSig !== lastLineSig) mapMoved = true;
+    lastLineSig = lineSig;
+    if (!mapMoved) [1, 2].forEach(function (z) { var layer = zr.painter.getLayer(z); if (layer && layer.clear) keep.push(layer); });
+    mapMoved = false;
+    drawCount++;
+    keep.forEach(function (layer) {
+      var real = layer.clear;
+      layer.__real = real;
+      layer.clear = function (all) { if (all !== true) return real.apply(layer, arguments); };
+    });
+    try { chart.setOption({ series: series }); }
+    finally { keep.forEach(function (layer) { layer.clear = layer.__real; }); }
+    (function walk(list) {
+      for (var i = 0; list && i < list.length; i++) {
+        var el = list[i];
+        if (el.__p1 && el.__t > 0 && el.ignore) el.ignore = false;  // an arrow in flight stays visible
+        if (el._children) walk(el._children);
+      }
+    })(zr.storage._roots);
+    Object.keys(state.nums).forEach(function (id) { if (!state.numSeen[id]) delete state.nums[id]; });  // markers that are gone
+    if (state.counting && !flyAnim) flyAnim = requestAnimationFrame(flyLoop);
+  }
+  function initMap() {
+    if (!window.echarts || !echarts.getMap || !echarts.getMap("world")) {
+      notice("The map could not be drawn (map files missing). The feed on the right still works.");
+      return;
+    }
+    chart = echarts.init($("map"));
+    chart.setOption({
+      backgroundColor: token("--sea"), animation: false,
+      tooltip: { trigger: "item", backgroundColor: token("--card"), borderColor: token("--line"), borderWidth: 1,
+        textStyle: { color: token("--text"), fontSize: 12 },
+        formatter: function (q) {
+          var d = q.data || {};
+          if (d.person) return esc(d.person.name) + (d.person.guess ? " · best guess" : "") + "<br>" + esc(d.person.how) + "<br>" +
+                               esc(d.person.located ? "last located " + ago(d.person.located) : ago(d.person.seen));
+          if (d.place && d.place.kind === "office" && d.keys && d.keys.length > 1)
+            return esc(d.place.label) + (d.place.hq ? " · headquarters" : "") + "<br>" + d.own + " signed in from the office + " + (d.count - d.own) +
+                   " in " + (d.keys.length - 1) + (d.keys.length === 2 ? " place" : " places") + " close by" + notIn(d) +
+                   "<br>click to see who · zoom in to see them apart";
+          if (d.place && d.keys && d.keys.length > 1) return notIn(d).slice(4) + (d.absent ? "<br>" : "") + d.count + " people in " + d.keys.length + " places around " + esc(d.place.label) +
+                                                             "<br>click to see who · zoom in to see the places apart";
+          if (d.place && d.place.kind === "office") {
+            var where = [d.place.city, d.place.country].filter(Boolean).join(", ");
+            return esc(d.place.label) + (d.place.hq ? " · headquarters" : "") + (where ? "<br>" + esc(where) : "") +
+                   "<br>" + d.count + " signed in from the office" + (d.place.rooms ? " · " + d.place.rooms + " meeting room" +
+                   (d.place.rooms === 1 ? "" : "s") + " online" : "") + notIn(d) + " · click to see who";
+          }
+          if (d.place && d.place.kind === "country") {
+            return esc(placeLabel(d.place)) + "<br>" + d.count + " " + (d.count === 1 ? "person" : "people") +
+                   " on a phone outside known networks:<br>only the country is known · click to see who";
+          }
+          if (d.place && d.count === 0 && d.place.kind !== "office") {
+            var gs = state.ghostList.filter(function (g) { return (d.keys || [d.place.key]).indexOf(g.place) >= 0; });
+            var hit = gs.filter(function (g) { return !g.offline; });
+            return esc(gs.slice(0, 4).map(function (g) { return g.name; }).join(", ")) + (gs.length > 4 ? " + " + (gs.length - 4) + " more" : "") +
+                   "<br>not signed in" + (hit.length ? " · under attack (" + hit.reduce(function (n, g) { return n + g.attempts; }, 0) + " attempts)" : "") +
+                   "<br>shown where the account was last seen";
+          }
+          if (d.place && d.count === 1) {
+            var one = shownPeople().filter(function (p) { return p.place === d.place.key; })[0];
+            return esc(one ? one.name : "") + "<br>" + esc(d.place.label) + " · click for devices and movement";
+          }
+          if (d.place) return esc(d.place.label) + notIn(d) + "<br>" + d.count + " signed in · click to see who";
+          if (d.attack) return esc(d.attack.count + " attempt(s) from " + d.attack.source) + "<br>" + esc(d.attack.networks.slice(0, 2).join(", ")) +
+                               "<br>→ " + esc(d.attack.targets.slice(0, 3).join(", "));
+          return "";
+        } },
+      geo: { map: "world", roam: true, zoom: 1.2, center: [18, 24], scaleLimit: { min: 1, max: 400 },
+             label: { emphasis: { show: false } },
+             itemStyle: { normal: { areaColor: token("--land"), borderColor: token("--land-line"), borderWidth: 0.6 },
+                          emphasis: { areaColor: token("--land-hover") } } },
+      series: []
+    });
+    chart.on("click", function (q) {
+      var d = q.data || {};
+      // a click on the map itself - land or sea - closes what is opened (the sea is handled below: it is no element)
+      if (q.componentType === "geo") { closePlace(); return; }
+      if (d.person) selectPerson(d.person.id);
+      else if (d.place && d.keys && d.keys.length > 1) openPlace(d.place.key, d.keys, d.place.label);
+      else if (d.place) {
+        // a dot that stands for one person IS that person: show devices and movement at once
+        var alone = shownPeople().filter(function (p) { return p.place === d.place.key; });
+        var absent = state.ghostList.filter(function (g) { return g.place === d.place.key; });
+        if (alone.length === 1 && !absent.length && d.place.kind === "city") selectPerson(alone[0].id);
+        else if (!alone.length && absent.length === 1 && d.place.kind === "city") selectPerson(absent[0].id);
+        else openPlace(d.place.key);
+      }
+      else if (d.attack) select({ type: "attack", attack: d.attack });
+    });
+    var roam = 0;
+    var viewTimer = 0;
+    chart.on("georoam", function () {  // markers merge / separate with the zoom
+      mapMoved = true;
+      if (!roam) roam = requestAnimationFrame(function () { roam = 0; mapMoved = true; splitOpen(); draw(); });
+      if (state.tab === "sel" && !state.sel) {  // "people in view" follows the map
+        clearTimeout(viewTimer);
+        viewTimer = setTimeout(renderPanel, 250);
+      }
+    });
+    chart.getZr().on("click", function (e) { if (!e.target) closePlace(); });
+    window.addEventListener("resize", function () { chart.resize(); mapMoved = true; draw(); });
+  }
+  function zoomTo(place) {
+    var geo = chart.getOption().geo[0];
+    chart.setOption({ geo: { center: xy(place), zoom: Math.min(40, (geo.zoom || 1.2) * 2.6) } });
+    mapMoved = true;
+    draw();
+  }
+  function paintTheme() {
+    document.documentElement.setAttribute("data-theme", state.dark ? "dark" : "light");
+    $("l-dark").setAttribute("aria-pressed", state.dark);
+    if (!chart) return;
+    chart.setOption({ backgroundColor: token("--sea"),
+      tooltip: { backgroundColor: token("--card"), borderColor: token("--line"), textStyle: { color: token("--text") } },
+      geo: { itemStyle: { normal: { areaColor: token("--land"), borderColor: token("--land-line") }, emphasis: { areaColor: token("--land-hover") } } } });
+    draw();
+  }
+  function notIn(d) {
+    return d.absent ? "<br>" + d.absent + " not signed in, last seen here" + (d.absent > d.off ? " (" + (d.absent - d.off) + " under attack)" : "") : "";
+  }
+  function notice(text) { var n = $("notice"); n.hidden = !text; n.textContent = text || ""; }
+
+  // ------------------------------------------------------------------ panel
+  function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+  function row(color, main, sub, right, ring) {
+    var r = el("div", "row"), pip = el("span", "pip" + (ring ? " ring" : "")), mid = el("div");
+    pip.style.setProperty("--c", color);
+    mid.appendChild(el("span", null, main));
+    if (sub) mid.appendChild(el("em", null, sub));
+    r.appendChild(pip); r.appendChild(mid); r.appendChild(el("span", "t", right || ""));
+    return r;
+  }
+  function clickable(node, fn) { var b = el("button", "linkrow"); b.appendChild(node); b.addEventListener("click", fn); return b; }
+  function tags(list) {
+    var box = el("div", "tags");
+    list.forEach(function (t) { box.appendChild(el("span", "tag " + tagClass(t), t)); });
+    return box;
+  }
+  function personRow(p) {
+    return clickable(row(p.unusual ? "var(--breach)" : "var(--person)", p.name, p.how + (p.tags.length ? " · " + p.tags.join(", ") : ""),
+                         p.located ? "last located\n" + ago(p.located) : ago(p.seen)),
+                     function () { selectPerson(p.id); });
+  }
+  function ghostRow(g) {  // an account that is not signed in, listed where it was last seen
+    return g.offline
+      ? clickable(row("var(--muted)", g.name, "not signed in · " + g.how.replace("Not signed in - last seen here: ", "") + (g.guest ? " · guest" : ""),
+                      "last seen\n" + ago(g.seen), true), function () { selectPerson(g.id); })
+      : clickable(row("var(--attack)", g.name, "not signed in · under attack, " + g.attempts + " attempts", ago(g.seen), true),
+                  function () { selectPerson(g.id); });
+  }
+  function eventKey(e) { return e.sid || (e.ts + "|" + e.kind + "|" + e.who); }
+  function renderPanel() {
+    var body = $("body"), d = state.data;
+    var keep = body.scrollTop;
+    body.textContent = "";
+    $("t-feed").setAttribute("aria-selected", state.tab === "feed");
+    $("t-sel").setAttribute("aria-selected", state.tab === "sel");
+    if (!d) { body.appendChild(el("p", "empty", "Reading the data...")); return; }
+    if (state.tab === "feed") {
+      if (!d.events.length) body.appendChild(el("p", "empty", "No sign-ins or attack attempts in the chosen time."));
+      var feedNote = el("div", "sent");
+      body.appendChild(feedNote);
+      var rows = el("div", "rows");
+      d.events.forEach(function (e) {
+        var main;
+        if (e.kind === "signin") {
+          main = clickable(row("var(--person)", e.who + " signed in",
+            (state.places[e.place] ? placeLabel(state.places[e.place]) : "") + (e.device ? " · " + e.device : "") + (e.app ? " · " + e.app : ""), hhmm(e.ts)),
+            function () { selectPerson(e.user); });
+        } else if (e.kind === "account") {
+          // from the audit log: a password reset, an MFA method, a device, an account, an admin role
+          var self = e.by && e.upn && e.by.toLowerCase() === e.upn.toLowerCase();
+          main = row(e.failed ? "var(--breach)" : "var(--acct)", e.title + (e.who ? ": " + e.who : ""),
+            [e.by && !self ? "by " + e.by : self && e.what !== "device" ? "by the person" : e.by ? "by " + e.by : "", e.detail].filter(Boolean).join(" · "),
+            hhmm(e.ts));
+          main.className += " acct";
+          if (e.user && (state.byId[e.user] || state.ghostById[e.user])) main = clickable(main, (function (id) { return function () { selectPerson(id); }; })(e.user));
+        } else if (e.kind === "seen") {
+          // turned up at a place without a sign-in by hand (a device coming online in the background)
+          var where = state.places[e.place] ? placeLabel(state.places[e.place]) : "";
+          main = clickable(row(e.new_country ? "var(--breach)" : "var(--person)", e.who + (e.moved ? " now in " : " active in ") + where,
+            (e.device ? e.device + " · " : "") + "background activity, no sign-in by hand" +
+            (e.new_country ? " · first time in " + countryName(e.new_country) + " in 30 days" : ""), hhmm(e.ts), true),
+            function () { selectPerson(e.user); });
+          if (!e.new_country) main.className += " quiet";  // the everyday case steps back; a new country stands out
+        } else {
+          main = clickable(row(e.kind === "breach" ? "var(--breach)" : "var(--attack)",
+            (e.kind === "breach" ? "Got past the password of " : "Password attempt on ") + e.who,
+            e.ip + " · " + e.source + " · " + e.network, hhmm(e.ts)), function () { select({ type: "event", event: e }); });
+        }
+        var item = withEntryLink(main, e, feedNote);
+        var fresh = state.freshEvents[eventKey(e)];
+        if (fresh) {
+          item.className += fresh > 1 ? " fresh intro" : " fresh";
+          if (fresh > 1) item.style.setProperty("--i", fresh - 2);
+          item.style.setProperty("--c", e.kind === "account" ? (e.failed ? "var(--breach)" : "var(--acct)") :
+                                 e.kind === "signin" || (e.kind === "seen" && !e.new_country) ? "var(--person)" :
+                                 e.kind === "breach" || e.kind === "seen" ? "var(--breach)" : "var(--attack)");
+        }
+        rows.appendChild(item);
+      });
+      state.freshEvents = {};  // animated once: a later redraw of the list shows them at rest
+      body.appendChild(rows);
+      body.scrollTop = keep;
+      return;
+    }
+    var s = state.sel;
+    if (!s) { renderInView(body); return; }
+    var back = el("button", "act back", "People in view");  // leave the selection: back to who is on the visible map
+    back.addEventListener("click", clearSelection);
+    body.appendChild(back);
+    if (s.type === "unlocated") {
+      body.appendChild(el("h2", null, "Place unknown"));
+      body.appendChild(el("div", "sub", "Signed in, but only through a VPN, relay or cloud network, only on a virtual desktop, " +
+        "or without any location - drawing them at that address would be wrong."));
+      var none = el("div", "rows");
+      shownUnlocated().forEach(function (p) { none.appendChild(personRow(p)); });
+      body.appendChild(el("h3", null, shownUnlocated().length + " people"));
+      body.appendChild(none);
+    } else if (s.type === "group") {
+      var everyone = shownPeople(), total = 0;
+      var groups = s.keys.filter(function (k) { return state.places[k]; }).map(function (k) {
+        var here = everyone.filter(function (p) { return p.place === k; });
+        total += here.length;
+        return { place: state.places[k], people: here, away: state.ghostList.filter(function (g) { return g.place === k; }) };
+      }).filter(function (g) { return g.people.length || g.away.length; }).sort(function (a, b) { return b.people.length - a.people.length; });
+      body.appendChild(el("h2", null, "Around " + s.label));
+      body.appendChild(el("div", "sub", total + " signed in at " + groups.length + " places close together (one bubble at this zoom). Zoom in to see them apart."));
+      groups.forEach(function (g) {
+        var head = el("h3", null, g.place.label + " · " + g.people.length + (g.away.length ? " + " + g.away.length + " not signed in" : ""));
+        body.appendChild(head);
+        var list = el("div", "rows");
+        g.people.forEach(function (p) { list.appendChild(personRow(p)); });
+        g.away.forEach(function (a) { list.appendChild(ghostRow(a)); });
+        body.appendChild(list);
+      });
+    } else if (s.type === "place") {
+      var pl = state.places[s.key], inside = shownPeople().filter(function (p) { return p.place === s.key; });
+      body.appendChild(el("h2", null, pl ? placeLabel(pl) : "Place"));
+      if (pl && pl.kind === "country") {
+        body.appendChild(el("div", "sub", "Phones and tablets outside the networks their owners' computers use (mobile data, " +
+          "foreign Wi-Fi). Such an address only tells the country."));
+      }
+      if (pl && pl.kind === "office") {
+        var where = [pl.city, pl.country].filter(Boolean).join(", ");
+        if (where) body.appendChild(el("div", "sub", where));
+        var badges = [];
+        if (pl.hq) badges.push("headquarters");
+        badges.push(pl.ips ? pl.ips + " IP address" + (pl.ips === 1 ? "" : "es") + " / range" + (pl.ips === 1 ? "" : "s") : "Entra named location");
+        if (pl.fixed) badges.push("position set by hand");
+        else if (pl.position === "city") badges.push("placed by its city");
+        else if (pl.position === "address") badges.push("placed by its IP address");
+        body.appendChild(tags(badges));
+        if (pl.position_note) body.appendChild(el("p", "sub", pl.position_note));
+      }
+      body.appendChild(el("div", "sub", inside.length + " signed in" + (pl && pl.kind === "office" ? " from the office network" :
+        pl && pl.kind === "country" ? ", city unknown" : " from this city (by IP address)")));
+      body.appendChild(el("h3", null, "Who is here"));
+      var list = el("div", "rows");
+      inside.forEach(function (p) { list.appendChild(personRow(p)); });
+      body.appendChild(list);
+      var absentHere = state.ghostList.filter(function (g) { return g.place === s.key && !g.offline; });
+      if (absentHere.length) {  // accounts under attack that were last seen here but are not signed in
+        body.appendChild(el("h3", null, "Under attack, not signed in (" + absentHere.length + ")"));
+        var al2 = el("div", "rows");
+        absentHere.forEach(function (g) {
+          al2.appendChild(clickable(row("var(--attack)", g.name, g.attempts + " attempts · last seen here", ago(g.seen), true), function () { selectPerson(g.id); })); });
+        body.appendChild(al2);
+      }
+      var offlineHere = state.ghostList.filter(function (g) { return g.place === s.key && g.offline; });
+      if (offlineHere.length) {  // the "Not signed in" switch: accounts last seen here
+        body.appendChild(el("h3", null, "Not signed in, last seen here (" + offlineHere.length + ")"));
+        var ol = el("div", "rows");
+        offlineHere.slice(0, 150).forEach(function (g) {
+          ol.appendChild(clickable(row("var(--muted)", g.name, g.how.replace("Not signed in - last seen here: ", "") + (g.guest ? " · guest" : ""),
+                                       "last seen\n" + ago(g.seen), true), function () { selectPerson(g.id); })); });
+        body.appendChild(ol);
+      }
+      var roomsHere = (d.rooms || []).filter(function (r) { return r.place === s.key; });
+      if (roomsHere.length) {  // meeting rooms are online here, but they are not people
+        body.appendChild(el("h3", null, "Meeting rooms online (" + roomsHere.length + ")"));
+        var rl = el("div", "rows");
+        roomsHere.forEach(function (r) { rl.appendChild(row("var(--muted)", r.name, r.upn, ago(r.seen), true)); });
+        body.appendChild(rl);
+      }
+    } else if (s.type === "person") {
+      var p = state.byId[s.id], det = state.detail && state.detail.id === s.id ? state.detail : null;
+      body.appendChild(el("h2", null, p ? p.name : (det ? det.name : "Person")));
+      body.appendChild(el("div", "sub", p ? p.upn : (det ? det.upn : "")));
+      if (p && p.tags.length) body.appendChild(tags(p.tags));
+      // the person's detail views open through RADAR (it has the sign-in to Entra)
+      var acts = el("div", "acts"), sent = el("div", "sent");
+      [["Open in Entra", "user"], ["Sign-in logs", "user_signins"], ["Authentication methods", "user_methods"]].forEach(function (a) {
+        var b = el("button", "act", a[0]);
+        b.addEventListener("click", function () { openInApp("user", s.id, a[1], sent); });
+        acts.appendChild(b);
+      });
+      body.appendChild(acts);
+      body.appendChild(sent);
+      if (p) {
+        body.appendChild(el("h3", null, "Where"));
+        body.appendChild(row("var(--person)", state.places[p.place] ? placeLabel(state.places[p.place]) + (p.guess ? " (best guess)" : "") : "Place unknown",
+                             p.how, p.located ? "last located\n" + ago(p.located) : ago(p.seen), p.flagged || !!p.guess));
+        if (p.located) body.appendChild(el("p", "sub", "Active " + ago(p.seen) + ", but the place is hidden. Shown " + p.guess + " - last located " + ago(p.located) + "."));
+        else if (p.exit) body.appendChild(el("p", "sub", "The place is hidden. Shown " + p.guess + "."));
+        else if (p.guess) body.appendChild(el("p", "sub", "A phone's address on mobile data does not tell the city. Shown at " + p.guess + "."));
+        if (p.fallback) body.appendChild(el("p", "sub", "The place is hidden right now; the map shows where this person was last located."));
+        if (p.corrected) body.appendChild(el("p", "sub", "Shown " + p.corrected + "."));
+        if (p.also && p.also.length) {
+          body.appendChild(el("h3", null, "Also active"));
+          var al = el("div", "rows");
+          p.also.forEach(function (t) { al.appendChild(row("var(--muted)", t, "", "", true)); });
+          body.appendChild(al);
+        }
+      } else {
+        var gone = state.ghostById[s.id];
+        if (gone) {
+          body.appendChild(el("h3", null, "Where"));
+          body.appendChild(row("var(--muted)", state.places[gone.place] ? placeLabel(state.places[gone.place]) + " (last seen)" : "", gone.how, "last seen\n" + ago(gone.seen), true));
+        }
+        body.appendChild(el("p", "empty", "Not signed in during the last hours; shown is where the account was last seen."));
+      }
+      if (!det) { body.appendChild(el("p", "empty", "Reading devices and movement...")); return; }
+      if (!det.devices.length) {
+        body.appendChild(el("h3", null, "Devices (last " + det.days + " days)"));
+        body.appendChild(el("p", "empty", "No device information in the sign-ins."));
+      }
+      [["work computer", "Work computers"], ["managed mobile", "Managed phones and tablets"],
+       ["unmanaged device", "Unmanaged or unidentified devices"],
+       ["virtual desktop", "Virtual desktops and shared hosts"]].forEach(function (group) {
+        var list = det.devices.filter(function (x) { return x["class"] === group[0]; });
+        if (!list.length) return;
+        body.appendChild(el("h3", null, group[1]));
+        var dv = el("div", "rows");
+        list.forEach(function (x) {
+          var r = row("var(--muted)", x.name, x.detail, ago(x.seen), !x.managed);
+          // a device Entra knows (it sent its identity) opens its Entra page on a click
+          dv.appendChild(x.known ? clickable(r, function () { openInApp("device", x.id, "device", sent); }) : r);
+        });
+        body.appendChild(dv);
+      });
+      body.appendChild(el("h3", null, "Movement"));
+      var mv = el("div", "rows");
+      if (!det.hops.length) mv.appendChild(el("p", "empty", "No located sign-ins."));
+      det.hops.slice().reverse().forEach(function (hp, idx) {
+        var r = row(hp.bad ? "var(--attack)" : "var(--person)", hp.label,
+          hp.how + (hp.bad ? " · " + hp.km + " km from the previous place - too fast to travel" : ""), whenThere(hp.when, hp.tz, hp.until), idx > 0);
+        var age = partsThere(hp.until || hp.when, hp.tz).days;
+        r.className += age <= 0 ? " today" : age > 1 ? " older" : "";  // today stands out, older stops step back
+        mv.appendChild(r);
+        if (hp.idle_minutes >= 120) {  // a silence before this stay: say so instead of pretending to know where the device was
+          var hours = hp.idle_minutes / 60, quiet = hours >= 48 ? Math.round(hours / 24) + " days" : Math.round(hours) + " h";
+          mv.appendChild(el("div", "idle", "no sign-ins for " + quiet + " before that" +
+            (hp.same_place ? " (device off, asleep or offline)" : " (device off or on the way)")));
+        } });
+      body.appendChild(mv);
+      if (det.ignored_places) body.appendChild(el("p", "sub", det.ignored_places + " far-away address(es) seen minutes from the office were left out: " +
+        "cloud services, relays or VPNs the device talks through, not trips."));
+      var hits = d.events.filter(function (e) { return e.kind !== "signin" && e.user === s.id; });
+      if (hits.length) {
+        body.appendChild(el("h3", null, "Attempts on this account"));
+        var at = el("div", "rows");
+        hits.slice(0, 8).forEach(function (e) {
+          at.appendChild(withEntryLink(row(e.kind === "breach" ? "var(--breach)" : "var(--attack)", e.ip + " · " + e.source,
+                                           e.network + " · error " + e.code, hhmm(e.ts)), e, sent)); });
+        body.appendChild(at);
+      }
+    } else {
+      var a = s.attack, e = s.event;
+      var breach = a ? a.breach : e.kind === "breach";
+      body.appendChild(el("h2", null, breach ? "Got past the password, stopped later" : "Password attempts, blocked"));
+      body.appendChild(el("div", "sub", a ? a.count + " attempt(s) from " + a.ip_count + " IP address(es) · last " + hhmm(a.last) : hhmm(e.ts)));
+      body.appendChild(el("h3", null, "Source"));
+      body.appendChild(row("var(--attack)", a ? a.source : e.source, a ? a.networks.join(", ") : e.network, ""));
+      body.appendChild(el("div", "mono", a ? a.ips.join("  ") : e.ip));
+      body.appendChild(el("h3", null, a && a.targets.length > 1 ? "Targets" : "Target"));
+      var tg = el("div", "rows");
+      if (a) a.targets.forEach(function (t) { tg.appendChild(row("var(--person)", t, "", "")); });
+      else tg.appendChild(clickable(row("var(--person)", e.who, "error " + e.code + (e.reason ? " · " + e.reason : ""), ""), function () { selectPerson(e.user); }));
+      body.appendChild(tg);
+      body.appendChild(el("p", "sub", "The line ends where the account was last seen - an attacked account has no place of its own."));
+    }
+  }
+  function withEntryLink(node, e, note) {
+    // a feed item plus a link that opens its sign-in log entry in RADAR
+    if (!e.sid) return node;
+    var wrap = el("div", "entry"), link = el("button", "act", "Log entry");
+    link.title = "Open the sign-in log entry in RADAR";
+    link.addEventListener("click", function () { openInApp("signin", e.sid, "view_signin", note); });
+    wrap.appendChild(node); wrap.appendChild(link);
+    return wrap;
+  }
+  function clearSelection() {
+    state.sel = null; state.detail = null;
+    if (state.open) closePlace(); else draw();
+    renderPanel();
+  }
+  function renderInView(body) {
+    // nothing selected: who is on the part of the map one is looking at (follows moving and zooming)
+    var d = state.data, groups = {}, order = [], total = 0, away = {}, awayTotal = 0;
+    if (!chart || !d) { body.appendChild(el("p", "empty", "Reading the data...")); return; }
+    var w = chart.getWidth(), h = chart.getHeight();
+    shownPeople().forEach(function (p) {
+      var pl = state.places[p.place];
+      if (!pl) return;
+      var px = chart.convertToPixel({ geoIndex: 0 }, xy(pl));
+      if (!px || px[0] < 0 || px[1] < 0 || px[0] > w || px[1] > h) return;
+      if (!groups[p.place]) { groups[p.place] = []; order.push(p.place); }
+      groups[p.place].push(p); total++;
+    });
+    (state.ghostList || []).forEach(function (g) {  // not signed in: the corner numbers on the map
+      var pl = state.places[g.place];
+      if (!pl) return;
+      var px = chart.convertToPixel({ geoIndex: 0 }, xy(pl));
+      if (!px || px[0] < 0 || px[1] < 0 || px[0] > w || px[1] > h) return;
+      if (!groups[g.place]) { groups[g.place] = []; order.push(g.place); }
+      (away[g.place] = away[g.place] || []).push(g); awayTotal++;
+    });
+    order.sort(function (a, b) {
+      return (state.places[b].kind === "office") - (state.places[a].kind === "office") || groups[b].length - groups[a].length;
+    });
+    body.appendChild(el("h2", null, "People in view"));
+    body.appendChild(el("div", "sub", total + " " + (total === 1 ? "person" : "people") + " at " + order.length + " place" +
+      (order.length === 1 ? "" : "s") + (awayTotal ? ", plus " + awayTotal + " not signed in," : "") + " on the visible part of the map. Move or zoom the map to change the list; click a person, " +
+      "a place or an attack line for details."));
+    var shown = 0;
+    order.forEach(function (key) {
+      if (shown >= 200) return;
+      var pl = state.places[key], head = el("h3"), open = el("button", "act", placeLabel(pl) + " · " + groups[key].length +
+                                                                         (away[key] ? " + " + away[key].length + " not signed in" : ""));
+      open.addEventListener("click", function () { openPlace(key); });
+      head.appendChild(open);
+      body.appendChild(head);
+      var list = el("div", "rows");
+      groups[key].forEach(function (p) { if (shown < 200) { list.appendChild(personRow(p)); shown++; } });
+      (away[key] || []).forEach(function (g) { if (shown < 200) { list.appendChild(ghostRow(g)); shown++; } });
+      body.appendChild(list);
+    });
+    if (shown < total + awayTotal) body.appendChild(el("p", "sub", "Showing the first " + shown + ". Zoom in to narrow the list."));
+  }
+  function openInApp(kind, value, action, note) {
+    note.textContent = "Asking RADAR to open it...";
+    fetch("open?kind=" + encodeURIComponent(kind) + "&value=" + encodeURIComponent(value) + "&action=" + encodeURIComponent(action))
+      .then(function (r) { return r.json(); })
+      .then(function (r) { note.textContent = !r.ok ? "This cannot be opened." : kind === "signin" ? "Opening the log entry in RADAR." : "Opening in your browser (RADAR looks it up in Entra)."; })
+      .catch(function () { note.textContent = "Could not reach the map's data source."; });
+  }
+  function select(sel) { state.sel = sel; state.tab = "sel"; renderPanel(); draw(); }
+  var ringAnim = 0;
+  var flyAnim = 0;
+  function animateRing(to, done) {
+    // people fly out of the marker when it is opened and back into it when it is closed (instantly without animations)
+    cancelAnimationFrame(ringAnim);
+    var from = state.ringT, start = null, ms = 280;
+    if (!state.effects || from === to) { state.ringT = to; if (done) done(); draw(); return; }
+    function frame(now) {
+      if (start === null) start = now;
+      var t = Math.min(1, (now - start) / ms), eased = 1 - Math.pow(1 - t, 3);
+      state.ringT = from + (to - from) * eased;
+      if (t >= 1) { state.ringT = to; if (done) done(); draw(); return; }
+      draw();
+      ringAnim = requestAnimationFrame(frame);
+    }
+    ringAnim = requestAnimationFrame(frame);
+  }
+  function closePlace() {
+    if (!state.open) return;
+    animateRing(0, function () { state.open = null; state.openKeys = []; state.ringT = 1; });
+    if (state.sel && (state.sel.type === "place" || state.sel.type === "group" || state.sel.type === "person")) {
+      state.sel = null; state.detail = null;  // closed: nothing is selected any more -> people in view
+      renderPanel();
+    }
+  }
+  function flyLoop() {
+    var now = Date.now();
+    state.flyOut = state.flyOut.filter(function (f) { return now - f.t0 < FLY_MS; });
+    Object.keys(state.flyIn).forEach(function (id) { if (now - state.flyIn[id].t0 >= FLY_MS) delete state.flyIn[id]; });
+    state.blobs = state.blobs.filter(function (b) { return now - b.t0 < FLY_MS; });
+    Object.keys(state.markerFly).forEach(function (k) { if (now - state.markerFly[k].t0 >= FLY_MS) delete state.markerFly[k]; });
+    flyAnim = 0;  // drawing may ask for the next frame itself (markers that started moving in this very frame)
+    draw();
+    if (!flyAnim && (state.flyOut.length || Object.keys(state.flyIn).length || state.blobs.length || Object.keys(state.markerFly).length))
+      flyAnim = requestAnimationFrame(flyLoop);
+  }
+  function splitOpen() {
+    // An opened marker follows the zoom like closed ones do: zooming in lets the places that no longer lie on it
+    // go again, zooming out takes in the places that now do. The people visibly move to where they belong.
+    var main = state.open && state.places[state.open];
+    if (!main || main.kind === "country" || state.ringT < 1) return;
+    var at = chart.convertToPixel({ geoIndex: 0 }, xy(main));
+    var zoomNow = (chart.getOption().geo[0] || {}).zoom || 1.2;
+    function onIt(k) {
+      if (k === state.open) return true;
+      var pl = state.places[k];
+      if (!pl || pl.kind !== "city") return false;
+      var px = chart.convertToPixel({ geoIndex: 0 }, xy(pl)), gapX = Math.abs(px[0] - at[0]), gapY = Math.abs(px[1] - at[1]);
+      if (gapX >= MERGE_PX || gapY >= MERGE_PX) return false;
+      if (main.kind === "office" && zoomNow >= APART_ZOOM && zoomNow * MERGE_PX / Math.max(gapX, gapY, 0.01) > APART_LIMIT) return false;
+      // a city that lies on an office belongs to the nearest one - the opened marker does not take it from there
+      var mine = gapX * gapX + gapY * gapY, taken = false;
+      if (state.offices) state.data.places.forEach(function (of) {
+        if (of.kind !== "office" || of.key === state.open) return;
+        var q = chart.convertToPixel({ geoIndex: 0 }, xy(of)), dx = Math.abs(q[0] - px[0]), dy = Math.abs(q[1] - px[1]);
+        if (dx < MERGE_PX && dy < MERGE_PX && (main.kind !== "office" || dx * dx + dy * dy < mine)) taken = true;
+      });
+      return !taken;
+    }
+    var keep = state.openKeys.filter(onIt), gone = state.openKeys.filter(function (k) { return keep.indexOf(k) < 0; });
+    var came = Object.keys(state.lastMarkerAt).filter(function (k) { return state.openKeys.indexOf(k) < 0 && onIt(k); });
+    if (!gone.length && !came.length) return;
+    var sel = state.sel, person = sel && sel.type === "person" ? (state.byId[sel.id] || state.ghostById[sel.id]) : null;
+    if (person && gone.indexOf(person.place) >= 0) return;  // stay with the selected person: their marker is left as it is
+    var everyone = (state.people ? shownPeople() : []).concat(state.ghostList || []), now = Date.now();
+    var moving = everyone.filter(function (q) { return gone.indexOf(q.place) >= 0 || came.indexOf(q.place) >= 0 || keep.indexOf(q.place) >= 0; });
+    if (state.effects && moving.length <= 250) {
+      moving.forEach(function (q) {
+        var was = state.lastMemberAt[q.id];
+        if (gone.indexOf(q.place) >= 0) { if (was) state.flyOut.push({ person: q, place: q.place, from: was, t0: now }); }
+        else state.flyIn[q.id] = { from: was || state.lastMarkerAt[q.place] || xy(state.places[q.place]), t0: now };  // also re-seats who stays
+      });
+      if (!flyAnim) flyAnim = requestAnimationFrame(flyLoop);
+    }
+    state.openKeys = keep.concat(came);
+    if (sel && (sel.type === "group" || sel.type === "place")) {
+      state.sel = state.openKeys.length > 1 ? { type: "group", keys: state.openKeys, label: sel.label || main.label } : { type: "place", key: state.open };
+    }
+    renderPanel();
+  }
+  function openPlace(key, keys, label) {
+    // open (or, clicked again, close) a marker: one place, or several nearby places that are shown as one bubble
+    var again = state.open === key && state.openKeys.length === (keys ? keys.length : 1);
+    state.detail = null;
+    if (again) { closePlace(); return; }
+    state.open = key;
+    state.openKeys = (keys || [key]).slice();
+    state.ringT = 0;
+    if (state.openKeys.length > 1) select({ type: "group", keys: state.openKeys, label: label || state.places[key].label });
+    else select({ type: "place", key: key });
+    animateRing(1);
+  }
+  function selectPerson(id) {
+    var p = state.byId[id] || state.ghostById[id];
+    var opening = p && p.place && state.openKeys.indexOf(p.place) < 0;
+    if (opening) { state.open = p.place; state.openKeys = [p.place]; state.ringT = 0; }
+    select({ type: "person", id: id });
+    if (opening) animateRing(1);
+    fetch("person?id=" + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (det) {
+      if (state.sel && state.sel.type === "person" && state.sel.id === id) { state.detail = det; renderPanel(); draw(); }
+    }).catch(function () {});
+  }
+
+  // ------------------------------------------------------------------ data
+  function paintStatus(error) {
+    var live = $("live"), d = state.data;
+    live.className = "live" + (error ? " err" : state.paused ? " off" : "");
+    $("livetext").textContent = error ? "No data - is RADAR still running?" :
+      !d ? "Reading the data..." : d.empty ? "No sign-in history yet" :
+      (state.paused ? "Paused · " : "") + "Data from " + hhmm(d.as_of) + " (" + ago(d.as_of) + ")";
+    $("pause").textContent = state.paused ? "Resume" : "Pause";
+  }
+  var freshTimer = 0;
+  function apply(d) {
+    var first = !state.data;
+    // which feed entries are new since the last data (none on the first load, and none without animations)
+    var known = state.knownEvents, now_ = {};
+    state.freshEvents = {};
+    var animated = known ? state.effects : (!d.ui || d.ui.animations !== false) && !reduced;
+    (d.events || []).forEach(function (e, idx) {
+      var k = eventKey(e);
+      now_[k] = 1;
+      if (!animated) return;
+      if (known) { if (!known[k]) state.freshEvents[k] = 1; }       // new since the last data: opens up and glows
+      else if (idx < 16) state.freshEvents[k] = idx + 2;              // the map was just opened: the top ones come in in turn
+    });
+    state.knownEvents = now_;
+    clearTimeout(freshTimer);
+    freshTimer = setTimeout(function () { state.freshEvents = {}; }, 1500);  // not shown in time (other tab): no late animation
+    state.data = d;
+    state.places = {}; state.byId = {};
+    d.places.forEach(function (pl) { state.places[pl.key] = pl; });
+    d.people.forEach(function (p) { state.byId[p.id] = p; });
+    (d.unlocated || []).forEach(function (p) { state.byId[p.id] = p; });
+    state.ghostById = {};
+    (d.offline || []).concat(d.absent_targets || []).forEach(function (g) { state.ghostById[g.id] = g; });
+    if (d.ui) state.effects = d.ui.animations !== false && !reduced;
+    if (state.open && !state.places[state.open]) { state.open = null; state.openKeys = []; }
+    paintStats();
+    if (d.hours) $("s-people-l").textContent = "signed in (" + d.hours + " h)";
+    if (d.attack_hours) $("s-att-l").textContent = "attacks (" + d.attack_hours + " h)";
+    $("s-note").textContent = d.empty ? "" : !d.offices_configured ? "No offices defined yet: tray menu > Settings > Offices..." :
+      (d.unplaced_offices || []).length ? d.unplaced_offices.join(", ") + ": no position known yet - set the city or coordinates in Settings > Offices..." :
+      d.host_suggestions ? d.host_suggestions + " machine" + (d.host_suggestions === 1 ? " looks" : "s look") +
+        " like virtual desktops or shared hosts: tray menu > Settings > Virtual desktops..." : "";
+    notice(d.empty ? "RADAR has not read any sign-ins yet. The map fills after its first scan." :
+           !d.places.length ? "No located sign-ins in the last hours." : "");
+    paintStatus(false);
+    renderPanel();
+    draw();
+    if (first && location.hash === "#selftest-view") { state.tab = "sel"; renderPanel(); }
+    if (first && location.hash === "#selftest-offline") { $("l-offline").click(); $("l-guests").click(); }
+    if (first && location.hash === "#selftest-risk-noattacks") { $("l-attacks").click(); $("l-risk").click(); state.tab = "sel"; renderPanel(); }
+    if (first && location.hash === "#selftest-risk") { $("l-risk").click(); state.tab = "sel"; renderPanel(); }
+    if (first && location.hash.indexOf("#selftest-zoom-") === 0 && chart) {  // #selftest-zoom-<zoom>-<place name starts with>
+      var zp = decodeURIComponent(location.hash.slice(15)).split("-"), zpl = d.places.filter(function (q) { return q.label.indexOf(zp[1]) === 0; })[0];
+      if (zpl) { chart.setOption({ geo: { center: [zpl.lon, zpl.lat], zoom: +zp[0] } }); draw(); }
+    }
+    if (first && location.hash.indexOf("#selftest-place-") === 0) {  // open the place whose name starts with ...
+      var name = decodeURIComponent(location.hash.slice(16)), pl0 = d.places.filter(function (q) { return q.label.indexOf(name) === 0; })[0];
+      if (pl0) { if (chart) chart.setOption({ geo: { center: [pl0.lon, pl0.lat], zoom: 3 } }); openPlace(pl0.key); }
+    }
+    if (first && location.hash.indexOf("#selftest-upn-") === 0) {  // select the person whose sign-in name starts with ...
+      var want = location.hash.slice(14), who = d.people.filter(function (q) { return q.upn.indexOf(want) === 0; })[0];
+      if (who) selectPerson(who.id);
+      var zq = /[?&]z=([0-9.]+)/.exec(location.search);  // ...?z=<zoom>: and look at their place from close by
+      if (who && zq && chart && state.places[who.place]) setTimeout(function () {
+        chart.setOption({ geo: { center: xy(state.places[who.place]), zoom: +zq[1] } }); mapMoved = true; draw(); }, 2500);
+    }
+    if (first && location.hash.indexOf("#selftest-merge-") === 0 && chart) {  // #selftest-merge-<zoom>: zoom, frozen mid-move
+      setTimeout(function () {
+        chart.setOption({ geo: { center: [9, 47], zoom: 3 } }); draw();
+        chart.setOption({ geo: { center: [9, 47], zoom: +location.hash.slice(16) } }); draw();
+        cancelAnimationFrame(flyAnim);
+        var real = Date.now(); Date.now = function () { return real + 170; };
+        document.title = "moving " + Object.keys(state.markerFly).length + " markers, " + state.blobs.length + " taken in";
+        draw();
+        document.title += ", counting " + Object.keys(state.nums).filter(function (id) {
+          var t = state.nums[id]; return t.from !== t.to && Date.now() - t.t0 < NUM_MS; }).map(function (id) {
+          var t = state.nums[id]; return id.slice(2).split(":").pop().slice(0, 12) + " " + t.from + ">" + t.to; }).slice(0, 6).join("; ");
+      }, 800);
+    }
+    if (first && location.hash === "#selftest-noattacks") setTimeout(function () { draw(); $("l-attacks").click(); }, 4000);
+    if (first && location.hash === "#selftest-owners") {
+      setTimeout(function () {
+        var owner = {}, moved = [], zooms = [40, 20, 10, 6, 4, 3, 2.2, 1.6, 1.2, 1];
+        zooms.forEach(function (z) {
+          chart.setOption({ geo: { center: [18, 24], zoom: z } }); mapMoved = true; draw();
+          Object.keys(state.hostOf).forEach(function (k) {
+            var h = state.hostOf[k];
+            if (h.indexOf("office:") !== 0 || h === k) return;
+            if (owner[k] && owner[k] !== h) moved.push(k.slice(5, 22) + ": " + owner[k].slice(7) + " -> " + h.slice(7) + " at zoom " + z);
+            owner[k] = h;
+          });
+        });
+        var per = {};
+        Object.keys(owner).forEach(function (k) { per[owner[k].slice(7)] = (per[owner[k].slice(7)] || 0) + 1; });
+        document.title = "changed office: " + (moved.length ? moved.join("; ") : "none") + " | places per office when zoomed out: " + JSON.stringify(per);
+      }, 2500);
+    }
+    if (first && location.hash.indexOf("#selftest-landclick") === 0 && chart) {  // open an office, then click on land far away
+      var off0 = d.places.filter(function (q) { return q.kind === "office" && q.hq; })[0] || d.places[0];
+      openPlace(off0.key);
+      setTimeout(function () {
+        var before = state.open, at = chart.convertToPixel({ geoIndex: 0 }, [24, -1]), ev = { zrX: at[0], zrY: at[1] }, hd = chart.getZr().handler;  // Congo
+        hd.mousemove(ev); hd.mousedown(ev); hd.mouseup(ev); hd.click(ev);
+        setTimeout(function () { document.title = "opened " + before + " -> after a click on land: " + (state.open || "closed") + ", selection " + (state.sel ? state.sel.type : "none"); }, 800);
+      }, 1500);
+    }
+    if (first && location.hash === "#selftest-feed") {
+      setTimeout(function () {
+        var css = document.createElement("style");
+        css.textContent = ".fresh { animation-play-state: paused !important; animation-delay: -0.22s, -0.22s !important; }";
+        document.head.appendChild(css);
+        if (location.search.indexOf("intro") >= 0) {
+          css.textContent = ".fresh { animation-play-state: paused !important; animation-delay: calc(var(--i, 0) * 45ms - 0.3s) !important; }";
+          d.events.slice(0, 16).forEach(function (e, i) { state.freshEvents[eventKey(e)] = i + 2; });
+        } else d.events.slice(0, 2).forEach(function (e) { state.freshEvents[eventKey(e)] = 1; });
+        renderPanel();
+      }, 1500);
+    }
+    if (first && location.hash === "#selftest-draws") {  // how often is the map redrawn while nothing happens?
+      setTimeout(function () { var n0 = drawCount; setTimeout(function () {
+        var arrows = 0, flying = 0;
+        (function walk(list) { for (var i = 0; list && i < list.length; i++) { var el = list[i];
+          if (el.__p1) { arrows++; if (!el.ignore) flying++; } if (el._children) walk(el._children); } })(chart.getZr().storage._roots);
+        document.title = "redraws in 5 s: " + (drawCount - n0) + ", arrows " + arrows + ", visible " + flying + " | visible per half second: " + seen.join(" ") +
+          " | phases now: " + phases.sort().join(" "); $("livetext").textContent = ""; $("s-note").textContent = document.title; }, 5000);
+        var seen = [], phases = [];
+        var iv = setInterval(function () {
+          var v = 0; phases = [];
+          (function walk(list) { for (var i = 0; list && i < list.length; i++) { var el = list[i];
+            if (el.__p1 && !el.ignore) { v++; phases.push(Math.round(el.__t * 10)); } if (el._children) walk(el._children); } })(chart.getZr().storage._roots);
+          seen.push(v); if (seen.length >= 9) clearInterval(iv); }, 500); }, 4000);
+    }
+    if (first && location.hash === "#selftest-split" && chart) {  // open the biggest merged marker, then zoom in on it
+      var merged = [];
+      chart.getOption().series.forEach(function (x) {
+        if (x.name === "places" || x.name === "offices") (x.data || []).forEach(function (m) { if (m.keys && m.keys.length > 1) merged.push(m); }); });
+      merged.sort(function (a, b) { return b.keys.length - a.keys.length; });
+      if (merged[0]) {
+        openPlace(merged[0].place.key, merged[0].keys, merged[0].place.label);
+        document.title = "split " + merged[0].keys.length;
+        setTimeout(function () {
+          chart.setOption({ geo: { center: [merged[0].place.lon, merged[0].place.lat], zoom: 10 } });
+          splitOpen(); draw(); document.title += " -> " + state.openKeys.length;
+          setTimeout(function () {
+            if (location.search.indexOf("mid") >= 0) return;
+            chart.setOption({ geo: { zoom: location.search.indexOf("fly") >= 0 ? 4 : 1.2 } });
+            splitOpen(); draw(); document.title += " -> " + state.openKeys.length;
+            if (location.search.indexOf("fly") >= 0) { cancelAnimationFrame(flyAnim); var t0 = Date.now() - 200;  // freeze mid-flight
+              Object.keys(state.flyIn).forEach(function (id) { state.flyIn[id].t0 = t0; }); Date.now = function () { return t0 + 200; }; draw(); }
+          }, 1500);
+        }, 1500);
+      }
+    }
+    if (first && location.hash === "#selftest-click" && chart) {
+      var bubble = (chart.getOption().series.filter(function (x) { return x.name === "places"; })[0].data || [])
+        .filter(function (m) { return m.keys && m.keys.length > 1; })[0];
+      if (bubble) {
+        var at = chart.convertToPixel({ geoIndex: 0 }, bubble.value), ev = { zrX: at[0], zrY: at[1] }, h = chart.getZr().handler;
+        h.mousemove(ev); h.mousedown(ev); h.mouseup(ev); h.click(ev);
+      }
+    }
+    if (first && location.hash === "#selftest" && d.places.length) {
+      // check of the click path without a mouse: open the busiest place and select its first person
+      var busiest = d.places.slice().sort(function (a, b) { return b.count - a.count; })[0];
+      openPlace(busiest.key);
+      var someone = d.people.filter(function (q) { return q.place === busiest.key; })[0];
+      if (someone) selectPerson(someone.id);
+    }
+  }
+  var failures = 0;
+  function lost() {
+    // The map's data source has stopped (the app was updated or closed). This window cannot recover: say so, and
+    // close it so that it is not in the way when the map is opened again.
+    failures++;
+    paintStatus(true);
+    if (failures >= 3) {
+      notice("The map has stopped (RADAR was closed or updated). Close this window and open the map again from the tray icon.");
+      try { window.close(); } catch (e) { /* not allowed: the notice stays */ }
+    }
+  }
+  function paintStats() {
+    // the numbers at the bottom count what is shown: people signed in (guests only with the "Guests" switch)
+    var d = state.data, st = d.stats || {};
+    if (d.empty) return;
+    var people = shownPeople(), nowhere = shownUnlocated();
+    var inOffice = people.filter(function (p) { return p.place.indexOf("office:") === 0; }).length;
+    $("s-people").textContent = people.length + nowhere.length;
+    $("s-office").textContent = inOffice;
+    $("s-remote").textContent = people.length - inOffice;
+    $("s-country").textContent = people.filter(function (p) { return p.precision === "guess"; }).length;
+    $("s-unknown").textContent = nowhere.length;
+    $("s-att").textContent = st.attempts != null ? st.attempts : "-";
+    $("s-breach").textContent = st.breaches != null ? st.breaches : "-";
+    // with "Not signed in": the rest of the directory, so that the figures add up to all enabled accounts
+    var un = d.unplaced;  // the rest of the directory - always shown, so that the figures add up to all enabled accounts
+    if (un) {
+      $("s-away").textContent = (d.offline || []).filter(function (p) { return state.guests || !p.guest; }).length;
+      $("s-silent").textContent = (un.silent || 0) + (state.guests ? un.silent_guests || 0 : 0);
+      $("s-noplace").textContent = (un.active || 0) + (state.guests ? un.active_guests || 0 : 0);
+    }
+  }
+  function poll() {
+    if (state.paused) return;
+    fetch("data?attacks=" + state.window + "&offline=1")  /* always with the accounts not signed in: the bottom bar counts them */.then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) { failures = 0; apply(d); }).catch(lost);
+  }
+  // tells the map's server that this window is still open (also while paused), and notices when the server is gone
+  setInterval(function () { fetch("ping").then(function (r) { if (!r.ok) throw new Error(r.status); failures = 0; }).catch(lost); }, 10000);
+  [["l-people", "people"], ["l-offices", "offices"], ["l-attacks", "attacks"], ["l-risk", "risk"], ["l-guests", "guests"],
+   ["l-offline", "offline"]].forEach(function (pair) {
+    $(pair[0]).addEventListener("click", function () {
+      state[pair[1]] = !state[pair[1]];
+      this.setAttribute("aria-pressed", state[pair[1]]);
+      if (pair[1] === "offline" && state.offline && state.data && !(state.data.offline || []).length) {
+        $("livetext").textContent = "Reading the accounts that are not signed in...";
+        poll();  // these are only computed when asked for
+      }
+      if (state.data) paintStats();
+      renderPanel(); draw();
+    });
+  });
+  [1, 24, 72].forEach(function (h) {
+    $("w-" + h).addEventListener("click", function () {
+      state.window = h;
+      [1, 24, 72].forEach(function (x) { $("w-" + x).setAttribute("aria-pressed", x === h); });
+      $("livetext").textContent = "Reading the data...";
+      poll();
+    });
+  });
+  $("l-dark").addEventListener("click", function () {
+    state.dark = !state.dark;
+    try { localStorage.setItem("map-theme", state.dark ? "dark" : "light"); } catch (e) { /* not remembered */ }
+    paintTheme();
+  });
+  $("s-unknown-btn").addEventListener("click", function () { select({ type: "unlocated" }); });
+  $("t-feed").addEventListener("click", function () { state.tab = "feed"; renderPanel(); });
+  $("t-sel").addEventListener("click", function () { state.tab = "sel"; renderPanel(); });
+  (function () {  // the legend: closed by default, a click (or Enter / Space) opens and closes it
+    var lg = $("legend");
+    function toggle() {
+      var open = lg.getAttribute("aria-expanded") !== "true";
+      lg.classList.toggle("still", !state.effects);
+      lg.setAttribute("aria-expanded", open);
+      lg.title = open ? "Legend - click to close" : "Legend - click to show what the signs mean";
+    }
+    lg.addEventListener("click", toggle);
+    lg.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+    if (location.hash === "#selftest-legend") setTimeout(toggle, 1500);
+  })();
+  $("pause").addEventListener("click", function () { state.paused = !state.paused; paintStatus(false); draw(); if (!state.paused) poll(); });
+
+  initMap(); paintTheme(); renderPanel(); poll();
+  setInterval(poll, POLL_MS);
+  setInterval(function () { if (state.data && !state.paused) paintStatus(false); }, 5000);
+})();
+</script>
+</body>
+</html>
