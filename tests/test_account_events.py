@@ -130,3 +130,17 @@ def test_account_events_are_in_the_maps_feed(history):
                  for i in range(data.MAX_EVENTS + 20)])
     snap = data.build_snapshot(history, settings, None, now, account_events=[recent])
     assert len(snap["events"]) == data.MAX_EVENTS + 1 and snap["events"][-1]["kind"] == "account"
+
+
+def test_a_reported_mfa_prompt_is_a_feed_entry_in_the_warning_colour():
+    line = {"id": "r1", "activityDateTime": "2026-11-09T10:00:00Z", "activityDisplayName": "Suspicious activity reported",
+            "result": "success", "resultReason": "Successfully reported suspicious activity", "loggedByService": "Azure MFA",
+            "initiatedBy": {"user": {"id": "u1", "userPrincipalName": "alice@contoso.com"}},
+            "targetResources": [{"id": "u1", "type": "User", "displayName": "Alice", "userPrincipalName": "alice@contoso.com"}],
+            "additionalDetails": [{"key": "AuthenticationMethod", "value": "PhoneAppNotification"}]}
+    events = ae.normalise([line, dict(line, id="r2", activityDateTime="2026-11-09T10:00:40Z")])
+    assert len(events) == 1  # the same report logged twice is one entry
+    e = ae.public(events[0])
+    assert (e["kind"], e["title"], e["who"], e["by"], e["detail"], e["failed"]) == (
+        "mfa", "MFA prompt reported as not theirs", "Alice", "alice@contoso.com", "Authenticator notification", True)
+    assert ae.classify(dict(line, result="failure")) is None

@@ -302,7 +302,9 @@ CHANGE_KINDS: dict[str, tuple[int, str]] = {
     "method_deleted": (10, "MFA method deleted"),
     "password_reset_self": (10, "Self-service password reset"),
     "device_credential_added": (5, "Windows Hello for Business set up (device-bound)"),
+    "mfa_prompt_reported": (0, "MFA prompt reported as not theirs"),  # not a change: see the mfa_report rule
 }
+REPORT_KIND = "mfa_prompt_reported"
 
 
 def _change_kind(activity: str, reason: str) -> str | None:
@@ -373,6 +375,27 @@ class AccountChange:
         return cls(id=a["id"], created=parse_time(a["activityDateTime"]), user_id=target["id"], upn=upn, kind=kind,
                    detail=text, actor=actor_upn or app.get("displayName") or "", by_admin=by_admin,
                    actor_ip=user.get("ipAddress") or "", app_id=app.get("appId") or "", app=app.get("displayName") or "")
+
+    @classmethod
+    def from_report(cls, a: dict[str, Any]) -> "AccountChange | None":
+        """The audit entry Entra writes when a user reports an MFA prompt as not theirs ("Suspicious activity
+        reported", service "Azure MFA"). It names the account, the time and the method - not where the prompt came
+        from: that is in the sign-in log, in a row of its own that arrives up to 1-2 hours later."""
+        if (a.get("result") or "").lower() != "success":
+            return None
+        user = (a.get("initiatedBy") or {}).get("user") or {}
+        target = next((t for t in a.get("targetResources") or [] if (t.get("type") or "").lower() == "user"
+                       and t.get("id")), None) or ({"id": user.get("id"), "userPrincipalName": user.get("userPrincipalName")}
+                                                   if user.get("id") else None)
+        if not target:
+            return None
+        details = {str(d.get("key")): str(d.get("value") or "") for d in a.get("additionalDetails") or []
+                   if isinstance(d, dict)}
+        method = details.get("AuthenticationMethod") or ""
+        upn = (target.get("userPrincipalName") or "").lower()
+        text = (a.get("activityDisplayName") or "Suspicious activity reported").strip() + (f" ({method})" if method else "")
+        return cls(id=a["id"], created=parse_time(a["activityDateTime"]), user_id=target["id"], upn=upn,
+                   kind=REPORT_KIND, detail=text, actor=upn)
 
     @property
     def points(self) -> int:

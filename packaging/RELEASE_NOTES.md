@@ -1,5 +1,14 @@
 RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID.
 
+**New in 1.0.4**
+
+- New check: a user reports an MFA prompt as not theirs (Microsoft Authenticator, or the reporting code on the
+  phone). RADAR raises an alert and judges it by the sign-in that caused the prompt: the account's own device and
+  network ends low, an unfamiliar one high. A password attack on the same account is rated higher. The report
+  also appears in the live map's feed.
+- This needs the Entra setting *Report suspicious activity*. The connection check shows whether it is on and how
+  to switch it on; while it is off the check is inactive and the menu says so.
+
 **New in 1.0.3** (hardening after a review of the code)
 
 - One installation, one tenant: after a sign-in to a different tenant RADAR reads nothing until you sign in to the

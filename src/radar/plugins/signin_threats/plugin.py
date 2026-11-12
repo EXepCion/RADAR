@@ -1,9 +1,11 @@
 """Sign-in threat detection plugin: incremental ingestion of tenant sign-ins + detection rules."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
+from ... import tenant_settings
 from ...graph import GraphError
 from ...plugin_api import Finding, Plugin, PluginContext, Rule
 from . import apps, netintel, overview, rules
@@ -82,6 +84,11 @@ class SignInThreatsPlugin(Plugin):
         # fresh MFA through a hosting network (AiTM proxy) / session moving networks right after a fresh MFA
         "aitm_replay": {"window_minutes": 180},
         "password_not_completed": {"settle_minutes": 15, "window_hours": 3},
+        # a user reported an MFA prompt as not theirs: the audit entries that say so (by name), how close in time the
+        # failed sign-in must be to count as the one that caused the prompt, and how long to wait for it
+        "mfa_report": {"activities": ["Suspicious activity reported"], "lookback_hours": 24,
+                       "match_seconds_before": 180, "match_seconds_after": 60, "wait_minutes": 120,
+                       "setting_check_hours": 24},
         "attack_tooling": {"min_failures": 3},
         "new_shared_ip": {"min_accounts": 2, "new_ip_hours": 24},
         # Risk scoring: trusted_asns lower nothing but stop "VPN/hosting" points (e.g. your own ZTNA/VPN
@@ -91,8 +98,13 @@ class SignInThreatsPlugin(Plugin):
         "scoring": {"trusted_asns": [], "extra_asns": {}, "suspicious_user_agents": None, "lookup_asn_names": True},
     }
 
+    #: rule id -> a short note shown behind the rule's name in the menu (why it is inactive, what cannot be verified)
+    rule_notes: dict[str, str] = {}
+
     # ---------------------------------------------------------------- run
     def run(self, ctx: PluginContext) -> list[Finding]:
+        if "rule_notes" not in self.__dict__:
+            self.rule_notes = {}
         s = ctx.settings
         history = SignInHistory(ctx.data_dir / "signins.db")
         try:
@@ -113,7 +125,8 @@ class SignInThreatsPlugin(Plugin):
                 fetched += n
                 new.extend(fresh)
             self._refresh_incomplete(ctx, history, now)
-            self._ingest_changes(ctx, history, now)
+            report_off = self._report_setting(ctx, now, force=full) == tenant_settings.OFF
+            self._ingest_changes(ctx, history, now, reports=ctx.rule_enabled("mfa_report") and not report_off)
             history.purge(now - timedelta(days=float(s.get("retention_days", 30))),
                           now - timedelta(hours=float(s.get("non_interactive_retention_hours", 3))))
 
@@ -124,7 +137,7 @@ class SignInThreatsPlugin(Plugin):
             rc.learning = frozenset(learning)
             findings: list[Finding] = []
             for rule in RULES:
-                if not ctx.rule_enabled(rule.meta.id):
+                if not ctx.rule_enabled(rule.meta.id) or (rule.meta.id == "mfa_report" and report_off):
                     continue
                 try:
                     findings.extend(rule.evaluate(rc))
@@ -297,29 +310,85 @@ class SignInThreatsPlugin(Plugin):
                       "activityDisplayName eq 'Add Windows Hello for Business credential' or "
                       "activityDisplayName eq 'Delete passwordless phone sign-in credential')")
 
-    def _ingest_changes(self, ctx: PluginContext, history: SignInHistory, now: datetime) -> None:
-        """Fetch MFA-method and password changes for the mfa_change rule (first run: the whole baseline)."""
-        if not ctx.rule_enabled("mfa_change"):
+    def _report_setting(self, ctx: PluginContext, now: datetime, force: bool = False) -> str:
+        """Is 'Report suspicious activity' on in the tenant? (enabled / off / unknown; asked once a day.) While it
+        is off nobody can report a prompt: the mfa_report rule is left out and the menu says why. When the setting
+        cannot be read with this sign-in (it needs Policy.Read.All) the rule stays active."""
+        if not ctx.rule_enabled("mfa_report"):
+            self.rule_notes.pop("mfa_report", None)
+            return tenant_settings.UNKNOWN
+        cfg = ctx.settings.get("mfa_report") if isinstance(ctx.settings.get("mfa_report"), dict) else {}
+        try:
+            cached = json.loads(ctx.state.get("report_setting") or "{}")
+        except (TypeError, ValueError):
+            cached = {}
+        fresh = cached.get("checked") and now - parse_time(cached["checked"]) < timedelta(
+            hours=float(cfg.get("setting_check_hours", 24)))
+        if force or not fresh:
+            try:
+                state, scope = tenant_settings.report_suspicious_activity(ctx.graph)
+            except GraphError as exc:
+                # not allowed to read it: unknown. Anything else (throttling ...): what was known before stays
+                denied = exc.status in (401, 403)
+                state = tenant_settings.UNKNOWN if denied else cached.get("state", tenant_settings.UNKNOWN)
+                scope = "" if denied else cached.get("scope", "")
+            except Exception:  # noqa: BLE001 - no network: nothing learned
+                state, scope = cached.get("state", tenant_settings.UNKNOWN), cached.get("scope", "")
+            if state != cached.get("state"):
+                ctx.log.info("Tenant setting 'Report suspicious activity': %s%s", state, f" ({scope})" if scope else "")
+            cached = {"state": state, "scope": scope, "checked": now.isoformat()}
+            ctx.state.set("report_setting", json.dumps(cached))
+        state = cached.get("state", tenant_settings.UNKNOWN)
+        note = {tenant_settings.OFF: "inactive: 'Report suspicious activity' is off in Entra",
+                tenant_settings.UNKNOWN: "cannot verify the Entra setting"}.get(
+                    state, "on for a group only" if cached.get("scope") == "group" else "")
+        if note:
+            self.rule_notes["mfa_report"] = note
+        else:
+            self.rule_notes.pop("mfa_report", None)
+        return state
+
+    def _ingest_changes(self, ctx: PluginContext, history: SignInHistory, now: datetime, reports: bool = False) -> None:
+        """Fetch MFA-method and password changes for the mfa_change rule (first run: the whole baseline), and the
+        reports of MFA prompts for the mfa_report rule."""
+        changes_wanted = ctx.rule_enabled("mfa_change")
+        if not changes_wanted and not reports:
             return
+        cfg = ctx.settings.get("mfa_report") if isinstance(ctx.settings.get("mfa_report"), dict) else {}
+        names = [str(n) for n in (cfg.get("activities") or ["Suspicious activity reported"]) if "'" not in str(n)]
+        report_names = {n.lower() for n in names} if reports else set()
         checkpoint = ctx.state.get("checkpoint:changes")  # time of the last fetch; audit events arrive late
         since = (parse_time(checkpoint) - timedelta(minutes=60) if checkpoint
                  else now - timedelta(days=min(30.0, float(ctx.settings.get("baseline_days", 30)))))
+        wanted = [(flt, since) for flt in (self.CHANGE_FILTERS if changes_wanted else ())]
+        if report_names:
+            # the first time this is read (also after an update): what was reported within the rule's window
+            first = not ctx.state.get("checkpoint:reports")
+            wanted.append(("(" + " or ".join(f"activityDisplayName eq '{n}'" for n in names) + ")",
+                           min(since, now - timedelta(hours=float(cfg.get("lookback_hours", 24)))) if first else since))
         audits: list[dict] = []
         try:
-            for flt in self.CHANGE_FILTERS:
+            for flt, start in wanted:
                 for page in ctx.graph.get_pages("/v1.0/auditLogs/directoryAudits",
-                                                {"$filter": f"activityDateTime ge {graph_time(since)} and {flt}",
+                                                {"$filter": f"activityDateTime ge {graph_time(start)} and {flt}",
                                                  "$top": "999"}, max_pages=50):
                     ctx.check_cancelled()
                     audits.extend(page)
         except Exception as exc:  # the sign-in rules must not depend on the audit log
             ctx.log.warning("Could not read MFA/password changes from the audit log: %s", exc)
             return
+        if report_names:
+            ctx.state.set("checkpoint:reports", now.isoformat())
         audits.sort(key=lambda a: a.get("activityDateTime") or "")
         # "User registered security info" does not name the method; the preceding "started" event does
         started: dict[str, tuple[datetime, str]] = {}
         changes = []
         for a in audits:
+            if (a.get("activityDisplayName") or "").strip().lower() in report_names:
+                report = AccountChange.from_report(a)
+                if report:
+                    changes.append(report)
+                continue
             if (a.get("activityDisplayName") or "").lower() == "user started security info registration":
                 method = next((str(d.get("value")) for d in a.get("additionalDetails") or []
                                if isinstance(d, dict) and d.get("key") == "AuthenticationMethod"), "")

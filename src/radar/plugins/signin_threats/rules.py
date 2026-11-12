@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable
 from ...plugin_api import Finding, Rule, Severity
 from . import netintel
 from .history import SignInHistory
-from .models import CHANGE_KINDS, AccountChange, SignIn, os_family, parse_time  # noqa: F401  (os_family re-exported)
+from .models import CHANGE_KINDS, REPORT_KIND, AccountChange, SignIn, os_family, parse_time  # noqa: F401  (os_family re-exported)
 from .accounts import AccountDirectory  # noqa: F401  (type of RuleContext.accounts)
 from .scoring import LABEL_HABITUAL_VPN, Assessment, Assessor, Factor, severity_for
 
@@ -493,6 +493,10 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
         if locked_out:
             factors.append(Factor(30, f"The person is locked out too: {len(locked_out)} sign-in(s) from their own "
                                       f"network or device were refused as locked (50053)"))
+        reported = [c for c in rc.history.changes(rc.now - window, rc.now, user_id) if c.kind == REPORT_KIND]
+        if reported:
+            factors.append(Factor(25, f"The person reported an MFA prompt as not theirs "
+                                      f"({reported[-1].created.astimezone():%d.%m. %H:%M}): the password is known"))
         if acct:
             factors.extend(Assessor.account_factors(acct, failures[0]))
         score = max(0, min(100, sum(f.points for f in factors)))
@@ -1448,7 +1452,7 @@ def mfa_change(rc: RuleContext) -> list[Finding]:
     lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
     groups: dict[str, list[AccountChange]] = defaultdict(list)
     for c in rc.history.changes(rc.now - lookback, rc.now):
-        if (c.guest and not cfg.get("include_guests", False)) or c.upn in rc.ignore_users:
+        if (c.guest and not cfg.get("include_guests", False)) or c.upn in rc.ignore_users or c.kind == REPORT_KIND:
             continue
         groups[c.user_id].append(c)
     out = []
@@ -1647,6 +1651,84 @@ class RuleDef:
     evaluate: Callable[[RuleContext], list[Finding]]
 
 
+def mfa_report(rc: RuleContext) -> list[Finding]:
+    """A user reported an MFA prompt as not theirs (Authenticator: "No, it's not me" > report; phone: the reporting
+    code). The prompt only comes after the password was accepted, so a true report means someone else has it.
+
+    The audit entry is the trigger; the sign-in that caused the prompt is a row of its own in the sign-in log -
+    failed at the MFA step, same account, seconds before the report - and arrives up to 1-2 hours later. Until then
+    the alert stands at Medium; with the row it is judged by where that sign-in came from: the account's own
+    managed device and usual network (a prompt of their own, reported by mistake) ends low, an unfamiliar network
+    or device high. No row after the waiting time: high.
+    """
+    cfg = rc.cfg("mfa_report")
+    lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
+    before = timedelta(seconds=float(cfg.get("match_seconds_before", 180)))
+    after = timedelta(seconds=float(cfg.get("match_seconds_after", 60)))
+    wait = timedelta(minutes=float(cfg.get("wait_minutes", 120)))
+    out = []
+    for c in rc.history.changes(rc.now - lookback, rc.now):
+        if c.kind != REPORT_KIND or c.upn in rc.ignore_users:
+            continue
+        acct = rc.accounts.get(c.user_id) if rc.accounts else None
+        upn = (acct.upn if acct else "") or c.upn or c.user_id
+        when = f"{c.created.astimezone():%d.%m. %H:%M}"
+        near = rc.history.query(c.created - timedelta(minutes=10), c.created + timedelta(minutes=10),
+                                user_id=c.user_id, interactive_only=True)
+        prompts = [s for s in near if s.error_code == MFA_DENIED_CODE and c.created - before <= s.created <= c.created + after]
+        fields = {"User": upn, "Reported": f"{when} - {c.detail}"}
+        if prompts:
+            s = min(prompts, key=lambda x: abs((x.created - c.created).total_seconds()))
+            same = [x for x in near if x.success and ((s.device_id and x.device_id == s.device_id)
+                                                      or (s.session_id and x.session_id == s.session_id))]
+            extra = [Factor(-25, "The same device signed the account in successfully within minutes of the report")] if same else []
+            a = rc.assessor.assess(s, 60, "The user reported the MFA prompt of this sign-in as not theirs", extra)
+            a.score = max(a.score, 25)  # a report is never dropped: at least a low reminder
+            own = a.score < 45
+            fields.update({"IP address": s.ip, "Location": s.location, "Application": s.app})
+            out.append(_scored(
+                a, key=f"mfa-report|{c.user_id}|{c.id}", rule_id="mfa_report",
+                title=f"MFA prompt reported as not theirs: {upn}" + (" (probably their own sign-in)" if own else ""),
+                summary=(f"{upn} reported an MFA prompt as not theirs at {when}. The prompt was caused by a sign-in to "
+                         f"{s.app or 'an application'} from {s.location} ({s.ip}) that had the right password. "
+                         + ("It came from the account's own device and usual surroundings: most likely the user's own "
+                            "sign-in, reported by mistake." if own else
+                            "It did not come from the account's usual surroundings: someone else knows the password.")
+                         + f" Assessment: {a.top_reasons()}."),
+                occurred_at=c.created, fields=fields,
+                evidence=[c.evidence()] + _evidence([s] + [x for x in near if x.id != s.id]),
+                recommendation=("Ask the user whether they were signing in themselves. If so, nothing is wrong - but the "
+                                "report set the account to high risk in Entra ID Protection: dismiss that risk there."
+                                if own else
+                                "Treat the password as known to someone else: reset it and revoke the sessions, block "
+                                "the address, and look for successful sign-ins from it. The report also set the account "
+                                "to high risk in Entra ID Protection."),
+                links=_user_links(s),
+            ))
+            continue
+        pending = rc.now - c.created < wait
+        score = 50 if pending else 75
+        factors = [(50, "The user reported an MFA prompt as not theirs (a prompt is only sent after the right password)")]
+        if not pending:
+            factors.append((25, f"No sign-in that caused the prompt was recorded within {int(wait.total_seconds() // 60)} minutes"))
+        fields["Risk score"] = f"{score}/100"
+        out.append(Finding(
+            key=f"mfa-report|{c.user_id}|{c.id}", rule_id="mfa_report", severity=severity_for(score), score=score,
+            factors=factors, title=f"MFA prompt reported as not theirs: {upn}",
+            summary=(f"{upn} reported an MFA prompt as not theirs at {when}. "
+                     + ("The sign-in that caused the prompt is not in the sign-in log yet (Entra delivers it up to "
+                        "1-2 hours later); this alert is judged again when it arrives."
+                        if pending else
+                        "No sign-in that caused the prompt has appeared in the sign-in log.")
+                     + (f" {len(near)} other sign-in(s) of the account around that time are listed below." if near else "")),
+            occurred_at=c.created, fields=fields, evidence=[c.evidence()] + _evidence(near),
+            recommendation="Ask the user whether they were signing in themselves. If not, someone else knows the "
+                           "password: reset it and revoke the sessions.",
+            links=[("Entra: sign-in logs", SIGNIN_LOGS_URL)],
+        ))
+    return out
+
+
 RULES: list[RuleDef] = [
     RuleDef(Rule("risky_signin", "Risky sign-ins (ID Protection)",
                  "Sign-ins Entra ID Protection rates medium/high risk"), risky_signin),
@@ -1654,7 +1736,9 @@ RULES: list[RuleDef] = [
     RuleDef(Rule("brute_force", "Brute force", "Many failed passwords for one account (+ success)"), brute_force),
     RuleDef(Rule("distributed_attack", "Password attack from rotating IPs",
                  "Low-and-slow guessing against one account from many proxy IPs"), distributed_attack),
-    RuleDef(Rule("mfa_fatigue", "MFA fatigue / fraud report", "Repeated MFA denials or fraud reports"), mfa_fatigue),
+    RuleDef(Rule("mfa_fatigue", "MFA fatigue", "Repeated MFA denials"), mfa_fatigue),
+    RuleDef(Rule("mfa_report", "MFA prompt reported by the user",
+                 "A user reported an MFA prompt as not theirs (needs 'Report suspicious activity' in Entra)"), mfa_report),
     RuleDef(Rule("password_not_completed", "Correct password, MFA not completed",
                  "Password accepted from an unfamiliar place but MFA/CA stopped it"), password_not_completed),
     RuleDef(Rule("session_theft", "Session token theft",

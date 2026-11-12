@@ -24,15 +24,17 @@ class Graph:
         for part, error in self.errors.items():
             if part in path:
                 raise error
+        if "authenticationMethodsPolicy" in path:
+            return {"reportSuspiciousActivitySettings": {"state": "enabled", "includeTarget": {"id": "all_users"}}}
         return {"value": []}
 
 
 def test_everything_readable_means_working():
     seen = []
     checks = setup_check.probe(Graph(), "me@contoso.com", identity.AZURE_CLI, on_result=seen.append)
-    assert [c.key for c in checks] == ["signins", "audit", "directory", "policies"] and all(c.ok for c in checks)
+    assert [c.key for c in checks] == ["signins", "audit", "directory", "policies", "report"] and all(c.ok for c in checks)
     assert seen == checks and setup_check.working(checks) and setup_check.first_problem(checks) is None
-    assert [k for k, _ in setup_check.STEPS] == ["signin", "signins", "audit", "directory", "policies"]
+    assert [k for k, _ in setup_check.STEPS] == ["signin", "signins", "audit", "directory", "policies", "report"]
 
 
 def test_missing_role_is_explained_with_what_to_do():
@@ -45,7 +47,7 @@ def test_missing_role_is_explained_with_what_to_do():
     assert "admin consent" not in problem.hint  # that part is only for an app registration of one's own
     own = setup_check.probe(Graph({"signIns": denied}), "me@contoso.com", identity.OWN)[0]
     assert "AuditLog.Read.All" in own.hint and "admin consent" in own.hint
-    assert [c.ok for c in checks] == [False, False, True, True]  # the other reads are still tried
+    assert [c.ok for c in checks] == [False, False, True, True, True]  # the other reads are still tried
 
 
 def test_missing_licence_and_optional_reads():

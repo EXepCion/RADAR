@@ -230,6 +230,8 @@ class Tray:
         yield Item(a.plugin_status_text(rt), None, enabled=False)
         if rt.plugin.rules:
             yield SEP
+            notes = getattr(rt.plugin, "rule_notes", None) or {}
             for rule in rt.plugin.rules:
-                yield Item(rule.name, self._act(a.toggle_rule, pid, rule.id),
+                note = notes.get(rule.id)
+                yield Item(rule.name + (f"  ({note})" if note else ""), self._act(a.toggle_rule, pid, rule.id),
                            checked=self._chk(pm.rule_enabled, pid, rule.id), enabled=enabled)

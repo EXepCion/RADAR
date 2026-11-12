@@ -23,7 +23,7 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
 ## What it does
 
 - **Watches sign-ins** (every 10 minutes): password spray, brute force, password guessing from rotating addresses,
-  MFA fatigue, a correct password stopped by MFA, session token theft and AiTM phishing, impossible travel, sign-ins
+  MFA fatigue, MFA prompts a user reported as not theirs, a correct password stopped by MFA, session token theft and AiTM phishing, impossible travel, sign-ins
   from new countries (by hand and in the background), legacy protocols, device-code sign-ins, risky sign-ins flagged
   by Entra, accounts excluded from MFA, break-glass and disabled accounts, apps signing in with their own secrets.
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
@@ -129,6 +129,9 @@ Everything is in the tray icon's menu (right-click the shield in the notificatio
    where the machine is, not where the person is; travel rules and the map ignore it. The window proposes
    candidates.
 3. **Settings > Detection** - switch whole functions or single rules on and off.
+   One rule depends on a setting in Entra: *MFA prompt reported by the user* only works when *Report suspicious
+   activity* is switched on there (Entra ID > Authentication methods > Settings). The connection check tells you,
+   and the rule's menu entry says when it is inactive.
 4. **Settings > Advanced > Edit settings file** - everything else (thresholds, allowed countries, break-glass
    accounts, accounts pinned to fixed addresses, retention times). Changes apply when the file is saved.
 
@@ -147,7 +150,8 @@ failed, blue while scanning, grey while paused.
   from the local history each time, independent of what you dismissed.
 - **MFA exposure report** - all accounts that can sign in without MFA, with clean-up hints.
 - **Live map** - offices and towns with the number of people signed in, password attacks as arrows, a feed of
-  sign-ins, attacks and account events (password resets, MFA methods, devices, accounts, admin roles). Click a
+  sign-ins, attacks and account events (password resets, MFA methods, reported MFA prompts, devices, accounts,
+  admin roles). Click a
   place or a person for details. The map is a separate program that only runs while its window is open; its map
   files ship with RADAR, nothing is loaded from the internet.
 

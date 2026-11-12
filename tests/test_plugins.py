@@ -121,7 +121,7 @@ def test_signin_plugin_first_run_baseline_then_incremental(tmp_path):
     assert ctx.state.get("checkpoint:interactiveUser")
     assert len([c for c in fake.calls if "signInEventTypes" in c and "servicePrincipal" not in c]) == 2
     assert len([c for c in fake.calls if "'servicePrincipal'" in c]) == 1  # app sign-ins
-    assert len([c for c in fake.calls if c.startswith("activityDateTime")]) == 4  # MFA/password change audits
+    assert len([c for c in fake.calls if c.startswith("activityDateTime")]) == 5  # MFA/password change audits + reported prompts
 
     # second run: same data again -> nothing new, no findings
     ctx2 = pm.build_context("signin_threats")

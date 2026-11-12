@@ -1,4 +1,5 @@
-"""Account events for the live map's feed: password resets, MFA methods, devices, accounts, admin roles.
+"""Account events for the live map's feed: password resets, MFA methods, reported MFA prompts, devices, accounts,
+admin roles.
 
 The directory audit watch reads the Entra audit log anyway; what it sees of these kinds is boiled down here to one
 entry per real action (the log writes several lines for one action: a PIM activation is five) and kept in a small
@@ -20,7 +21,7 @@ CAP = 1500
 PLUGIN = "directory_audit"
 
 # lines that belong to one action lie this close together (same person / device, same kind of action)
-COLLAPSE = {"password": 600, "password-failed": 900, "mfa": 120, "device-added": 600, "device-deleted": 120,
+COLLAPSE = {"password": 600, "password-failed": 900, "mfa": 120, "mfa-report": 120, "device-added": 600, "device-deleted": 120,
             "account": 180, "role": 300}
 
 _PIM_APPS = {"ms-pim", "azure ad pim", "microsoft pim"}
@@ -66,6 +67,7 @@ def classify(audit: dict) -> dict[str, Any] | None:
     kind = title = group = detail = ""
     rank = 1  # of several lines for one action, the one with the highest rank tells it best
     person = user
+    warn = False  # shown in the warning colour although the action itself succeeded
 
     if "security info" in act and "all required" not in act and "started" not in act:
         verb = ("registered" if "registered" in act else "removed" if "deleted" in act else
@@ -76,6 +78,15 @@ def classify(audit: dict) -> dict[str, Any] | None:
         title = f"MFA method {verb}" + (" by an admin" if act.startswith("admin") else "")
         reason = (audit.get("resultReason") or "").strip()
         detail = reason if reason.lower() != act else ""
+    elif act == "suspicious activity reported":
+        if not ok:
+            return None
+        # the person said in Authenticator (or on the phone) that an MFA prompt was not theirs
+        kind, group, warn = "mfa", "mfa-report", True
+        title = "MFA prompt reported as not theirs"
+        detail = {"phoneappnotification": "Authenticator notification", "twowayvoicemobile": "phone call",
+                  "twowayvoiceoffice": "phone call"}.get(_detail(audit, "AuthenticationMethod").lower(),
+                                                         _detail(audit, "AuthenticationMethod"))
     elif act == "self-service password reset flow activity progress":
         if ok:
             return None  # a step of a reset that also logs its completion
@@ -150,7 +161,7 @@ def classify(audit: dict) -> dict[str, Any] | None:
     if not audit.get("activityDateTime"):
         return None
     event = {"id": audit.get("id") or "", "ts": _time(audit["activityDateTime"]).isoformat(), "kind": kind, "title": title,
-             "who": who, "upn": upn, "user_id": user_id, "by": actor, "detail": detail, "failed": not ok,
+             "who": who, "upn": upn, "user_id": user_id, "by": actor, "detail": detail, "failed": not ok or warn,
              "_group": group + ("|" + title.split(":")[-1].strip() if kind == "role" else "") + "|" + subject, "_rank": rank}
     if kind == "account" and group == "account":
         event["_group"] = f"account|{title.replace('Guest account', 'Account')}|{subject}"

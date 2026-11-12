@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from . import identity
+from . import identity, tenant_settings
 from .auth import AuthRequiredError, TenantChangedError
 from .graph import GraphError
 
@@ -38,7 +38,8 @@ PROBES = [
     ("policies", "Conditional Access policies", "/v1.0/identity/conditionalAccess/policies", {"$top": "1"}, False,
      "the MFA exposure report and the stricter rules for accounts excluded from MFA"),
 ]
-STEPS = [(SIGN_IN, "Sign in")] + [(key, title) for key, title, *_ in PROBES]
+REPORT = "report"
+STEPS = [(SIGN_IN, "Sign in")] + [(key, title) for key, title, *_ in PROBES] + [(REPORT, tenant_settings.REPORT_TITLE)]
 
 _AAD_CODE = re.compile(r"AADSTS(\d+)")
 _AUTH_HINTS = {
@@ -153,7 +154,40 @@ def probe(graph: Any, account: str = "", kind: str = "", on_result: Callable[[Ch
         out.append(check)
         if on_result:
             on_result(check)
+    check = report_check(graph)
+    out.append(check)
+    if on_result:
+        on_result(check)
     return out
+
+
+def report_check(graph: Any) -> Check:
+    """Can users report an MFA prompt they did not start? A tenant setting, off unless somebody switched it on -
+    and until it is on, RADAR's check for such reports has nothing to find and stays inactive."""
+    title, steps, needed_for = tenant_settings.REPORT_TITLE, tenant_settings.REPORT_ENABLE_STEPS, tenant_settings.REPORT_NEEDED_FOR
+    try:
+        state, scope = tenant_settings.report_suspicious_activity(graph)
+    except GraphError as exc:
+        log.warning("Set-up check: tenant setting '%s' not readable (%s %s)", title, exc.status, exc.code)
+        if exc.status in (401, 403):
+            return Check(REPORT, title, False, False,
+                         f"{title}: this sign-in is not allowed to read the setting (it needs Policy.Read.All).",
+                         f"RADAR works without it and keeps {needed_for} active, but cannot tell whether your users "
+                         f"are able to report a prompt. Look it up yourself. {steps}")
+        return Check(REPORT, title, False, False, f"{title}: Microsoft Graph answered {exc.status} ({exc.code or 'error'}).",
+                     "Check again in a moment.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Set-up check: tenant setting '%s' failed (%s)", title, exc)
+        return Check(REPORT, title, False, False, f"{title}: could not be reached ({type(exc).__name__}).",
+                     "Check the internet connection and check again.")
+    log.info("Set-up check: tenant setting '%s' is %s%s", title, state, f" ({scope})" if scope else "")
+    if state == tenant_settings.ENABLED and scope == "group":
+        return Check(REPORT, title, True, False, "switched on for a group - only its members can report an MFA prompt")
+    if state == tenant_settings.ENABLED:
+        return Check(REPORT, title, True, False, "switched on for all users")
+    return Check(REPORT, title, False, False,
+                 f"{title}: switched off in this organisation - users cannot report an MFA prompt they did not start.",
+                 f"RADAR works without it, but {needed_for} stays inactive until it is switched on. {steps}")
 
 
 def working(checks: list[Check]) -> bool:
