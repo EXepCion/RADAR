@@ -103,6 +103,7 @@ class RuleContext:
     learning: frozenset[str] = frozenset()  # MFA-excluded accounts whose pattern is not learned yet
     _assessor: Assessor | None = None
     _computer_nets: dict = field(default_factory=dict)  # user id -> networks the user's computers sign in from
+    _reported: dict | None = None  # ip -> ReportedAddress (see reported_addresses)
 
     @classmethod
     def build(cls, new: list[SignIn], history: SignInHistory, settings: dict, now: datetime,
@@ -146,6 +147,23 @@ class RuleContext:
     def cfg(self, rule_id: str) -> dict:
         value = self.settings.get(rule_id)
         return value if isinstance(value, dict) else {}
+
+    def reported_addresses(self) -> dict[str, "ReportedAddress"]:
+        """Addresses an attacker demonstrably used: a user reported the MFA prompt of a sign-in from there as not
+        theirs, and the sign-in did not come from that user's own surroundings (a prompt of their own, reported by
+        mistake, marks nothing). Remembered for ``mfa_report.mark_days``; every rule's assessment of a sign-in
+        from such an address - to whatever account - is raised (see Assessor.assess)."""
+        if self._reported is None:
+            self._reported = {}
+            if self.rule_on("mfa_report"):
+                days = float(self.cfg("mfa_report").get("mark_days", 7))
+                for c in self.history.changes(self.now - timedelta(days=days), self.now):
+                    if c.kind != REPORT_KIND or c.upn in self.ignore_users:
+                        continue
+                    s = _report_prompt(self, c)
+                    if s is not None and s.ip and s.ip not in self.ignore_ips and _foreign_to_user(self, s):
+                        self._reported[s.ip] = ReportedAddress(s.ip, c.created, c.upn or c.user_id, c.user_id, s.id, c.id)
+        return self._reported
 
     def rule_on(self, rule_id: str) -> bool:
         return self.enabled_rules is None or rule_id in self.enabled_rules
@@ -200,6 +218,40 @@ class RuleContext:
 
 
 # ------------------------------------------------------------- helpers
+@dataclass(frozen=True)
+class ReportedAddress:
+    ip: str
+    when: datetime      # of the report
+    upn: str            # who reported
+    user_id: str
+    signin_id: str      # the sign-in that caused the reported prompt
+    report_id: str
+
+
+def _report_prompt(rc: RuleContext, c: AccountChange) -> SignIn | None:
+    """The sign-in that caused a reported MFA prompt: the account's sign-in that failed at the MFA step closest to
+    the report (the two logs share no id; the audit entry is written seconds after the sign-in)."""
+    cfg = rc.cfg("mfa_report")
+    before = timedelta(seconds=float(cfg.get("match_seconds_before", 180)))
+    after = timedelta(seconds=float(cfg.get("match_seconds_after", 60)))
+    rows = rc.history.query(c.created - before, c.created + after, user_id=c.user_id, codes=(MFA_DENIED_CODE,),
+                            interactive_only=True)
+    return min(rows, key=lambda x: abs((x.created - c.created).total_seconds())) if rows else None
+
+
+def _foreign_to_user(rc: RuleContext, s: SignIn) -> bool:
+    """Not the user's own surroundings: no office network, no device, network or address the account used before."""
+    h = rc.history
+    if rc.trusted(s):
+        return False
+    if s.device_id and s.device_id in h.user_devices(s.user_id, s.created):
+        return False
+    if s.asn and s.asn in h.user_asns(s.user_id, s.created):
+        return False
+    known_ips = h.user_profile(s.user_id, "ip", s.created)
+    return not (s.ip in known_ips or _ip_net(s.ip) in {_ip_net(i) for i in known_ips})
+
+
 def _day(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d")
 
@@ -1663,10 +1715,8 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
     """
     cfg = rc.cfg("mfa_report")
     lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
-    before = timedelta(seconds=float(cfg.get("match_seconds_before", 180)))
-    after = timedelta(seconds=float(cfg.get("match_seconds_after", 60)))
     wait = timedelta(minutes=float(cfg.get("wait_minutes", 120)))
-    out = []
+    out = _reported_address_findings(rc)
     for c in rc.history.changes(rc.now - lookback, rc.now):
         if c.kind != REPORT_KIND or c.upn in rc.ignore_users:
             continue
@@ -1675,10 +1725,9 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
         when = f"{c.created.astimezone():%d.%m. %H:%M}"
         near = rc.history.query(c.created - timedelta(minutes=10), c.created + timedelta(minutes=10),
                                 user_id=c.user_id, interactive_only=True)
-        prompts = [s for s in near if s.error_code == MFA_DENIED_CODE and c.created - before <= s.created <= c.created + after]
+        s = _report_prompt(rc, c)
         fields = {"User": upn, "Reported": f"{when} - {c.detail}"}
-        if prompts:
-            s = min(prompts, key=lambda x: abs((x.created - c.created).total_seconds()))
+        if s is not None:
             same = [x for x in near if x.success and ((s.device_id and x.device_id == s.device_id)
                                                       or (s.session_id and x.session_id == s.session_id))]
             extra = [Factor(-25, "The same device signed the account in successfully within minutes of the report")] if same else []
@@ -1725,6 +1774,63 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
             recommendation="Ask the user whether they were signing in themselves. If not, someone else knows the "
                            "password: reset it and revoke the sessions.",
             links=[("Entra: sign-in logs", SIGNIN_LOGS_URL)],
+        ))
+    return out
+
+
+def _reported_address_findings(rc: RuleContext) -> list[Finding]:
+    """What else came from an address whose MFA prompt a user reported as not theirs: other accounts tried from it,
+    and anybody - the reporter included - who got in from it. Sign-ins from a device the account already used are
+    left out (a colleague on the same hotel or mobile network)."""
+    days = float(rc.cfg("mfa_report").get("mark_days", 7))
+    out = []
+    for mark in rc.reported_addresses().values():
+        rows = rc.keep(rc.history.query(mark.when - timedelta(days=days), rc.now, ip=mark.ip))
+        hits = []
+        for s in rows:
+            if not s.user_id or s.id == mark.signin_id or rc.trusted(s):
+                continue
+            if s.user_id == mark.user_id and not s.success:
+                continue  # further attempts on the reporter: that is the report's own alert
+            if s.device_id and s.device_id in rc.history.user_devices(s.user_id, s.created):
+                continue
+            hits.append(s)
+        if not hits:
+            continue
+        others = sorted({s.who for s in hits if s.user_id != mark.user_id})
+        successes = [s for s in hits if s.success]
+        accepted = [s for s in hits if s.error_code in PASSWORD_ACCEPTED_CODES or s.error_code == MFA_DENIED_CODE]
+        when = f"{mark.when.astimezone():%d.%m. %H:%M}"
+        factors = [(45, f"Sign-ins from {mark.ip}: {mark.upn} reported an MFA prompt from this address as not theirs ({when})")]
+        if len(others) > 1:
+            factors.append((min(15, 5 * (len(others) - 1)), f"{len(others)} other accounts were tried from it"))
+        if accepted:
+            factors.append((20, f"The password was right for {', '.join(sorted({s.who for s in accepted}))} "
+                                f"(stopped at MFA / Conditional Access)"))
+        if successes:
+            factors.append((35, f"{len(successes)} successful sign-in(s) from it: {', '.join(sorted({s.who for s in successes}))}"))
+        score = min(100, sum(p for p, _ in factors))
+        got_in = sorted({s.who for s in successes})
+        title = (f"Signed in from the address of a reported MFA prompt: {', '.join(got_in)[:120]}" if got_in else
+                 f"Address of a reported MFA prompt also used on {len(others)} other account(s): {mark.ip}")
+        s0 = hits[-1]
+        out.append(Finding(
+            key=f"reported-ip|{mark.ip}|{_day(mark.when)}", rule_id="mfa_report", severity=severity_for(score), score=score,
+            factors=factors, title=title,
+            summary=(f"{mark.upn} reported an MFA prompt as not theirs at {when}; the sign-in behind it came from {mark.ip} "
+                     f"({s0.location}). From the same address there were {len(hits)} more sign-in(s)"
+                     + (f" to {len(others)} other account(s)" if others else "")
+                     + (f", {len(successes)} of them successful" if successes else ", none of them successful")
+                     + ". Whoever is behind that address has at least one password of yours and is trying more accounts."),
+            occurred_at=min(s.created for s in hits),
+            fields={"IP address": mark.ip, "Accounts": ", ".join(sorted({s.who for s in hits}))[:300],
+                    "Reported by": f"{mark.upn} ({when})", "Risk score": f"{score}/100"},
+            evidence=_evidence(hits),
+            recommendation=("Treat every account that signed in successfully from this address as taken over: revoke its "
+                            "sessions and reset its password. " if successes else "")
+                           + "Block the address, reset the passwords the attacker got right, and make sure the other "
+                             "accounts use MFA.",
+            links=[("Entra: sign-in logs", SIGNIN_LOGS_URL), ("Look up IP (AbuseIPDB)", f"https://www.abuseipdb.com/check/{mark.ip}")],
         ))
     return out
 

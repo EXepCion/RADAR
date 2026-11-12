@@ -88,7 +88,9 @@ class SignInThreatsPlugin(Plugin):
         # failed sign-in must be to count as the one that caused the prompt, and how long to wait for it
         "mfa_report": {"activities": ["Suspicious activity reported"], "lookback_hours": 24,
                        "match_seconds_before": 180, "match_seconds_after": 60, "wait_minutes": 120,
-                       "setting_check_hours": 24},
+                       # the address of a reported prompt that was not the user's own counts against every sign-in
+                       # from it, to any account, for this many days
+                       "mark_days": 7, "setting_check_hours": 24},
         "attack_tooling": {"min_failures": 3},
         "new_shared_ip": {"min_accounts": 2, "new_ip_hours": 24},
         # Risk scoring: trusted_asns lower nothing but stop "VPN/hosting" points (e.g. your own ZTNA/VPN

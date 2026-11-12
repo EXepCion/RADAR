@@ -174,6 +174,12 @@ class Assessor:
                 elif peers == 0:
                     f.append(Factor(10, f"Network {self.asn_label(s.asn)} never seen in the tenant"))
 
+        # --- an address an attacker demonstrably used: someone reported its MFA prompt as not theirs
+        mark = rc.reported_addresses().get(s.ip) if s.ip and hasattr(rc, "reported_addresses") else None
+        if mark and mark.signin_id != s.id and not trusted:
+            f.append(Factor(25, f"Address of an MFA prompt that {mark.upn} reported as not theirs "
+                                f"({mark.when.astimezone():%d.%m. %H:%M})"))
+
         # --- device
         if s.device_id:
             known = s.device_id in self._cached(("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))

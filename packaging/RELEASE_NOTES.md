@@ -1,5 +1,11 @@
 RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID.
 
+**New in 1.0.5**
+
+- The address behind a reported MFA prompt is remembered for 7 days: every sign-in from it, to any account, is rated
+  higher, and other accounts tried from it - or anybody signing in from it - raise an alert of their own. A
+  report that turns out to be the user's own prompt marks nothing.
+
 **New in 1.0.4**
 
 - New check: a user reports an MFA prompt as not theirs (Microsoft Authenticator, or the reporting code on the
