@@ -15,7 +15,9 @@ from PIL import ImageTk
 from ..plugins.signin_threats import offices as model
 from ..plugins.signin_threats.offices import Office
 from . import icons, theme
-from .richtext import card, card_label, stable_label
+from .cardtable import CardTable
+from .parts import card, on_card
+from .richtext import card_label, stable_label
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -34,7 +36,7 @@ LONGEST_STATUS = ("CA office: '203.0.113.555' is not an IP address or range (exa
 
 class OfficesWindow:
     def __init__(self, root: tk.Tk, app: "App", offices: list[Office], on_save: Callable[[list[Office]], str | None],
-                 first_time: bool = False):
+                 first_time: bool = False, parent: tk.Misc | None = None, on_close=None):
         """``on_save(offices)`` stores them and returns None, or the reason why it could not."""
         self.app = app
         self.offices = [Office(**o.to_dict()) for o in offices]
@@ -42,114 +44,117 @@ class OfficesWindow:
         self._current: Office | None = None
         self._loading = False
         self._suggestions: list[dict[str, Any]] = []
-        top = self.top = theme.new_window(root)
+        top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
+        pad = 0 if theme.is_panel(top) else px(20)  # (a page has its host's margins)
         top.title("Offices")
         top.geometry(f"{px(WIDTH)}x{min(px(760), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(860), px(600))
-        top.bind("<Escape>", lambda _e: top.destroy())
+        top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
         top.iconphoto(False, self._icon)
 
-        header = ttk.Frame(top, padding=(px(20), px(16), px(20), px(4)))
-        header.pack(fill="x")
+        header = ttk.Frame(top, padding=(pad, px(16), pad, px(4)))
+        if not theme.is_panel(top):  # (as a page, the main window's settings carry the heading)
+            header.pack(fill="x")
         ttk.Label(header, text="Offices", style="Title.TLabel").pack(fill="x")
         ttk.Label(header, text=HELP, style="Muted.TLabel", justify="left", wraplength=px(WIDTH - 40)).pack(
             fill="x", pady=(px(4), 0))
 
-        footer = ttk.Frame(top, padding=(px(20), px(4), px(20), px(14)))
-        footer.pack(side="bottom", fill="x")
-        self.status = stable_label(footer, LONGEST_STATUS, width=px(WIDTH - 40))
-        self.status.pack(fill="x", pady=(0, px(8)))
-        buttons = ttk.Frame(footer)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
-        self.save_btn = ttk.Button(buttons, text="Save", style="Accent.TButton", command=self.save)
-        self.save_btn.pack(side="right", padx=(0, px(6)))
-
-        body = ttk.Frame(top, padding=(px(20), px(8), px(20), 0))
+        c = theme.color
+        body = ttk.Frame(top, padding=(pad, px(8), pad, px(8) if theme.is_panel(top) else px(14)))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=3, uniform="half")
-        body.columnconfigure(1, weight=2, uniform="half")
-        body.rowconfigure(0, weight=3)
-        body.rowconfigure(1, weight=2)
 
         # ---- the offices
         left = card(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, px(10)))
-        bar = tk.Frame(left, background=theme.color("card"))
-        bar.pack(side="bottom", fill="x", pady=(px(8), 0))
+        left.pack(fill="x")
+        bar = on_card(left, padx=px(12), pady=px(10))
+        bar.pack(side="bottom", fill="x")
         ttk.Button(bar, text="Add office", command=self.add).pack(side="left")
         self.remove_btn = ttk.Button(bar, text="Remove", command=self.remove, state="disabled")
         self.remove_btn.pack(side="left", padx=(px(6), 0))
-        self.tree = ttk.Treeview(left, columns=COLS, show="headings", selectmode="browse", height=6)
-        for c in COLS:
-            self.tree.heading(c, text=c, anchor="w")
-            self.tree.column(c, width=px(WIDTHS[c]), stretch=c == "Office", anchor="w")
+        self.tree = CardTable(left, COLS, selectmode="browse", height=4, border=False)
+        for col in COLS:
+            self.tree.heading(col, text=col, anchor="w")
+            self.tree.column(col, width=px(WIDTHS[col]), stretch=col == "Office", anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._select())
 
-        # ---- the selected office
+        # ---- the selected office: the name of every field above it
         right = self.form = card(body)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(1, weight=1)
+        right.pack(fill="x", pady=(px(10), 0))
+        form = on_card(right, padx=px(16), pady=px(12))
+        form.pack(fill="x")
+        for column, weight in ((0, 4), (1, 3), (2, 2)):
+            form.columnconfigure(column, weight=weight, uniform="office")
         self.vars = {k: tk.StringVar() for k in ("name", "city", "country", "lat", "lon")}
         self.hq = tk.BooleanVar()
         self.entries: dict[str, ttk.Entry] = {}
 
-        def field(row: int, label: str, key: str, width: int | None = None) -> None:
-            card_label(right, label, "muted").grid(row=row, column=0, sticky="w", padx=(0, px(12)), pady=px(4))
-            e = ttk.Entry(right, textvariable=self.vars[key], **({"width": width} if width else {}))
-            e.grid(row=row, column=1, sticky="w" if width else "ew", pady=px(4))
+        def caption(parent: tk.Misc, text: str) -> tk.Label:
+            return card_label(parent, text, "muted", font=theme.FONT_CAPTION)
+
+        def field(column: int, label: str, key: str) -> None:
+            caption(form, label).grid(row=0, column=column, sticky="w")
+            e = ttk.Entry(form, textvariable=self.vars[key])
+            e.grid(row=1, column=column, sticky="ew", padx=(0, px(12) if column < 2 else 0), pady=(px(3), px(10)))
             self.vars[key].trace_add("write", lambda *_a: self._edited())
             self.entries[key] = e
 
         field(0, "Name", "name")
         field(1, "City", "city")
-        field(2, "Country (2 letters)", "country", 6)
-        self.hq_box = ttk.Checkbutton(right, text="This is the headquarters", variable=self.hq, command=self._edited,
-                                      style="Card.TCheckbutton")
-        self.hq_box.grid(row=3, column=1, sticky="w", pady=px(4))
-        card_label(right, "IP addresses / ranges", "muted").grid(row=4, column=0, sticky="nw", padx=(0, px(12)), pady=px(4))
-        c = theme.color
-        self.ips = tk.Text(right, height=5, width=28, font=theme.FONT_MONO, wrap="none", relief="flat",
-                           background=c("window"), foreground=c("text"), insertbackground=c("text"),
+        field(2, "Country (2 letters)", "country")
+        caption(form, "IP addresses or ranges (one per line, e.g. 203.0.113.5 or 198.51.100.0/28)").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+        self.ips = tk.Text(form, height=3, width=28, font=theme.FONT_MONO, wrap="none", relief="flat",
+                           background=c("card"), foreground=c("text"), insertbackground=c("text"),
                            selectbackground=c("select"), selectforeground=c("text"), highlightthickness=1,
                            highlightbackground=c("border"), highlightcolor=c("link"), padx=px(8), pady=px(6))
-        self.ips.grid(row=4, column=1, sticky="nsew", pady=px(4))
+        self.ips.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, px(12)), pady=(px(3), 0))
         self.ips.bind("<<Modified>>", self._ips_modified)
-        right.rowconfigure(4, weight=1)
-        card_label(right, "Position on the map", "muted").grid(row=5, column=0, sticky="w", padx=(0, px(12)), pady=px(4))
-        pos = tk.Frame(right, background=c("card"))
-        pos.grid(row=5, column=1, sticky="w", pady=px(4))
+        side = on_card(form)
+        side.grid(row=2, column=2, rowspan=2, sticky="nw")
+        self.hq_box = ttk.Checkbutton(side, text="Headquarters", variable=self.hq, command=self._edited,
+                                      style="Card.TCheckbutton")
+        self.hq_box.pack(anchor="w")
+        caption(side, "Map position (optional)").pack(anchor="w", pady=(px(6), px(3)))
+        pos = on_card(side)
+        pos.pack(anchor="w")
         for key, text in (("lat", "Lat"), ("lon", "Lon")):
             card_label(pos, text, "muted").pack(side="left", padx=(0, px(4)))
             e = ttk.Entry(pos, textvariable=self.vars[key], width=9)
             e.pack(side="left", padx=(0, px(10)))
             self.vars[key].trace_add("write", lambda *_a: self._edited())
             self.entries[key] = e
-        card_label(right, "Empty = where Entra locates the sign-ins from the office.", "muted",
-                   font=theme.FONT_CAPTION, wraplength=px(250)).grid(row=6, column=1, sticky="w")
 
-        # ---- suggestions
+        # ---- suggestions, and at the bottom what the editor has to say, with Save
         low = card(body)
-        low.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(px(10), 0))
-        head = tk.Frame(low, background=c("card"))
-        head.pack(fill="x", pady=(0, px(6)))
-        card_label(head, "Addresses many people sign in from", font=theme.FONT_BOLD).pack(side="left")
+        low.pack(fill="both", expand=True, pady=(px(10), 0))
+        foot = on_card(low, padx=px(16), pady=px(10))
+        foot.pack(side="bottom", fill="x")
+        tk.Frame(low, height=1, background=c("border"), bd=0, highlightthickness=0).pack(side="bottom", fill="x")
+        ttk.Button(foot, text="Discard changes" if theme.is_panel(top) else "Cancel",
+                   command=lambda: theme.close(top)).pack(side="right")
+        self.save_btn = ttk.Button(foot, text="Save", style="Accent.TButton", command=self.save)
+        self.save_btn.pack(side="right", padx=(px(12), px(6)))
+        self.status = stable_label(foot, LONGEST_STATUS, width=px(WIDTH - 330), background=c("card"))
+        self.status.pack(fill="x")
+        sbar = on_card(low, padx=px(12), pady=px(10))
+        sbar.pack(side="bottom", fill="x")
+        self.as_new_btn = ttk.Button(sbar, text="Add as new office", command=lambda: self._use_suggestion(new=True),
+                                     state="disabled")  # (every row has this as its own button; kept for the keyboard)
+        self.to_selected_btn = ttk.Button(sbar, text="Add the selected address to the office above",
+                                          command=lambda: self._use_suggestion(new=False), state="disabled")
+        self.to_selected_btn.pack(side="left")
+        head = on_card(low, padx=px(16))
+        head.pack(fill="x", pady=(px(12), px(4)))
+        card_label(head, "Suggestions: addresses many people sign in from", font=theme.FONT_BOLD).pack(side="left")
         self.suggest_note = card_label(head, "Looking through the sign-in history...", "muted", font=theme.FONT_CAPTION)
         self.suggest_note.pack(side="left", padx=(px(10), 0))
-        sbar = tk.Frame(low, background=c("card"))
-        sbar.pack(side="bottom", fill="x", pady=(px(8), 0))
-        self.as_new_btn = ttk.Button(sbar, text="Add as new office", command=lambda: self._use_suggestion(new=True),
-                                     state="disabled")
-        self.as_new_btn.pack(side="left")
-        self.to_selected_btn = ttk.Button(sbar, text="Add to the selected office",
-                                          command=lambda: self._use_suggestion(new=False), state="disabled")
-        self.to_selected_btn.pack(side="left", padx=(px(6), 0))
-        self.suggest = ttk.Treeview(low, columns=SUGGEST_COLS, show="headings", selectmode="browse", height=4)
+        self.suggest = CardTable(low, SUGGEST_COLS, selectmode="browse", height=2, border=False)
         for col in SUGGEST_COLS:
             self.suggest.heading(col, text=col, anchor="w")
             self.suggest.column(col, width=px(SUGGEST_WIDTHS[col]), stretch=col == "Network", anchor="w")
+        self.suggest.action("Add as office", lambda iid: self._use_suggestion(new=True, iid=iid))
         self.suggest.pack(fill="both", expand=True)
         self.suggest.bind("<<TreeviewSelect>>", lambda _e: self._buttons())
 
@@ -285,9 +290,11 @@ class OfficesWindow:
             else "none that is not an office already."))
         self._buttons()
 
-    def _use_suggestion(self, new: bool) -> None:
-        sel = self.suggest.selection()
-        if not sel:
+    def _use_suggestion(self, new: bool, iid: str | None = None) -> None:
+        """Take a suggested address: as an office of its own, or into the selected office. ``iid``: the row whose
+        button was clicked (otherwise the selected row)."""
+        sel = [iid] if iid is not None else list(self.suggest.selection())
+        if not sel or not self.suggest.exists(sel[0]):
             return
         r = self._suggestions[int(sel[0])]
         if new or self._current is None:
@@ -299,6 +306,7 @@ class OfficesWindow:
             self._load_form(self._current)
             self.tree.item(str(self.offices.index(self._current)), values=self._values(self._current))
         self.suggest.delete(sel[0])
+        self._say("")  # (what was said before - "no office yet" - no longer holds)
         self._buttons()
 
     def save(self) -> None:
@@ -310,4 +318,4 @@ class OfficesWindow:
         if error:
             self._say(f"Could not save: {error}", error=True)
             return
-        self.top.destroy()
+        theme.close(self.top)

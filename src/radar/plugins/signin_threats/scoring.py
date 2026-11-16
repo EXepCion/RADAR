@@ -27,6 +27,10 @@ RISK_EVENT_POINTS = {
     "newcountry": 10, "mcasimpossibletravel": 10, "nationstateip": 35, "suspiciousapitraffic": 20,
 }
 
+# Detections that say "this does not look like the user's usual sign-in" - what a risk rating is usually made of.
+# Where the rating itself is the base of an assessment they are named but not counted a second time.
+GENERIC_RISK_EVENTS = {"unfamiliarfeatures", "unlikelytravel", "impossibletravel", "newcountry", "mcasimpossibletravel"}
+
 LABEL_CORPORATE = "corporate network"
 LABEL_VPN = "likely VPN / proxy"
 LABEL_TRAVEL = "likely travel (known device)"
@@ -127,7 +131,13 @@ class Assessor:
 
     # ------------------------------------------------------------ assess
     def assess(self, s: SignIn, base: int, base_reason: str, extra: list[Factor] | None = None,
-               floor: int = 0) -> Assessment:
+               floor: int = 0, covers: tuple[str, ...] = (), office: tuple[int, str] | None = None,
+               floor_reason: str = "") -> Assessment:
+        """``covers``: what the base reason already says and counts, so it is not counted a second time - "flow"
+        (device code / ROPC), "password_only", "risk_rating" (Entra's rating is the base: the detections it is
+        made of are named, not added) and "device_identity" (a device that is just being registered has none).
+        ``office``: (points, why) in place of the usual -30 for a corporate network, where being in the office says
+        little about this sign-in. ``floor``: never rated lower; ``floor_reason`` says why when that applies."""
         rc, h = self.rc, self.rc.history
         f: list[Factor] = [Factor(base, base_reason)]
         f.extend(extra or [])
@@ -140,19 +150,22 @@ class Assessor:
         trusted = rc.trusted(s) or (s.asn in self.trusted_asns)
         if trusted:
             name = rc.trusted_label(s) if rc.trusted(s) else f"trusted network AS{s.asn}"
-            f.append(Factor(-30, f"Corporate network: {name}"))
+            f.append(Factor(office[0], f"Corporate network: {name} - {office[1]}") if office
+                     else Factor(-30, f"Corporate network: {name}"))
         if net:
             name, category = net
             f.append(Factor(netintel.ASN_CATEGORY_POINTS.get(category, 15), f"{category.capitalize()} network: {name} (AS{s.asn})"))
         events = [e.lower() for e in s.risk_events]
         # an anonymous-IP detection and a VPN/hosting network are the same evidence: count it once
         same_as_network = net is not None and net[1] != "cloud"
+        in_rating = {e for e in events if "risk_rating" in covers and e in GENERIC_RISK_EVENTS}
         risk_points = sum(RISK_EVENT_POINTS.get(e, 10) for e in events
-                          if not (e == "anonymizedipaddress" and same_as_network))
+                          if not (e == "anonymizedipaddress" and same_as_network) and e not in in_rating)
         if events:
             f.append(Factor(min(40, risk_points), "Entra ID Protection detections: " + ", ".join(s.risk_events)
                             + (" (anonymous IP already counted as network)" if same_as_network and
-                               "anonymizedipaddress" in events else "")))
+                               "anonymizedipaddress" in events else "")
+                            + (" (what the rating is made of: not counted again)" if in_rating else "")))
         anonymous = (net is not None and net[1] != "cloud") or "anonymizedipaddress" in events
         if anonymous and s.user_id and not (acct and acct.mfa_excluded):  # no excuses for password-only accounts
             vpn_days = self._cached(("vdays", s.user_id, s.created.date()), lambda: h.user_anon_days(s.user_id, s.created))
@@ -189,7 +202,7 @@ class Assessor:
                 f.append(Factor(-15, f"Company-managed device ({', '.join(p for p in (s.trust_type, 'compliant' if s.compliant else '') if p)})"))
             elif not known:
                 f.append(Factor(5, f"Device not seen before for this user ({s.trust_type or 'unmanaged'})"))
-        else:
+        elif "device_identity" not in covers:
             usual_devices = self._cached(("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))
             if usual_devices:
                 f.append(Factor(10, "No device identity although the user normally signs in with registered devices"))
@@ -221,7 +234,8 @@ class Assessor:
             f.append(Factor(-10, "Device-bound SSO token (Primary Refresh Token)"))
         if s.phishing_resistant:
             f.append(Factor(-15, "Phishing-resistant authentication (" + ", ".join(s.auth_methods) + ")"))
-        elif s.interactive and s.success and s.auth_requirement == "singleFactorAuthentication" and s.password_ok:
+        elif (s.interactive and s.success and s.auth_requirement == "singleFactorAuthentication" and s.password_ok
+              and "password_only" not in covers):
             f.append(Factor(10, "Password only, no MFA"))
         if any(m.lower() == "passwordless phone sign-in" for m in s.auth_methods):
             f.append(Factor(-5, "Passwordless sign-in with the user's registered Authenticator (no password typed)"))
@@ -233,10 +247,14 @@ class Assessor:
         agent = self.suspicious_agent(s) if s.interactive and not legacy else None
         if agent:
             f.append(Factor(25, f"Automation / attack-tool client ({agent})"))
-        if s.auth_protocol.lower() in ("devicecode", "ropc") and not legacy:
+        if s.auth_protocol.lower() in ("devicecode", "ropc") and not legacy and "flow" not in covers:
             f.append(Factor(15, f"{'Device code' if s.auth_protocol.lower() == 'devicecode' else 'ROPC (password-only)'} flow"))
 
-        score = max(floor, min(100, max(0, sum(x.points for x in f))))
+        score = min(100, max(0, sum(x.points for x in f)))
+        if score < floor:  # said, so that the score can be followed from the reasons
+            f.append(Factor(0, f"Rated at least {severity_for(floor).label} ({floor}): "
+                               + (floor_reason or "this kind of finding is always shown")))
+            score = floor
         return Assessment(score=score, factors=f, label=self._label(s, f, net, trusted),
                           context=acct.context(rc.now) if acct else "")
 

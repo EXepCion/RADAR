@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 # Named fonts (created in init): body text, semibold, small caption, window title, big numbers, IDs, tables.
 FONT, FONT_BOLD, FONT_CAPTION, FONT_CAPTION_BOLD = "AadBody", "AadStrong", "AadCaption", "AadCaptionStrong"
 FONT_TITLE, FONT_DISPLAY, FONT_MONO = "AadTitle", "AadDisplay", "AadMono"
+FONT_PAGE, FONT_FIGURE = "AadPage", "AadFigure"  # main window: the title of a page, the number on a tile
 FONT_TABLE, FONT_TABLE_BOLD = "AadTable", "AadTableStrong"
 FONT_PAD = "AadPad"    # empty lines that form the top/bottom padding of cards inside a text
 CELL_PAD = 12          # px left/right inside table cells (headings line up with the cell text)
@@ -34,7 +35,8 @@ HEADING_TEXT_SHIFT = 4  # Tk draws cell text this much further in than heading t
 LIGHT = {
     "window": "#f3f3f3", "card": "#ffffff", "border": "#e5e5e5", "track": "#e6e6e6", "heading_bg": "#f9f9f9",
     "text": "#1a1a1a", "muted": "#5d5d5d", "link": "#005fb8", "select": "#cce4f7",
-    "row_select": "#dcebf8", "new_row": "#eef5fc", "attention": "#fff4ce", "menu_hover": "#f0f0f0",
+    "row_select": "#dcebf8", "new_row": "#eef5fc", "attention": "#fff4ce", "menu_hover": "#f0f0f0", "disabled": "#a3a3a3",
+    "rail": "#eaeaeb", "rail_select": "#dcdcdd", "rail_hover": "#e3e3e4",
     "error": "#a4262c", "pos": "#a4262c", "neg": "#107c10", "warn": "#8a5300",
     "sev_high_bg": "#fde7e9", "sev_high_fg": "#a4262c", "sev_medium_bg": "#fdeadb", "sev_medium_fg": "#8a3b00",
     "sev_low_bg": "#fff4ce", "sev_low_fg": "#7a4600", "sev_info_bg": "#ebebeb", "sev_info_fg": "#5d5d5d",
@@ -42,7 +44,8 @@ LIGHT = {
 DARK = {
     "window": "#202020", "card": "#2b2b2b", "border": "#3d3d3d", "track": "#454545", "heading_bg": "#323232",
     "text": "#f3f3f3", "muted": "#ababab", "link": "#60cdff", "select": "#264f78",
-    "row_select": "#2e4a66", "new_row": "#26333f", "attention": "#4a3b10", "menu_hover": "#383838",
+    "row_select": "#2e4a66", "new_row": "#26333f", "attention": "#4a3b10", "menu_hover": "#383838", "disabled": "#6f6f6f",
+    "rail": "#1a1a1b", "rail_select": "#343435", "rail_hover": "#272728",
     "error": "#ff99a4", "pos": "#ff99a4", "neg": "#6ccb5f", "warn": "#fcb76a",
     "sev_high_bg": "#4a2327", "sev_high_fg": "#ff99a4", "sev_medium_bg": "#4a2f1a", "sev_medium_fg": "#ffb86b",
     "sev_low_bg": "#4a3b10", "sev_low_fg": "#f9e2a6", "sev_info_bg": "#3a3a3a", "sev_info_fg": "#ababab",
@@ -52,6 +55,8 @@ MUTED, HEADER_BG, TEXT_BG, BORDER = LIGHT["muted"], LIGHT["window"], LIGHT["card
 LINK_FG, ERROR_FG = LIGHT["link"], LIGHT["error"]
 
 _scale = 1.0
+_per_monitor = False  # Windows was told that RADAR handles every screen's scaling itself
+_rescale_listeners: list[Callable[[], None]] = []
 _palette = LIGHT
 _dark = False
 _animations = True
@@ -88,6 +93,21 @@ def set_animations(enabled: bool) -> None:
 
 
 def set_dpi_awareness() -> None:
+    """Tell Windows that RADAR draws every screen at that screen's own scaling.
+
+    With less ("system aware") Windows takes what was drawn for the main screen and stretches the picture on a
+    screen with another scaling - sharp on one monitor, blurry on the other. Tk does not follow a window from screen
+    to screen by itself; ``adapt_to_monitor`` sets the scale for the screen a window opens on."""
+    global _per_monitor
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_int
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):  # per monitor, version 2 (Windows 10 1703+)
+            _per_monitor = True
+            return
+    except Exception:
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
@@ -95,6 +115,72 @@ def set_dpi_awareness() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def pointer_scale() -> float | None:
+    """The scaling of the screen the mouse is on (1.0 = 100 %, 1.5 = 150 %); None when Windows does not tell."""
+    try:
+        from ctypes import wintypes
+
+        user32, shcore = ctypes.windll.user32, ctypes.windll.shcore
+        point = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [wintypes.POINT, wintypes.DWORD], ctypes.c_void_p
+        monitor = user32.MonitorFromPoint(point, 2)  # 2: the nearest screen
+        dpi_x, dpi_y = ctypes.c_uint(), ctypes.c_uint()
+        shcore.GetDpiForMonitor.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                                            ctypes.POINTER(ctypes.c_uint)]
+        if shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) != 0 or not dpi_x.value:
+            return None
+        return max(1.0, dpi_x.value / 96.0)
+    except Exception:
+        return None
+
+
+def on_rescale(callback: Callable[[], None]) -> None:
+    """Call this after the scale changed: whoever keeps a window built in advance builds it again."""
+    _rescale_listeners.append(callback)
+
+
+def set_scale(root: tk.Misc, scale: float) -> bool:
+    """Everything built from now on is drawn at this scale (fonts, sizes, icons). True when it changed."""
+    global _scale
+    scale = max(1.0, float(scale))
+    if abs(scale - _scale) < 0.01:
+        return False
+    _scale = scale
+    try:
+        root.tk.call("tk", "scaling", scale * 96.0 / 72.0)
+        _fonts(root)  # type: ignore[arg-type]
+        if _has_sv:
+            _scale_sv_fonts(root)  # type: ignore[arg-type]
+        _style_ttk(root)
+    except tk.TclError:
+        log.debug("rescale incomplete", exc_info=True)
+    for callback in list(_rescale_listeners):
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - one window failing to rebuild must not stop the others
+            log.exception("a window could not be rebuilt for the new scale")
+    return True
+
+
+def adapt_to_monitor(root: tk.Misc) -> bool:
+    """Before a window opens: take over the scaling of the screen the mouse is on - where the window will appear.
+
+    Only while no RADAR window is showing: what is on the screen keeps its size, and windows that belong together
+    look the same. (A window dragged to a screen with another scaling stays sharp and keeps its size in pixels.)"""
+    if not _per_monitor:
+        return False
+    try:
+        for child in root._root().winfo_children():
+            if isinstance(child, tk.Toplevel) and child.winfo_viewable():
+                return False
+    except tk.TclError:
+        return False
+    scale = pointer_scale()
+    return set_scale(root._root(), scale) if scale else False
 
 
 def px(value: float) -> int:
@@ -154,6 +240,7 @@ def _fonts(root: tk.Tk) -> None:
     for name, family, size in ((FONT, body, 14), (FONT_BOLD, strong, 14), (FONT_CAPTION, body, 12),
                                (FONT_CAPTION_BOLD, strong, 12), (FONT_TABLE, body, 13), (FONT_TABLE_BOLD, strong, 13),
                                (FONT_TITLE, display, 20), (FONT_DISPLAY, display, 40), (FONT_MONO, mono, 13),
+                               (FONT_PAGE, display, 24), (FONT_FIGURE, display, 28),
                                (FONT_PAD, body, 9)):
         # created in Tcl directly: a tkinter Font object would delete its font when garbage-collected
         root.tk.call("font", "configure" if name in existing else "create", name, "-family", family,
@@ -210,8 +297,11 @@ def _style_ttk(root: tk.Misc) -> None:
     style.configure("Muted.TLabel", background=c["window"], foreground=c["muted"], font=FONT_CAPTION)
     style.configure("Busy.TButton", foreground=c["muted"])  # a button that is working (see freshness.DataAge)
     style.configure("Title.TLabel", background=c["window"], foreground=c["text"], font=FONT_TITLE)
+    style.configure("PageTitle.TLabel", background=c["window"], foreground=c["text"], font=FONT_PAGE)
     style.configure("Card.TFrame", background=c["card"])
     style.configure("Card.TCheckbutton", background=c["card"])
+    style.configure("Card.Switch.TCheckbutton", background=c["card"])
+    style.configure("Card.TRadiobutton", background=c["card"])  # a switch on a card (main window settings)
     style.configure("Card.TLabel", background=c["card"], foreground=c["text"])
     style.configure("CardMuted.TLabel", background=c["card"], foreground=c["muted"], font=FONT_CAPTION)
     style.configure("CardHeading.TLabel", background=c["card"], foreground=c["text"], font=FONT_BOLD)
@@ -274,6 +364,9 @@ def recolor(widget: tk.Misc, mapping: dict[str, str]) -> int:
             pass
 
     for w in _descendants(widget):
+        hook = getattr(w, "recolor_colors", None)  # a widget that keeps colours of its own (the card table's tags)
+        if callable(hook):
+            hook(mapping)
         for opt in _COLOR_OPTIONS:
             swap(lambda: w.cget(opt), lambda v: w.configure({opt: v}))
         if isinstance(w, tk.Text):
@@ -329,7 +422,12 @@ def title_bar(top: tk.Misc) -> None:
 
 # ------------------------------------------------- theme-aware images
 #: Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10) code points
-ICONS = {"open": "\ue8a7", "copy": "\ue8c8", "clock": "\ue823", "check": "\ue73e", "refresh": "\ue72c"}
+ICONS = {"open": "\ue8a7", "copy": "\ue8c8", "clock": "\ue823", "check": "\ue73e", "refresh": "\ue72c",
+         # the main window's navigation
+         "link": "\ue71b", "target": "\ue7ba", "history": "\ue81c", "document": "\ue8a5", "globe": "\ue774",
+         "settings": "\ue713", "story": "\uf003", "aim": "\uf272", "report": "\uf000"}
+#: glyphs only the Windows 11 icon font has, and what the older one (Windows 10) shows in their place
+ICONS_OLD_FONT = {"story": "link", "aim": "target", "report": "document"}
 ACCENT_FG = {False: "#ffffff", True: "#000000"}  # text on the accent button (sv-ttk: white on blue / black on cyan)
 
 
@@ -358,6 +456,8 @@ def _render_icon(name: str, role: str, size: int):
     font = _icon_font(size * 4)
     img = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
     if font is not None:
+        if name in ICONS_OLD_FONT and "segmdl2" in str(getattr(font, "path", "")).lower():
+            name = ICONS_OLD_FONT[name]
         ImageDraw.Draw(img).text((size * 2, size * 2), ICONS[name], font=font, fill=_rgb(role_color(role)) + (255,),
                                  anchor="mm")
     return img.resize((size, size), Image.LANCZOS)
@@ -421,11 +521,76 @@ def _hand_over_buttons(root: tk.Misc) -> None:
 REVEAL_DELAY_MS = 60  # time for the first paint of all widgets before a new window becomes visible
 
 
-def new_window(root: tk.Misc, **kw: Any) -> tk.Toplevel:
+class Panel(ttk.Frame):
+    """The content of a "window" hosted as a page inside another window (the main window's pages).
+
+    The window classes build themselves into ``top``; given a Panel instead of a Toplevel they work unchanged: what
+    only a real window has (title bar, size, icon, fading in) is accepted and does nothing here. ``close`` - what
+    a Close / Cancel button or a finished save calls - tells the host (``on_close``) instead of destroying."""
+
+    is_panel = True
+
+    def __init__(self, parent: tk.Misc, on_close: Callable[[], None] | None = None):
+        super().__init__(parent)
+        self._title, self._on_close = "", on_close
+
+    def title(self, text: str | None = None) -> str:
+        if text is not None:
+            self._title = text
+        return self._title
+
+    def geometry(self, *_a: Any) -> str:
+        return ""
+
+    def minsize(self, *_a: Any) -> None:
+        return None
+
+    def iconphoto(self, *_a: Any) -> None:
+        return None
+
+    def deiconify(self) -> None:
+        return None
+
+    def attributes(self, *_a: Any) -> str:
+        return ""
+
+    def resizable(self, *_a: Any) -> None:
+        return None
+
+    def protocol(self, *_a: Any) -> None:
+        return None
+
+    def close(self) -> None:
+        if self._on_close is not None:
+            self._on_close()
+
+
+def is_panel(top: tk.Misc) -> bool:
+    return bool(getattr(top, "is_panel", False))
+
+
+def close(top: tk.Misc) -> None:
+    """What Close, Cancel, Escape and a finished save do: a window goes away, a page tells its host."""
+    try:
+        if is_panel(top):
+            top.close()  # type: ignore[attr-defined]
+        else:
+            top.destroy()
+    except tk.TclError:
+        pass
+
+
+def new_window(root: tk.Misc, parent: tk.Misc | None = None, on_close: Callable[[], None] | None = None,
+               **kw: Any) -> tk.Toplevel:
     """A window that is invisible from the very first moment; ``style_window`` reveals it when it is complete.
 
     A plain Toplevel shows up as soon as anything runs the idle tasks while it is being built (empty, wrong title
-    bar colour, panes not split yet) - that is what flickers when a window opens."""
+    bar colour, panes not split yet) - that is what flickers when a window opens.
+
+    With ``parent`` the content becomes a page inside that widget instead (a Panel, see there)."""
+    if parent is not None:
+        return Panel(parent, on_close)  # type: ignore[return-value]
+    adapt_to_monitor(root)
     top = tk.Toplevel(root, background=_palette["window"], **kw)
     _safe_alpha(top, 0.0)
     return top
@@ -436,6 +601,16 @@ def style_window(top: tk.Toplevel, fade_ms: int = 180, prepare: Callable[[], Non
 
     Everything happens while the window is invisible; it appears once, complete and painted. ``prepare`` does
     layout that needs real widget sizes (pane splits)."""
+    if is_panel(top):  # a page: its host shows it; only the layout that needs real sizes is done, once it has them
+        if prepare is not None:
+            def fit() -> None:
+                try:
+                    if top.winfo_exists():
+                        prepare()
+                except tk.TclError:
+                    log.debug("page preparation failed", exc_info=True)
+            top.after_idle(fit)
+        return
     top.configure(background=_palette["window"])
     _safe_alpha(top, 0.0)  # (already so for windows from new_window)
     title_bar(top)
@@ -472,14 +647,26 @@ def _front_rect(top: tk.Misc) -> tuple[int, int, int, int] | None:
         return None
 
 
+def _rect(top: tk.Misc) -> tuple[int, int, int, int]:
+    return (top.winfo_x(), top.winfo_y(), top.winfo_width() + 2 * FRAME[0], top.winfo_height() + FRAME[1] + FRAME[0])
+
+
+def is_raised(top: tk.Misc) -> bool:
+    """Was this window raised above the always-on-top window (and has to stay there while that one shows)?"""
+    return top in _raised
+
+
 def stay_in_front(top: tk.Misc) -> bool:
-    """A window that lies (partly) under the always-on-top window is raised above it. True when it was raised."""
-    rect = _front_rect(top)
-    if rect is None:
-        return False
+    """A window that lies (partly) under the always-on-top window is raised above it - and so is one that lies
+    under a window that was raised that way: the window that opens last is never behind the one it was opened
+    from. True when it was raised."""
     try:
-        mine = (top.winfo_x(), top.winfo_y(), top.winfo_width() + 2 * FRAME[0], top.winfo_height() + FRAME[1] + FRAME[0])
-        if not screens.overlap(mine, rect):
+        over = [r for r in [_front_rect(top)] if r is not None]
+        over += [_rect(w) for w in _raised if w is not top and w.winfo_exists() and w.winfo_viewable()]
+        if not over:
+            return False
+        mine = _rect(top)
+        if not any(screens.overlap(mine, rect) for rect in over):
             return False
         top.attributes("-topmost", True)
         top.lift()

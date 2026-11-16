@@ -123,7 +123,9 @@ class GraphClient:
             pages += 1
             url, params = data.get("@odata.nextLink"), None
             if url and max_pages and pages >= max_pages:
-                log.warning("Stopped paging %s after %d pages (max_pages)", path, pages)
+                # one page was asked for on purpose (a sample): nothing was cut short
+                log.log(logging.DEBUG if max_pages == 1 else logging.WARNING,
+                        "Stopped paging %s after %d pages (max_pages)", path, pages)
                 return
 
     def get_all(self, path: str, params: dict[str, str] | None = None,

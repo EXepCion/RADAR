@@ -124,7 +124,7 @@ def _score(f: Finding) -> int:
     return int(f.score) if f.score is not None else _SEVERITY_SCORE[Severity.parse(f.severity)]
 
 
-EVIDENCE_ID_FIELDS = ("Sign-in ID", "Audit ID", "Request ID", "ID")
+EVIDENCE_ID_FIELDS = ("_key", "Sign-in ID", "Audit ID", "Request ID", "ID")
 
 
 def _evidence_sig(row: dict) -> str:
@@ -181,6 +181,7 @@ class AlertCenter:
                     if status == ACTIVE:
                         popped.append(new_id)
                     touched.append(new_id)
+                    self._supersede(f, new_id)
                     continue
                 old = Alert.from_row(row)
                 old_sev = old.base_severity if old.base_severity is not None else old.severity
@@ -189,7 +190,12 @@ class AlertCenter:
                 escalated = sev > old_sev and sev >= min_severity and not f.signal
                 touched.append(old.id)
                 if f.signal:
-                    pass  # a signal only becomes active through correlation
+                    # a signal only becomes active through correlation; a finding that used to be an alert and is a
+                    # signal from now on (a report ...) leaves the reminders
+                    if not old.signal:
+                        self._store.execute("UPDATE alerts SET signal=? WHERE id=?", (f.signal, old.id))
+                        if old.status in (ACTIVE, SNOOZED):
+                            status, snooze_until = MUTED, None
                 elif (old.status in (DISMISSED, SNOOZED, ACTIVE) and escalated) or (old.status == MUTED and sev >= min_severity):
                     # got worse (or crossed the notification threshold): back on screen with attention - a snooze
                     # ends early, a dismissed reminder returns, an open one is shown again (it may be hidden)
@@ -208,16 +214,106 @@ class AlertCenter:
                     " links=?, occurred_at=?, last_seen=?, status=?, snooze_until=?, score=?, factors=? WHERE id=?",
                     (int(new_sev), f.title if keep_new else old.title, (f.summary if keep_new else old.summary) or old.summary,
                      f.recommendation or old.recommendation,
-                     json.dumps(fields), json.dumps(_merge_evidence(old.evidence, f.evidence)),
+                     json.dumps(fields),
+                     # a summary lists what it is made of NOW (its steps), anything else collects what it saw
+                     json.dumps(f.evidence[:MAX_EVIDENCE] if plugin_id == correlation.SUMMARY_PLUGIN and f.evidence
+                                else _merge_evidence(old.evidence, f.evidence)),
                      json.dumps([list(x) for x in (f.links or old.links)]), _iso(occurred), _iso(now),
                      status, snooze_until, max(score, old.score),
                      json.dumps([list(x) for x in (f.factors if keep_new else old.factors)]), old.id),
                 )
+                self._supersede(f, old.id)
             for alert_id in touched:
                 popped.extend(self._correlate_around(alert_id))
             for alert_id in touched:
                 popped.extend(self._respond_around(alert_id))  # back on screen: a response did not end it
         return [a for a in (self.get(i) for i in dict.fromkeys(popped)) if a]
+
+    def _supersede(self, f: Finding, by_id: int) -> None:
+        """The open alerts a finding takes the place of leave the reminders (they stay in the history)."""
+        for key in f.supersedes:
+            row = self._store.query_one("SELECT * FROM alerts WHERE key=? AND id<>? AND status IN (?,?)",
+                                        (key, by_id, ACTIVE, SNOOZED))
+            if row is None:
+                continue
+            fields = json.loads(row["fields"])
+            fields["Merged into"] = f.title
+            self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=?",
+                                (MUTED, json.dumps(fields), row["id"]))
+
+    def to_signal(self, rule_id: str, signal: str) -> int:
+        """Alerts of a rule whose findings are context signals from now on (e.g. a report that moved to RADAR >
+        Reports) leave the reminders. Returns how many did."""
+        with self._lock:
+            return self._store.execute(
+                "UPDATE alerts SET status=CASE WHEN status IN (?,?) THEN ? ELSE status END, snooze_until=NULL, signal=? "
+                "WHERE rule_id=? AND signal=''", (ACTIVE, SNOOZED, MUTED, signal, rule_id))
+
+    def settle_summaries(self, plugin_id: str, findings: Iterable[Finding], since: datetime,
+                         min_severity: Severity = Severity.LOW) -> int:
+        """Bring the open summary alerts (attack chains) in line with what holds NOW: one whose steps no longer
+        add up leaves the reminders, one that is rated lower is lowered. ``since``: summaries that began before it
+        are left alone - their steps have simply grown old. Returns how many left the reminders."""
+        current = {f.key: f for f in findings}
+        retired = 0
+        with self._lock:
+            rows = self._store.query("SELECT * FROM alerts WHERE plugin_id=? AND status IN (?,?)",
+                                     (plugin_id, ACTIVE, SNOOZED))
+            for row in rows:
+                alert = Alert.from_row(row)
+                f = current.get(alert.key)
+                if f is None:
+                    if alert.when < since:
+                        continue
+                    fields = dict(alert.fields)
+                    fields["Reassessed"] = ("These steps no longer make a chain: a step was dismissed with the chain "
+                                            "in view, was judged anew, or turned out not to connect the accounts.")
+                    self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=?",
+                                        (MUTED, json.dumps(fields), alert.id))
+                    retired += 1
+                elif _score(f) < alert.score:
+                    self.replace_assessment(f, min_severity)
+                    retired += int((self.get(alert.id) or alert).status == MUTED)
+        return retired
+
+    def companions(self, ids: Iterable[int]) -> list[Alert]:
+        """Open alerts that go with the ones about to be dismissed: the steps of a chain among them, and a chain all
+        of whose open steps are among them. (To offer: one decision should not leave half of it open.)"""
+        chosen = [a for a in (self.get(int(i)) for i in ids) if a]
+        picked = {a.id for a in chosen}
+        opened = [Alert.from_row(r) for r in self._store.query("SELECT * FROM alerts WHERE status IN (?,?)", (ACTIVE, SNOOZED))]
+        by_key = {a.key: a for a in opened}
+        out: dict[int, Alert] = {}
+        for a in chosen:
+            if a.plugin_id == correlation.SUMMARY_PLUGIN:
+                for row in a.evidence:
+                    step = by_key.get(row.get("_key") or "")
+                    if step is not None and step.id not in picked:
+                        out[step.id] = step
+        keys = {a.key for a in chosen}
+        for chain in opened:
+            if chain.plugin_id != correlation.SUMMARY_PLUGIN or chain.id in picked:
+                continue
+            steps = [row.get("_key") for row in chain.evidence if row.get("_key")]
+            if steps and keys & set(steps) and all(k in keys or k not in by_key for k in steps):
+                out[chain.id] = chain
+        return list(out.values())
+
+    def close_stale(self, days: int, now: datetime | None = None) -> int:
+        """Low alerts the user has seen and that have not changed for ``days`` days close by themselves: they go to
+        the history as dismissed, with a note. Returns how many."""
+        now = now or utcnow()
+        closed = 0
+        with self._lock:
+            rows = self._store.query(
+                "SELECT id, fields FROM alerts WHERE status=? AND severity<=? AND seen_at IS NOT NULL AND last_seen<? "
+                "AND plugin_id<>?", (ACTIVE, int(Severity.LOW), _iso(now - timedelta(days=days)), SYSTEM_PLUGIN))
+            for row in rows:
+                fields = json.loads(row["fields"])
+                fields["Closed"] = f"by RADAR on {now.astimezone():%d.%m.%Y}: Low, seen, and unchanged for {days} days"
+                closed += self._store.execute("UPDATE alerts SET status=?, dismissed_at=?, fields=? WHERE id=?",
+                                              (DISMISSED, _iso(now), json.dumps(fields), row["id"]))
+        return closed
 
     # ----------------------------------------------------------- responses
     def _respond_around(self, alert_id: int) -> list[int]:
@@ -269,10 +365,13 @@ class AlertCenter:
         began = alert.when - timedelta(minutes=correlation.RESPONSE_SLACK_MINUTES)
         about = self._alerts_about(alert.subjects, alert.id)
         latest: dict[str, Alert] = {}  # one per kind of response: the most recent
+        accounts = {s for s in alert.subjects if "@" in s}
         for other in about:
             rule = correlation.RESPONSE_SIGNALS.get(other.signal)
             if rule is None or not rule.answers(alert.rule_id, alert.title):
                 continue  # this response does nothing about this kind of alert
+            if len(accounts) > 1 and not accounts <= set(other.subjects):
+                continue  # an alert about several accounts is not answered by what was done about one of them
             if not (began <= other.when <= alert.when + timedelta(days=rule.days)):
                 continue
             if rule.undone_by and any(x.signal == rule.undone_by and x.when > other.when for x in about):
@@ -347,29 +446,45 @@ class AlertCenter:
         return [a.id for a in candidates if self._correlate_signal(a.id)]
 
     def _correlate_signal(self, signal_id: int) -> bool:
-        """Escalate a signal when a partner exists. Returns True if it just became active."""
+        """Escalate a signal when a partner exists - worked out afresh every time, so a signal whose partner no
+        longer counts (it was judged anew, or the rules changed) goes back to being context. Returns True if it
+        just became active."""
         sig = self.get(signal_id)
         if sig is None or not sig.signal:
             return False
+        own = [tuple(x) for x in sig.factors if not str(x[1]).startswith(correlation.REASON_PREFIXES)]
+        was_correlated = len(own) != len(sig.factors)
+        own_score = max(0, sig.score - sum(int(p) for p, t in sig.factors if str(t).startswith(correlation.REASON_PREFIXES)))
         hits: list[tuple[correlation.Correlation, Alert]] = []
         for rule in correlation.CORRELATIONS:
-            if rule.signal != sig.signal or sig.score < rule.min_signal_score:
+            if rule.signal != sig.signal or own_score < rule.min_signal_score:
                 continue
             for other in self._alerts_about(sig.subjects, sig.id):
                 if rule.partner == correlation.ANY_ALERT:
                     ok = (not other.signal and other.severity >= Severity.MEDIUM and other.plugin_id != SYSTEM_PLUGIN
                           and other.rule_id not in correlation.NOT_A_PARTNER_RULES and other.status != MUTED
-                          and other.rule_id not in rule.exclude_partner_rules)
+                          and other.rule_id not in rule.exclude_partner_rules
+                          # a chain the signal is itself a step of says nothing new about it
+                          and not any(row.get("_key") == sig.key for row in other.evidence))
                 else:
                     ok = other.signal == rule.partner
                 delta = (other.when - sig.when).total_seconds() / 86400
                 if ok and -rule.days_before <= delta <= rule.days_after:
                     hits.append((rule, other))
         if not hits:
+            if not was_correlated:
+                return False
+            fields = dict(sig.fields)
+            fields.pop("Correlated with", None)
+            self._store.execute(
+                "UPDATE alerts SET score=?, severity=?, factors=?, fields=?, status=?, snooze_until=CASE WHEN ? THEN NULL "
+                "ELSE snooze_until END WHERE id=?",
+                (own_score, int(_severity_for(own_score)), json.dumps([list(x) for x in own]), json.dumps(fields),
+                 MUTED if sig.status in (ACTIVE, SNOOZED) else sig.status, int(sig.status == SNOOZED), sig.id))
             return False
-        factors = [tuple(x) for x in sig.factors]
+        factors = list(own)
         reasons = [r for _, r in factors]
-        partners = list(sig.fields.get("Correlated with", "").split("\n")) if sig.fields.get("Correlated with") else []
+        partners: list[str] = []
         for rule, other in hits:
             days = max(0, round((other.when - sig.when).total_seconds() / 86400))
             reason = rule.reason.format(partner=other.title, days=days)
@@ -384,10 +499,12 @@ class AlertCenter:
                 if note not in fields.get("Related signals", ""):
                     fields["Related signals"] = "\n".join(x for x in (fields.get("Related signals"), note) if x)
                     self._store.execute("UPDATE alerts SET fields=? WHERE id=?", (json.dumps(fields), other.id))
-        score = min(100, sum(p for p, _ in factors))
+        score = min(100, own_score + sum(p for p, _ in factors[len(own):]))
         fields = dict(sig.fields)
         fields["Correlated with"] = "\n".join(partners)
         activate = sig.status == MUTED and score >= 25
+        if score == sig.score and factors == [tuple(x) for x in sig.factors] and fields == sig.fields and not activate:
+            return False
         self._store.execute(
             "UPDATE alerts SET score=?, severity=?, factors=?, fields=?, status=?, seen_at=CASE WHEN ? THEN NULL "
             "ELSE seen_at END WHERE id=?",
@@ -421,14 +538,27 @@ class AlertCenter:
                     if lo and lo <= (r.get("_created") or "") <= hi and r.get("Type") != "Non-interactive"
                     and _evidence_sig(r) not in new_sigs}
             evidence = _merge_evidence(before.evidence, f.evidence, drop)
+            if before.plugin_id == correlation.SUMMARY_PLUGIN:
+                evidence = f.evidence[:MAX_EVIDENCE]  # a summary lists what it is made of now
         self._store.execute(
             "UPDATE alerts SET severity=?, score=?, factors=?, title=?, summary=?, recommendation=?, fields=?, status=?, "
             "evidence=?, snooze_until=CASE WHEN ?='muted' THEN NULL ELSE snooze_until END WHERE id=?",
             (int(sev), _score(f), json.dumps([list(x) for x in f.factors]), f.title, f.summary or before.summary,
              f.recommendation or before.recommendation, json.dumps(fields), status, json.dumps(evidence), status,
              before.id))
+        self._supersede(f, before.id)
         self._apply_responses(before.id)
         return before, self.get(before.id)
+
+    def any_open(self, keys: Iterable[str]) -> bool:
+        """Is one of these alerts still a reminder?"""
+        keys = list(keys)
+        if not keys:
+            return False
+        row = self._store.query_one(
+            f"SELECT COUNT(*) AS n FROM alerts WHERE key IN ({','.join('?' * len(keys))}) AND status IN (?,?)",
+            (*keys, ACTIVE, SNOOZED))
+        return bool(row and row["n"])
 
     # -------------------------------------------------------- system notes
     def raise_system(self, key: str, title: str, summary: str, recommendation: str = "",
@@ -477,6 +607,11 @@ class AlertCenter:
             f"SELECT * FROM alerts WHERE rule_id IN ({','.join('?' * len(rule_ids))}) AND (subjects LIKE ? OR key LIKE ?) "
             f"ORDER BY last_seen DESC LIMIT 1",
             (*rule_ids, f'%"{(subject or "-").lower()}"%', f"%|{user_id}|%" if user_id else "-"))
+        return Alert.from_row(row) if row else None
+
+    def latest_of_rule(self, rule_id: str) -> Alert | None:
+        """The most recent stored finding of a rule, whatever its state (e.g. the last weekly report)."""
+        row = self._store.query_one("SELECT * FROM alerts WHERE rule_id=? ORDER BY last_seen DESC LIMIT 1", (rule_id,))
         return Alert.from_row(row) if row else None
 
     def find_by_title(self, title: str) -> Alert | None:

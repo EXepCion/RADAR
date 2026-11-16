@@ -87,6 +87,9 @@ class AuthManager:
         self._app_key: tuple | None = None
         self._token: tuple[str, float] | None = None  # (access token, expires_at epoch)
         self.account: str | None = None
+        self.display_name: str | None = None  # the person's name as the directory has it, where the token tells it
+        self.app_name: str | None = None  # the name of the application RADAR signs in through, where the token tells it
+        self.app_id: str | None = None
         self.tenant_id: str | None = None
         self.state = "unknown"  # unknown | ok | required | setup | other_tenant
         self.last_error: str | None = None
@@ -104,6 +107,7 @@ class AuthManager:
         """The sign-in identity changed: forget the client and its token; the next call signs in afresh."""
         with self._lock:
             self._app = self._app_key = self._token = None
+            self.app_name = self.app_id = None
             self.state = "unknown"
             self.last_error = None
 
@@ -133,6 +137,12 @@ class AuthManager:
         claims = _jwt_claims(token)
         account = ((result.get("id_token_claims") or {}).get("preferred_username")
                    or claims.get("upn") or claims.get("unique_name") or self.account)
+        name = str((result.get("id_token_claims") or {}).get("name") or claims.get("name") or "").strip()
+        if not name:
+            name = " ".join(str(claims.get(k) or "").strip() for k in ("given_name", "family_name")).strip()
+        self.display_name = name or (self.display_name if account == self.account else None)
+        self.app_name = str(claims.get("app_displayname") or "").strip() or None
+        self.app_id = str(claims.get("appid") or claims.get("azp") or "").strip() or None
         tenant = claims.get("tid") or ""
         if tenant and self._tenant_guard is not None and not self._tenant_guard(tenant):
             # the token is not kept: nothing of the other tenant is read into this installation's data
@@ -221,7 +231,7 @@ class AuthManager:
             self._cache.persist()
             self._cfg.set("auth", "account", value="")
             self._token = None
-            self.account = None
+            self.account = self.display_name = None
             self.state = "unknown"
 
     @property

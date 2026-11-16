@@ -119,8 +119,8 @@ LEGACY_CLIENT_APPS = {
 # Keywords in the registered AS holder name (e.g. from RIPEstat) -> category, for networks not listed above.
 NAME_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("vpn", ("vpn", "proxy", "onion", "tor exit", "torservers", "anonym", "mullvad", "nordvpn", "surfshark",
-             "expressvpn", "protonvpn", "privacy")),
-    ("hosting", ("hosting", "hoster", "server", "vps", "datacenter", "data center", "data-center", "colocation",
+             "expressvpn", "protonvpn", "proton ag", "windscribe", "cyberghost", "private internet access", "privacy")),
+    ("hosting", ("hosting", "hosted", "hoster", "server", "vps", "datacenter", "data center", "data-center", "colocation",
                  "dedicated", "cloud", "virtual machine", "compute")),
 ]
 

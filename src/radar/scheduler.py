@@ -38,6 +38,16 @@ class Scheduler(threading.Thread):
                 self._waiting.setdefault(plugin_id, []).append(done)
         self._wake.set()
 
+    def next_scan(self) -> "datetime | None":
+        """When the next plugin is due (None: nothing is scheduled yet, or everything is switched off)."""
+        from datetime import datetime, timedelta, timezone
+
+        pm = self.app.plugins
+        due = [self._due[rt.plugin.id] for rt in pm.ordered() if pm.is_enabled(rt.plugin.id) and rt.plugin.id in self._due]
+        if not due:
+            return None
+        return datetime.now(timezone.utc) + timedelta(seconds=max(0.0, min(due) - time.monotonic()))
+
     def reschedule(self, plugin_id: str) -> None:
         """Make a plugin due now (e.g. right after it was enabled)."""
         with self._lock:

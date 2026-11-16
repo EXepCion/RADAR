@@ -37,6 +37,10 @@ CORE_DEFAULTS: dict[str, Any] = {
         "dark_mode": False,      # tray > Settings > Appearance > Dark mode
         "animations": True,      # tray > Settings > Appearance > Animations (fades, risk bar, reminder glide-in)
         "alert_retention_days": 90,
+        "auto_close_low_days": 7,   # Low alerts that were seen and did not change for this long close themselves (0: never)
+        "rules_settled_for": "",    # the version whose rules the open reminders were last judged with (after an update)
+        "report_seen": "",          # the figures of the MFA exposure report when RADAR > Reports was last opened
+        "open_main_at_start": False,  # open the main window when RADAR starts (off: only the tray icon)
         "check_for_updates": True,   # once a day: is there a newer release on GitHub? (tells, never downloads)
         "update_notified": "",       # the version the notification was last shown for
         "allowed_user_plugins": [],  # files in the plugins folder that may be loaded (tray menu > Plugins asks)

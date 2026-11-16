@@ -32,14 +32,34 @@ def chain_for(ac):
 
 def test_guessing_then_password_known_then_new_mfa_method_is_a_chain_even_if_dismissed():
     ac = store(step("dpa", "distributed_attack", 50, 3), step("pwok", "password_not_completed", 40, 2),
-               step("mfa", "mfa_change", 30, 1), dismiss=("dpa", "pwok"))
+               dismiss=("dpa", "pwok"))                       # each dismissed by itself ...
+    ac.ingest("signin_threats", [step("mfa", "mfa_change", 30, 1)])   # ... before the next step was known
     out = chain_for(ac)
     assert len(out) == 1
     f = out[0]
     assert f.fields["Chain"] == "Targeted -> Password known -> Persistence"
     assert f.score == 50 + 2 * chains.STEP_POINTS + 10 and f.severity == Severity.HIGH
     assert [r["Reminder"] for r in f.evidence] == ["dismissed", "dismissed", "active"]
+    assert [r["_key"] for r in f.evidence] == ["dpa", "pwok", "mfa"]   # (the alert behind each step)
     assert f.subjects == [USER]
+
+
+def test_steps_dismissed_with_the_whole_chain_in_view_weigh_less_and_all_of_them_end_it():
+    three = (step("dpa", "distributed_attack", 50, 3), step("pwok", "password_not_completed", 40, 2),
+             step("mfa", "mfa_change", 30, 1))
+    f = chain_for(store(*three, dismiss=("dpa", "pwok")))[0]   # dismissed when all three were on screen
+    assert f.score == 30 + 2 * chains.WEAK_STEP_POINTS + 10 and f.severity == Severity.MEDIUM
+    assert f.factors[0] == (30, "Strongest step still open: Persistence - mfa_change " + USER)
+    assert "(dismissed with the chain in view)" in f.factors[1][1]
+    assert chain_for(store(*three, dismiss=("dpa", "pwok", "mfa"))) == []   # all settled: nothing left to show
+
+
+def test_guessing_at_a_disabled_account_starts_no_chain():
+    off = [(0, chains.DISABLED_MARK)]
+    ac = store(step("dpa", "distributed_attack", 50, 3, factors=off), step("dc", "device_code", 45, 2))
+    assert chain_for(ac) == []
+    ac = store(step("dpa", "distributed_attack", 50, 3), step("dc", "device_code", 45, 2))
+    assert len(chain_for(ac)) == 1                              # (the same against an account that can sign in)
 
 
 def test_travel_then_new_passkey_is_quiet():

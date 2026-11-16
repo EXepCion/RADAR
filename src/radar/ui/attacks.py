@@ -9,8 +9,10 @@ from PIL import ImageTk
 
 from .. import linkify
 from . import icons, theme
+from .cardtable import CardTable
 from .freshness import DataAge
-from .richtext import LinkHandler, StackedNotebook, StatusLine, attach_table_menu, scrolled_text, stable_label
+from .parts import Tiles, UnderlineTabs
+from .richtext import LinkHandler, StatusLine, attach_table_menu, scrolled_text, stable_label
 from .tables import make_sortable
 from .theme import px
 
@@ -35,6 +37,7 @@ WIDTHS = {"Account": 270, "Countries": 190, "Got past password": 150, "Also targ
           "Network type": 110}
 WIDTH_SCALE, WIDTH_PAD = 1.08, 16  # the widths above were set for the 9 pt font; tables now use 13 px + cell padding
 STATUS_ROLE = {"Active": "error", "Quiet": "warn", "Ended": "muted"}  # palette roles (follow dark mode)
+TIME_COLS = {"Last attempt", "First attempt", "Last event", "First event", "Last use from there", "First seen"}
 TAB_NAMES = ["Password guessing", "Password known", "Stolen sessions", "Attacking IPs"]
 KEY_COLS = ("Account", "Session ID", "IP address")  # what identifies a row across a refresh
 FIGURE_SPACE, FIGURE_DASH = "\u2007", "\u2012"  # exactly as wide as a digit
@@ -49,18 +52,18 @@ def tab_label(name: str, count: int | None = None) -> str:
     return f"{name} ({shown})" + FIGURE_SPACE * max(0, 3 - len(shown))
 
 
-def summary_text(label: str, guess: int, known: int, sessions: int, active: int, sources: int,
-                 rotating: int) -> str:
-    parts = [f"{guess} account(s) under password guessing", f"{known} with the password apparently known",
-             f"{sessions} stolen/replayed session(s)"]
-    return (f"In the {label}: " + ", ".join(parts) + f" - {active} still active (within the last 6 hours). "
+def summary_text(label: str, sources: int, rotating: int) -> str:
+    """Where the attacks of that period came from (how many accounts they hit is on the tiles)."""
+    return (f"The {label}, from the sign-in history. "
             f"{sources} attacking IP(s): {sources - rotating} tried several accounts or several times"
             + (f", {rotating} tried an account only once or twice (rotating proxies - blocking single IPs does "
                "not stop that)" if rotating else "") + ".")
 
 
 #: the longest summary there can be: the status line always has room for it
-SUMMARY_TEMPLATE = summary_text("last 72 hours", 8888, 8888, 8888, 8888, 88888, 8888)
+SUMMARY_TEMPLATE = summary_text("last 72 hours", 88888, 8888)
+#: the figures above the tables ("still active": something happened within the last 6 hours)
+TILES = ["Under password guessing", "Password apparently known", "Stolen or replayed sessions", "Still active"]
 
 
 def _t(dt) -> str:
@@ -89,52 +92,54 @@ def session_values(s: Any, reminder: str) -> list[str]:
 
 
 class AttacksWindow:
-    def __init__(self, root: tk.Tk, app: "App"):
+    def __init__(self, root: tk.Tk, app: "App", parent: tk.Misc | None = None, on_close=None):
         self.app = app
         self.result = None
-        top = self.top = theme.new_window(root)
+        top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
         top.title("Ongoing attacks")
         top.geometry(f"{px(WIDTH)}x{min(px(720), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(720), px(380))
-        top.bind("<Escape>", lambda _e: top.destroy())
+        top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
         top.iconphoto(False, self._icon)
 
-        header = ttk.Frame(top, padding=(px(20), px(16), px(20), px(6)))
+        header = ttk.Frame(top, padding=(px(20), px(16), px(20), px(4)))
         header.pack(fill="x")
-        ttk.Label(header, text="Ongoing attacks", style="Title.TLabel").pack(fill="x")
         inner = px(WIDTH - 2 * MARGIN)
-        self.status = stable_label(header, SUMMARY_TEMPLATE, width=inner)  # fixed height: the tables do not move
-        self.status.pack(fill="x", pady=(px(4), 0))
-
-        bar = ttk.Frame(top, padding=(px(20), px(8), px(20), 0))
-        bar.pack(fill="x")
-        ttk.Label(bar, text="Period").pack(side="left")
+        # on the right: how old the data is + Refresh (reads sign-ins and accounts again), and the period looked at
+        tools = ttk.Frame(header)
+        tools.pack(side="right", anchor="n", pady=(px(6), 0))
         self.period = tk.StringVar(value=WINDOWS[1][0])
-        box = ttk.Combobox(bar, textvariable=self.period, values=[w for w, _ in WINDOWS], state="readonly", width=16)
-        box.pack(side="left", padx=(px(8), px(10)))
+        box = ttk.Combobox(tools, textvariable=self.period, values=[w for w, _ in WINDOWS], state="readonly", width=16)
+        box.pack(side="right", padx=(px(10), 0))
         box.bind("<<ComboboxSelected>>", lambda _e: self.load())
-        # how old the data is + Refresh (reads sign-ins and accounts again); disabled while a refresh is running
-        self.age = DataAge(bar, self.refresh)
-        self.age.pack(side="left")
+        self.age = DataAge(tools, self.refresh, button_side="right")
+        self.age.pack(side="right")
         self.refresh_btn = self.age.button
+        ttk.Label(header, text="Ongoing attacks", style="PageTitle.TLabel").pack(fill="x")
+        under = ttk.Frame(top, padding=(px(20), 0, px(20), 0))
+        under.pack(fill="x")
+        self.status = stable_label(under, SUMMARY_TEMPLATE, width=inner)  # fixed height: nothing below moves
+        self.status.pack(fill="x")
 
-        footer = ttk.Frame(top, padding=(px(20), px(4), px(20), px(12)))
+        self.tiles = Tiles(top, TILES)  # the figures; the tables below say who and from where
+        self.tiles.pack(fill="x", padx=px(20), pady=(px(8), 0))
+
+        footer = ttk.Frame(top, padding=(px(20), px(8), px(20), px(12)))
         footer.pack(side="bottom", fill="x")
-        hint = stable_label(footer, HINT, width=inner)
-        hint.pack(fill="x", pady=(0, px(6)))
+        if not theme.is_panel(top):
+            ttk.Button(footer, text="Close", command=top.destroy).pack(side="right", padx=(px(8), 0))
+        self.open_btn = ttk.Button(footer, text="Open assessment", command=self.open_selected, state="disabled")
+        self.open_btn.pack(side="right", padx=(px(12), 0))
+        hint = stable_label(footer, HINT, width=inner - px(180))
+        hint.pack(fill="x")
         self.hint = StatusLine(hint, HINT)
         self.links = LinkHandler(app, top, self.hint)
-        buttons = ttk.Frame(footer)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Close", command=top.destroy).pack(side="right")
-        self.open_btn = ttk.Button(buttons, text="Open assessment", command=self.open_selected, state="disabled")
-        self.open_btn.pack(side="left")
 
         body = self.body = ttk.PanedWindow(top, orient="vertical")
         body.pack(fill="both", expand=True, padx=px(20), pady=(px(10), 0))
-        self.tabs = StackedNotebook(body)  # tables are swapped, not re-mapped: no flash
-        body.add(self.tabs, weight=3)
+        self.tabs = UnderlineTabs(body)  # tables are swapped, not re-mapped: no flash
+        body.add(self.tabs.outer, weight=3)
         detail = ttk.Frame(body, padding=(0, px(8), 0, 0))
         body.add(detail, weight=1)
         self.row_text = scrolled_text(detail, self.links, height=8)
@@ -203,21 +208,17 @@ class AttacksWindow:
         self.open_btn.configure(state="normal" if self.selected_account() else "disabled")
 
     def _table(self, cols: list[str]) -> tuple[ttk.Treeview, Any]:
-        frame = ttk.Frame(self.tabs.stack, padding=px(6))
-        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        frame = ttk.Frame(self.tabs.stack)
+        tree = CardTable(frame, cols, selectmode="browse", xscroll=True, border=False)  # (the tabs' card is the frame)
         for c in cols:
             tree.heading(c, text=c, anchor="w")
             tree.column(c, width=px(WIDTHS.get(c, 70 if len(c) < 9 else 90) * WIDTH_SCALE + WIDTH_PAD), stretch=False,
                         anchor="w")
-        for status, role in STATUS_ROLE.items():
-            tree.tag_configure(status, foreground=theme.color(role))
+            if c in TIME_COLS:
+                tree.show_as(c)
+        tree.cell_role("Status", lambda value, _tags: STATUS_ROLE.get(value))  # active ones stand out, not whole rows
         sort = make_sortable(tree, cols)
-        ys = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        xs = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
         tree.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
-        xs.grid(row=1, column=0, sticky="ew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree, sort
@@ -280,9 +281,10 @@ class AttacksWindow:
         label = next((w for w, h in WINDOWS if h == result.hours), f"{result.hours:g} h").lower()
         guess, known, sess = result.accounts, result.password_known, result.sessions
         active = result.active_all
-        text = summary_text(label, len(guess), len(known), len(sess), active, len(result.sources),
-                            result.single_attempt_ips)
-        self.status.configure(text=text, foreground=theme.color("error" if active else "muted"))
+        self.status.configure(text=summary_text(label, len(result.sources), result.single_attempt_ips),
+                              foreground=theme.color("muted"))
+        for i, n in enumerate((len(guess), len(known), len(sess), active)):
+            self.tiles.set(i, n, "error" if n and i else "text")  # (guessing alone is everyday noise: not red)
         for i, n in enumerate((len(guess), len(known), len(sess), len(result.sources))):
             self.tabs.tab(i, text=tab_label(TAB_NAMES[i], n))
         # a refresh keeps what the user was looking at: sort order and selected row

@@ -12,7 +12,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from . import APP_DISPLAY_NAME, __version__, audio, paths, startup
+from . import APP_DISPLAY_NAME, __version__, audio, correlation, paths, startup
 from .alerts import Alert, AlertCenter
 from . import tenant
 from .auth import AuthManager, AuthRequiredError, TenantChangedError
@@ -45,6 +45,14 @@ class App:
             self.alerts.relink_responses()
         except Exception:
             log.warning("Responses could not be linked to the stored alerts", exc_info=True)
+        try:  # what an earlier version stored differently: the report was a reminder, signals kept partners that
+            #   no longer count
+            moved = self.alerts.to_signal(self.EXPOSURE_RULE, correlation.REPORT_SIGNAL)
+            self.alerts.correlate_all()
+            if moved:
+                log.info("%d report(s) moved from the reminders to RADAR > Reports", moved)
+        except Exception:
+            log.warning("Stored alerts could not be brought in line with the current rules", exc_info=True)
         self.plugins = PluginManager(self.cfg, self.store, lambda: GraphClient(self.auth, self.stop_event),
                                      paths.user_plugin_dir(), self.stop_event)
         self.plugins.discover()
@@ -78,12 +86,15 @@ class App:
         self.tray = Tray(self)
         self.tray.start()
         if not self.demo:
+            self._background(self.settle_after_update, name="settle")  # (reads the local history only)
             self.scheduler.start()
         self.root.after(150, self._pump)
         if self.alerts.count_active():  # at logon: only demand attention if something is unseen
             self.root.after(3000, lambda: self.reminders.show(attention=self.alerts.count_unseen() > 0))
         if not self.demo and not self.setup_done:  # a new installation (or one whose set-up never worked)
             self.root.after(1200, lambda: self.show_setup(run_now=self.auth.configured))
+        elif not self.demo and bool(self.cfg.get("general", "open_main_at_start", default=False)):
+            self.root.after(1200, self.show_main)
         if on_ready:
             self.root.after(500, lambda: on_ready(self))
         log.info("%s started (demo=%s)", APP_DISPLAY_NAME, self.demo)
@@ -154,6 +165,96 @@ class App:
         if time.monotonic() >= self._next_purge:
             self._next_purge = time.monotonic() + 6 * 3600
             self.purge_old_alerts()
+            self.close_stale_alerts()
+
+    def close_stale_alerts(self) -> int:
+        """Low alerts that were seen and have not changed for ``general.auto_close_low_days`` close by themselves
+        (into the history, with a note). 0 switches it off."""
+        try:
+            days = int(self.cfg.get("general", "auto_close_low_days", default=7) or 0)
+            closed = self.alerts.close_stale(days) if days > 0 else 0
+        except Exception:
+            log.exception("Old Low alerts could not be closed")
+            return 0
+        if closed:
+            log.info("%d Low alert(s) closed by RADAR: seen and unchanged for %d days", closed, days)
+            self.on_alerts_changed()
+        return closed
+
+    SETTLE_HOURS = 72
+
+    def settle_after_update(self) -> int:
+        """Once after an update: the open reminders are judged again with the rules as they are now, from the
+        sign-ins kept on this PC (nothing is read from Microsoft Graph). A rating may go down, several reminders
+        about one thing become one, and chains that no longer hold leave. Returns how many reminders changed."""
+        if str(self.cfg.get("general", "rules_settled_for", default="") or "") == __version__:
+            return 0
+        changed = 0
+        try:
+            for rt in self.plugins.ordered():
+                if not self.plugins.is_enabled(rt.plugin.id):
+                    continue
+                for f in rt.plugin.reevaluate(self.plugins.build_context(rt.plugin.id), self.SETTLE_HOURS):
+                    if self.alerts.replace_assessment(f, self.min_severity()):
+                        changed += 1
+                    elif self.alerts.any_open(f.supersedes):  # one reminder in the place of several open ones
+                        self.alerts.ingest(rt.plugin.id, [f], self.min_severity())
+                        changed += 1
+            self._update_chains()
+            self.cfg.set("general", "rules_settled_for", value=__version__)
+        except Exception:
+            log.exception("The open reminders could not be judged again after the update")
+            return changed
+        log.info("Open reminders judged with the rules of %s: %d changed", __version__, changed)
+        if changed:
+            self.on_alerts_changed()
+        return changed
+
+    # ------------------------------------------------------- dismissing
+    def dismiss_alerts(self, ids: Any, parent: Any = None) -> list[int]:
+        """Dismiss reminders. What goes with them (the open steps of a chain, or the chain whose last open steps
+        these are) is offered along: one decision should not leave half of it open. Returns what was dismissed."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return []
+        try:
+            extra = self.alerts.companions(ids)
+        except Exception:
+            log.exception("What goes with a dismissal could not be worked out")
+            extra = []
+        if extra and self.ask_companions(extra, parent):
+            ids += [a.id for a in extra]
+        self.alerts.dismiss(ids)
+        return ids
+
+    def ask_companions(self, extra: list[Alert], parent: Any = None) -> bool:
+        from .ui import confirm
+
+        one = len(extra) == 1
+        lines = [a.title for a in extra[:6]] + ([f"... and {len(extra) - 6} more"] if len(extra) > 6 else [])
+        return confirm.ask(self.root, parent,
+                           f"{'One more reminder belongs' if one else f'{len(extra)} more reminders belong'} to what you dismiss",
+                           lines, f"Dismiss {'it' if one else 'them'} as well? Otherwise {'it stays' if one else 'they stay'} "
+                                  f"open as {'a reminder' if one else 'reminders'}.",
+                           yes=f"Dismiss {'it' if one else 'them'} as well", no="Only what I chose")
+
+    # ---------------------------------------------------------- reports
+    @staticmethod
+    def _report_figures(alert: Alert | None) -> str:
+        return " | ".join(f"{k} {v}" for k, v in (alert.fields if alert else {}).items() if str(v).strip().isdigit())
+
+    def report_news(self) -> int:
+        """1 when the weekly MFA exposure report has other figures than when RADAR > Reports was last opened."""
+        try:
+            figures = self._report_figures(self.alerts.latest_of_rule(self.EXPOSURE_RULE))
+        except Exception:
+            return 0
+        return int(bool(figures) and figures != str(self.cfg.get("general", "report_seen", default="") or ""))
+
+    def mark_reports_seen(self) -> None:
+        figures = self._report_figures(self.alerts.latest_of_rule(self.EXPOSURE_RULE))
+        if figures and figures != str(self.cfg.get("general", "report_seen", default="") or ""):
+            self.cfg.set("general", "report_seen", value=figures)
 
     def purge_old_alerts(self) -> int:
         """Delete dismissed and muted alerts last seen longer ago than ``general.alert_retention_days``."""
@@ -197,7 +298,7 @@ class App:
             if self._auth_failures >= 2:
                 self._report_problem("auth-required", "Sign-in required for RADAR",
                                      f"The app could not get a token silently: {exc}",
-                                     "Click 'Sign in' below (or use the tray menu Settings > Account > Sign in...).",
+                                     "Click 'Sign in' below (or open RADAR > Settings > Account and connection).",
                                      [("Sign in", SIGN_IN_LINK), ("Open the connection check", IDENTITY_LINK)])
             return False
         except OperationCancelled:
@@ -256,9 +357,14 @@ class App:
         try:
             recent = self.alerts.since(datetime.now(timezone.utc) - timedelta(days=chains.LOOKBACK_DAYS + 1))
             now = datetime.now(timezone.utc)
-            return self.alerts.ingest(chains.CHAIN_PLUGIN,
-                                      chains.chain_findings(recent, now) + chains.spread_findings(recent, now),
-                                      self.min_severity())
+            found = chains.chain_findings(recent, now) + chains.spread_findings(recent, now)
+            popped = self.alerts.ingest(chains.CHAIN_PLUGIN, found, self.min_severity())
+            # chains whose steps no longer add up (dismissed with the chain in view, judged anew) leave the reminders
+            gone = self.alerts.settle_summaries(chains.CHAIN_PLUGIN, found, now - timedelta(days=chains.LOOKBACK_DAYS),
+                                                self.min_severity())
+            if gone:
+                log.info("%d attack chain(s) no longer hold and left the reminders", gone)
+            return popped
         except Exception:
             log.exception("Attack-chain correlation failed")
             return []
@@ -279,6 +385,12 @@ class App:
         history, and the details of each alert that is open - no window keeps showing what was true when it was
         opened."""
         self._refresh_history_if_open()
+        main = getattr(self, "_main", None)
+        if main is not None and main.exists():
+            try:
+                main.refresh()
+            except Exception:
+                log.exception("The main window could not be updated")
         refresh = getattr(self.reminders, "refresh_details", None)
         if refresh:
             try:
@@ -291,6 +403,33 @@ class App:
             win = getattr(self, name, None)
             if win is not None and win.exists():
                 win.refresh()
+        for key, win in list(getattr(self, "_incident_windows", {}).items()):
+            if win.exists():
+                win.refresh()
+            else:
+                del self._incident_windows[key]
+
+    def open_incident(self, incident_id: str) -> bool:
+        """One incident in a window of its own (Tk thread): opened, or brought to the front."""
+        from . import incidents
+        from .ui.incident import IncidentWindow
+
+        windows = self.__dict__.setdefault("_incident_windows", {})
+        win = windows.get(incident_id)
+        if win is not None and win.exists():
+            win.focus()
+            return True
+        now = datetime.now(timezone.utc)
+        found = incidents.group(self.alerts.since(now - timedelta(days=incidents.LOOKBACK_DAYS + 1)), now)
+        incident = next((i for i in found if i.id == incident_id), None)
+        if incident is None:
+            return False
+        label = str(self.cfg.get("general", "default_snooze", default="15 minutes"))
+        from .ui.reminder import SNOOZE_CHOICES
+
+        windows[incident_id] = IncidentWindow(self.root, self, incident, snooze_minutes=dict(SNOOZE_CHOICES).get(label, 15),
+                                              snooze_label=label)
+        return True
 
     def _refresh_tray(self) -> None:
         if self.tray:
@@ -302,33 +441,99 @@ class App:
 
     # ========================================================= alert history
     def show_history(self) -> None:
-        """Tray: every alert still kept - also dismissed and logged-only ones - with a way to reactivate one."""
-        from .ui.history import HistoryWindow
+        """Every alert still kept - also dismissed and logged-only ones - with a way to reactivate one."""
+        self.show_main("history")
 
-        def show() -> None:
-            win = getattr(self, "_history", None)
-            if win is not None and win.exists():
-                win.refresh()
-                win.focus()
-                return
-            self._history = HistoryWindow(self.root, self)
-        self.ui_call(show)
+    # ============================================================ main window
+    def _open_main(self, page: str = "incidents", sub: str | None = None):
+        """The main window on this page (Tk thread): opened, or brought to the front."""
+        from .ui.main import MainWindow
+
+        win = getattr(self, "_main", None)
+        if win is not None and win.exists():
+            win.focus()
+            win.show(page, sub)
+            return win
+        win = self._main = MainWindow(self.root, self, page, sub)
+        return win
+
+    def show_main(self, page: str = "incidents", sub: str | None = None) -> None:
+        """Tray > Open RADAR: incidents, attacks, history, reports and the settings in one window."""
+        self.ui_call(self._open_main, page, sub)
 
     def show_incidents(self, select: str | None = None) -> None:
-        """Tray: alerts that belong to one story (same account or same attacker address), as one incident each.
+        """Alerts that belong to one story (same account or same attacker address), as one incident each.
         ``select``: the incident to show (from the link in an alert's details)."""
-        from .ui.incidents import IncidentsWindow
-
         def show() -> None:
+            self._open_main("incidents")
             win = getattr(self, "_incidents", None)
-            if win is not None and win.exists():
-                win.refresh()
-                win.focus()
-            else:
-                win = self._incidents = IncidentsWindow(self.root, self)
-            if select:
+            if select and win is not None and win.exists():
                 win.select(select)
         self.ui_call(show)
+
+    def offices_editor(self, parent: Any, on_close: Callable[[], None]):
+        """The offices editor as a page (Settings > Offices): what is stored now, suggestions in the background."""
+        from .plugins.signin_threats import offices as model
+        from .ui.offices import OfficesWindow
+
+        def settings() -> dict:
+            return self.cfg.get("plugins", self.ATTACK_PLUGIN, "settings", default={}) or {}
+
+        def save(items: list) -> str | None:
+            try:
+                self.cfg.set("plugins", self.ATTACK_PLUGIN, "settings", value=model.save_into(settings(), items))
+            except Exception as exc:
+                log.exception("Offices could not be saved")
+                return str(exc)
+            log.info("Offices saved: %s", ", ".join(o.name for o in items) or "none")
+            return None
+
+        current = model.load(settings())
+        win = self._offices_win = OfficesWindow(self.root, self, current, save, first_time=not current,
+                                                parent=parent, on_close=on_close)
+
+        def work() -> None:
+            rt = self.plugins.get(self.ATTACK_PLUGIN)
+            try:
+                rows = rt.plugin.office_suggestions(self.plugins.build_context(self.ATTACK_PLUGIN)) if rt else []
+            except Exception:
+                log.exception("Office suggestions failed")
+                rows = []
+            self.ui_call(lambda: win.exists() and win.show_suggestions(rows))
+
+        self._background(work, name="office-suggestions")
+        return win
+
+    def hosts_editor(self, parent: Any, on_close: Callable[[], None]):
+        """The virtual-desktops editor as a page (Settings > Virtual desktops)."""
+        from .plugins.signin_threats import hosts as model
+        from .ui.hosts import HostsWindow
+
+        def settings() -> dict:
+            return self.cfg.get("plugins", self.ATTACK_PLUGIN, "settings", default={}) or {}
+
+        def save(entries: list) -> str | None:
+            try:
+                self.cfg.set("plugins", self.ATTACK_PLUGIN, "settings", value=model.save_into(settings(), entries))
+            except Exception as exc:
+                log.exception("Virtual desktops could not be saved")
+                return str(exc)
+            log.info("Virtual desktops saved: %s", ", ".join(e["match"] for e in entries) or "none")
+            return None
+
+        win = self._hosts_win = HostsWindow(self.root, self, model.load(settings()), save, parent=parent, on_close=on_close)
+
+        def work() -> None:
+            rt = self.plugins.get(self.ATTACK_PLUGIN)
+            try:
+                rows = rt.plugin.host_suggestions(self.plugins.build_context(self.ATTACK_PLUGIN)) if rt else []
+            except Exception:
+                log.exception("Virtual desktop suggestions failed")
+                rows = []
+            self.ui_call(lambda: win.exists() and win.show_suggestions(rows))
+
+        self._background(work, name="host-suggestions")
+        return win
 
     def incident_of(self, alert: Alert):
         """The incident a stored alert belongs to (radar.incidents), or None."""
@@ -554,19 +759,16 @@ class App:
                     "sessions": ("session_theft", "aitm_replay")}
     REMINDER_STATE = {"active": "open", "snoozed": "snoozed", "dismissed": "dismissed", "muted": "logged only"}
 
-    def show_attacks(self) -> None:
-        """Tray: live overview of running password attacks (independent of reminders)."""
-        from .ui.attacks import AttacksWindow
+    def count_attacked_accounts(self, hours: float = 72) -> int | None:
+        """How many accounts are under a password attack right now (worker thread: it reads the sign-in history)."""
+        rt = self.plugins.get(self.ATTACK_PLUGIN)
+        if rt is None or not hasattr(rt.plugin, "ongoing") or self.threat_data_as_of() is None:
+            return None
+        return len(rt.plugin.ongoing(self.plugins.build_context(self.ATTACK_PLUGIN), hours).accounts)
 
-        def show() -> None:
-            win = getattr(self, "_attacks_win", None)
-            if win and win.exists():
-                win.focus()
-                win.refresh()
-                return
-            win = self._attacks_win = AttacksWindow(self.root, self)
-            win.load(then_refresh=True)  # at once what the app has, meanwhile fresh data in the background
-        self.ui_call(show)
+    def show_attacks(self) -> None:
+        """Live overview of running password attacks (independent of reminders)."""
+        self.show_main("attacks")
 
     def refresh_threat_data(self) -> str:
         """Read sign-ins AND accounts again now (one scan, so all data has the same age) and wait for it.
@@ -625,77 +827,12 @@ class App:
 
     # ========================================================= offices
     def show_offices(self) -> None:
-        """Tray > Settings > Offices...: names, places and IP addresses of the offices (first set-up and later)."""
-        from .plugins.signin_threats import offices as model
-        from .ui.offices import OfficesWindow
-
-        def settings() -> dict:
-            return self.cfg.get("plugins", self.ATTACK_PLUGIN, "settings", default={}) or {}
-
-        def save(items: list) -> str | None:
-            try:
-                self.cfg.set("plugins", self.ATTACK_PLUGIN, "settings", value=model.save_into(settings(), items))
-            except Exception as exc:
-                log.exception("Offices could not be saved")
-                return str(exc)
-            log.info("Offices saved: %s", ", ".join(o.name for o in items) or "none")
-            return None
-
-        def show() -> None:
-            win = getattr(self, "_offices_win", None)
-            if win and win.exists():
-                win.focus()
-                return
-            current = model.load(settings())
-            win = self._offices_win = OfficesWindow(self.root, self, current, save, first_time=not current)
-
-            def work() -> None:
-                rt = self.plugins.get(self.ATTACK_PLUGIN)
-                try:
-                    rows = rt.plugin.office_suggestions(self.plugins.build_context(self.ATTACK_PLUGIN)) if rt else []
-                except Exception:
-                    log.exception("Office suggestions failed")
-                    rows = []
-                self.ui_call(win.show_suggestions, rows)
-
-            self._background(work, name="office-suggestions")
-        self.ui_call(show)
+        """Settings > Offices: names, places and IP addresses of the offices (first set-up and later)."""
+        self.show_main("settings", "offices")
 
     def show_hosts(self) -> None:
-        """Tray > Settings > Virtual desktops...: Citrix / AVD / shared hosts whose place is not the person's."""
-        from .plugins.signin_threats import hosts as model
-        from .ui.hosts import HostsWindow
-
-        def settings() -> dict:
-            return self.cfg.get("plugins", self.ATTACK_PLUGIN, "settings", default={}) or {}
-
-        def save(entries: list) -> str | None:
-            try:
-                self.cfg.set("plugins", self.ATTACK_PLUGIN, "settings", value=model.save_into(settings(), entries))
-            except Exception as exc:
-                log.exception("Virtual desktops could not be saved")
-                return str(exc)
-            log.info("Virtual desktops saved: %s", ", ".join(e["match"] for e in entries) or "none")
-            return None
-
-        def show() -> None:
-            win = getattr(self, "_hosts_win", None)
-            if win and win.exists():
-                win.focus()
-                return
-            win = self._hosts_win = HostsWindow(self.root, self, model.load(settings()), save)
-
-            def work() -> None:
-                rt = self.plugins.get(self.ATTACK_PLUGIN)
-                try:
-                    rows = rt.plugin.host_suggestions(self.plugins.build_context(self.ATTACK_PLUGIN)) if rt else []
-                except Exception:
-                    log.exception("Virtual desktop suggestions failed")
-                    rows = []
-                self.ui_call(win.show_suggestions, rows)
-
-            self._background(work, name="host-suggestions")
-        self.ui_call(show)
+        """Settings > Virtual desktops: Citrix / AVD / shared hosts whose place is not the person's."""
+        self.show_main("settings", "hosts")
 
     # ======================================================== live map
     MAP_HEARTBEAT = "map.open"   # touched by the map process while its window is open
@@ -1078,18 +1215,15 @@ class App:
         log.info("Set-up: sign-in identity set to %s", self.identity_label)
 
     def show_setup(self, run_now: bool = False) -> None:
-        """Tray > Settings > Account > Set-up and connection check... - and by itself while set-up is not finished."""
-        from .ui.setup import SetupWindow
-
+        """Settings > Account and connection - and by itself while set-up is not finished."""
         def show() -> None:
+            self._open_main("settings", "account")
             win = getattr(self, "_setup", None)
-            if win is not None and win.exists():
-                win.focus()
-                if run_now and not win.busy:
-                    win.start(save=False)
+            if win is None or not win.exists():
                 return
-            log.info("Set-up window opened (set-up %s)", "finished" if self.setup_done else "not finished")
-            self._setup = SetupWindow(self.root, self, run_now=run_now)
+            log.info("Set-up page opened (set-up %s)", "finished" if self.setup_done else "not finished")
+            if run_now and not win.busy:
+                win.top.after(400, lambda: win.exists() and not win.busy and win.start(save=False))
         self.ui_call(show)
 
     def _setup_needed(self, why: str) -> None:
@@ -1146,6 +1280,9 @@ class App:
         self._auth_failures = 0
         log.info("Set-up %s: RADAR is working (signed in as %s, identity: %s)",
                  "finished" if first_time else "checked", self.auth.account, self.identity_label)
+        main = getattr(self, "_main", None)
+        if main is not None:
+            self.ui_call(lambda: main.exists() and main.setup_finished())
         if first_time and self.tray:
             self.tray.notify("RADAR is set up and working. It keeps running here in the notification area and shows "
                              "a reminder when it finds something.")

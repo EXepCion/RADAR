@@ -123,25 +123,20 @@ def test_history_window_lists_filters_and_reactivates(root):
 
 
 def test_tray_menu_layout():
-    """The menu a user sees: views on top, the two everyday switches, everything else under Settings - and no entry twice."""
+    """The menu a user sees: the reminders, the two windows, the two everyday switches - everything that is set once
+    lives in the main window's Settings, so the menu has no submenus and no entry twice."""
     pytest.importorskip("pystray")
     from radar.tray import Tray
 
-    rule = SimpleNamespace(id="r1", name="Rule one")
-    rt = SimpleNamespace(plugin=SimpleNamespace(id="p1", name="Sign-in threats", rules=[rule]))
     app = SimpleNamespace(
         alerts=SimpleNamespace(count_active=lambda: 3, count_unseen=lambda: 1), status_line=lambda: "Last scan 12:00",
-        plugins=SimpleNamespace(ordered=lambda: [rt], load_errors=[], is_enabled=lambda pid: True, rule_enabled=lambda pid, rid: True),
-        auth=SimpleNamespace(account="me@contoso.com", state="ok", using_explicit_account=False),
-        plugin_status_text=lambda rt: "ok", paused=False, exposure_reminder=True, dark_mode=False, animations=True,
-        sound_enabled=True, respect_mute=True, identity_label="own app registration", setup_done=True,
-        updates=SimpleNamespace(available=None), check_updates=True)
-    for name in ("show_reminders_from_tray", "show_history", "show_incidents", "show_attacks", "show_map", "show_exposure_report", "scan_now", "toggle_pause",
-                 "quit", "show_offices", "show_hosts", "toggle_exposure_reminder", "toggle_dark_mode", "toggle_animations", "toggle_startup",
-                 "sign_in", "use_windows_account", "open_config", "open_log", "open_data_dir", "open_plugins_dir", "reload_plugins",
-                 "toggle_sound", "toggle_respect_mute", "test_sound", "toggle_plugin", "toggle_rule", "show_setup", "toggle_check_updates", "look_for_update", "open_update_page"):
+        paused=False, updates=SimpleNamespace(available=None))
+    opened = []
+    for name in ("show_reminders_from_tray", "show_map", "scan_now", "toggle_pause", "quit", "open_update_page"):
         setattr(app, name, lambda *a: None)
+    app.show_main = lambda *a: opened.append(a)
     tray = Tray(app)
+    tray.refresh = lambda: None
 
     import pystray
 
@@ -149,29 +144,18 @@ def test_tray_menu_layout():
         return [i.text for i in items if i is not pystray.Menu.SEPARATOR]
 
     top = list(tray._items())
-    assert texts(top)[2:] == ["Show reminders (3, 1 new)", "Incidents...", "Alert history...", "Ongoing attacks...", "Live map...",
-                              "MFA exposure report...", "Scan now", "Pause monitoring", "Settings", "Exit"]
-    assert [i.text for i in top if i.default] == ["Show reminders (3, 1 new)"]
-    settings = list(next(i for i in top if i.text == "Settings").submenu.items)
-    assert texts(settings) == ["Detection", "Offices...", "Virtual desktops...", "Weekly MFA exposure reminder", "Reminder sound",
-                               "Appearance", "Start with Windows", "Check for new versions", "Account: me@contoso.com", "Advanced"]
-    sub = {i.text: texts(i.submenu.items) for i in settings if i.submenu}
-    assert sub["Detection"] == ["Sign-in threats"]
-    assert sub["Advanced"] == ["Edit settings file (config.json)", "Open log file", "Open data folder", "Open plugins folder", "Reload plugins", "Look for a new version now"]
-    assert sub["Appearance"] == ["Dark mode", "Animations"] and sub["Account: me@contoso.com"][0] == "Sign in..."
-    assert sub["Account: me@contoso.com"][-1] == "Set-up and connection check... (own app registration)"
-
-    def everything(items):
-        for i in items:
-            if i is pystray.Menu.SEPARATOR:
-                continue
-            yield i.text
-            if i.submenu:
-                yield from everything(i.submenu.items)
+    assert texts(top)[2:] == ["Open RADAR", "Show reminders (3, 1 new)", "Live map...", "Scan now", "Pause monitoring",
+                              "Settings...", "Exit"]
+    assert [i.text for i in top if i.default] == ["Open RADAR"]                  # a click on the icon: the window
+    assert not any(i.submenu for i in top if i is not pystray.Menu.SEPARATOR)
+    by_text = {i.text: i for i in top if i is not pystray.Menu.SEPARATOR}
+    by_text["Open RADAR"](None)
+    by_text["Settings..."](None)
+    assert opened == [(), ("settings",)]                                          # the main window, and its settings
 
     # a newer release puts one more line above Settings
     app.updates.available = SimpleNamespace(version="9.9.0")
     assert "New version 9.9.0 available..." in texts(list(tray._items()))
     app.updates.available = None
-    seen = list(everything(top))
+    seen = texts(top)
     assert len(seen) == len(set(seen)), "an entry appears twice in the menu"

@@ -1,7 +1,7 @@
 # What RADAR detects
 
 The detection logic lives in two built-in plugins. Thresholds named here are defaults; most can be changed in the
-settings file (tray menu: Settings > Advanced > Edit settings file).
+settings file (RADAR window: Settings > Advanced > Settings file > Edit).
 
 ### Sign-in threat detection (`signin_threats`, enabled, every 10 min)
 Pulls interactive **and** non-interactive user sign-ins (beta `auditLogs/signIns`), de-duplicates
@@ -9,8 +9,8 @@ them into a local history and runs these rules:
 
 | Rule | Default logic | Ranking |
 |---|---|---|
-| Risky sign-ins | **successful** sign-ins Entra ID Protection rates ≥ medium / confirmed compromised, per user and day (blocked risky attempts count as attack evidence instead; `include_failed`) | scored, never below Low |
-| Password attack from rotating IPs | per account in 72 h: ≥ 8 failed passwords from ≥ 6 IPs on networks the user never used (residential-proxy botnets: ~1 attempt per IP). Escalates to High if an attempt gets past the password or a device-less sign-in succeeds from an unfamiliar network; lists other accounts hit by the same campaign | 40–50, escalates |
+| Risky sign-ins | **successful** sign-ins Entra ID Protection rates ≥ medium / confirmed compromised, per user and day (blocked risky attempts count as attack evidence instead; `include_failed`). When the same sign-in is also the first from a new country, that is said and counted here (+10) and no second alert is raised | scored, never below Low |
+| Password attack from rotating IPs | per account in 72 h: ≥ 8 failed passwords from ≥ 6 IPs on networks the user never used (residential-proxy botnets: ~1 attempt per IP). Escalates to High if an attempt gets past the password or a device-less sign-in succeeds from an unfamiliar network; one campaign that guesses at several accounts and got nowhere is **one alert** naming them all; a disabled account among them is a line in it (alone it is only logged); an account where something happened keeps an alert of its own | 40–50, escalates |
 | Password spray | one IP, failed password for ≥ 5 accounts in 60 min (skipped if the IP is mostly successful traffic) | 80 (90 if an account then succeeded) |
 | Brute force | ≥ 10 failed passwords for one account in 60 min; escalates if a success from the same IP follows | 55 → 85 |
 | MFA fatigue | ≥ 3 MFA denials (500121) in 60 min | 75 |
@@ -23,13 +23,14 @@ them into a local history and runs these rules:
 | MFA changes + new device | MFA method registered/deleted, MFA reset or TAP by an admin, password reset (directory audit, `Authentication Methods` + SSPR). Judged by **where** the user made the change (his sign-in at that moment - the audit IP is a Microsoft gateway for IPv6) and **what signed in afterwards** from a device/network not used before (baseline ends 12 h before the change). Admin resets/TAPs weigh more (social-engineered help desk). Guests skipped; new accounts (< 7 days) -20 | 10–30 by change, scored |
 | Impossible travel | consecutive successful interactive sign-ins ≥ 500 km apart at > 900 km/h | scored |
 | New country | success from a country not in the user's baseline (or not in `allowed_countries`) | scored |
+| Background activity from a new country | background sign-ins (none by hand) from a country the account was not seen in. On a device the person has long used AND a network they use anyway it is only logged (their phone or laptop, wherever the address is counted to); networks that hide where someone is (VPN, hosting) count as for any sign-in | scored, otherwise never below Low |
 | New IP shared by several accounts | a never-seen IP used by ≥ 2 accounts within 24 h (AiTM phishing proxy) | scored |
 | Attack tools / scripted sign-ins | interactive sign-ins from HTTP libraries/attack tools (`Go-http-client`, `python-requests`, `axios`, …) | scored |
 | Legacy authentication | successful IMAP/POP/SMTP AUTH/EAS/… sign-in | scored, never below Low |
 | Pinned accounts | an account in `pinned_accounts.accounts` signs in successfully from any other IP | 85 |
-| Device code / ROPC sign-ins | completed device-code or ROPC (password-only) authentication | scored, never below Low |
+| Device code / ROPC sign-ins | completed device-code or ROPC (password-only) authentication. Base 55 for device code and 65 for ROPC (the flow is counted once). For ROPC of an admin account that needs no MFA the office network takes off only 10 instead of 30 (the password sits in a script), so it stays High there too | scored, never below Low |
 | Admin tools & device registration | first use of Azure CLI / PowerShell / Graph tools, or a device registration | scored |
-| App sign-ins (service principals) | apps signing in with their own secret/certificate (~12,000/day), judged against a per-app baseline (countries, /24 network ranges, credential key ids; 3 days learning; raw rows not stored): new country -> Medium, first use of a credential -> Low, new range in a known country -> logged, >= 50 credential failures a week -> Low "credential failing" (Medium if from networks outside the app's baseline = someone trying its secrets) | 10-70 |
+| App sign-ins (service principals) | apps signing in with their own secret/certificate (~12,000/day), judged against a per-app baseline (countries, /24 network ranges, credential key ids; 3 days learning; raw rows not stored): new country -> Medium, first use of a credential -> Low, new range in a known country -> logged, >= 50 credential failures a week -> Low "credential failing" (Medium if from networks outside the app's baseline = someone trying its secrets). A credential that keeps failing the same way is one alert for as long as it does: dismissed once it stays dismissed, and returns when it fails differently or starts again after a week without | 10-70 |
 
 Every scored rule also uses: **MFA registration** (account sync reads the registration report; an enabled member
 without any MFA method gets +20 - whoever has the password can register their own MFA), **which Authenticator
@@ -52,12 +53,21 @@ permission), and every **enforced Conditional Access MFA policy for all users wi
 **MFA-excluded accounts (strict)** learn each account's 30-day pattern (IPs, networks, apps, protocols,
 countries). A successful sign-in outside it (new IP, protocol, browser use, country, or a dormant account
 waking up) is High; a correct password stopped by Conditional Access from an unfamiliar network is High; 3 failed
-passwords from unfamiliar networks within 24 h already raise an alert. The **weekly MFA-exposure report** lists
+passwords from unfamiliar networks within 24 h already raise an alert. The **weekly MFA-exposure report** (kept
+for *RADAR > Reports*, never a reminder; a mark on Reports tells when its figures changed) lists
 every excluded account with last sign-in, password age, what it really uses and clean-up flags (unused,
 old password, looks like a person, disabled, admin role). Directory audit watch raises **High when someone is
 added to an MFA exclusion group** (also via access-package approvals).
 
 ### Risk score (0–100)
+The reasons listed with an alert add up to its score. Where a rule never rates lower than a minimum (risky
+sign-ins, device code / ROPC, legacy authentication, background activity abroad on an unknown device) and the
+reasons add up to less, a line says so and why. Nothing is counted twice: where the base of an assessment already
+says something (the flow of a device code / ROPC sign-in, Entra's risk rating and the generic detection it is made
+of, a device that is just being registered and so has no identity), it is named and not added again; and for a
+risky sign-in that is also the first from a new country, the country counts only when the address is not one of
+a cloud, VPN or hosting network.
+
 Every context-dependent finding starts from a base for its pattern and gets points added or removed
 for evidence in the sign-in and the local history. The **Risk assessment** box of an alert lists each
 factor. Score → severity: < 25 Info (logged, no pop-up), < 45 Low, < 70 Medium, ≥ 70 High. The reminder list
@@ -152,6 +162,13 @@ two different detections; a step must be at least Low on its own (score >= 25); 
 all failed counts as targeting. Score = strongest step + 10 per further step (+10 if the password was known and
 something followed); two-step chains stay Medium unless a step is High on its own.
 
+*What was dismissed:* a step dismissed before the later steps were known counts in full - dismissing each step by
+itself is how a chain gets overlooked. A step dismissed with the whole chain on screen is settled: it adds +5
+instead of +10, the chain is rated by its strongest step that is not settled, and a chain whose real steps are all
+settled leaves the reminders (as does one whose steps no longer add up after a rule change). Guessing at a
+disabled account starts no chain. A chain lists each step once, with the state it has now. Dismissing a chain
+offers to dismiss its open steps as well, and dismissing its last open steps offers the chain.
+
 *In hindsight:* a finding that was only logged (score 10-24) can be a step of a chain that two real steps already
 make (+5 instead of +10); it never starts a chain and never makes one. *Slow attacks:* the look-back is 30 days,
 and two steps that are each at least Medium (45) may lie up to 10 days apart instead of 3.
@@ -169,17 +186,29 @@ sign-ins from a device the account already used. It never counts against the sig
 whose evidence contains such an address get the field *Known attacker address*.
 
 **Attacks across accounts** (`chains.spread_findings`). Accounts are taken together when their alerts name the
-same known attacker address, or when an account that was already under suspicion (password known or worse) acted
-on another one afterwards (*Initiated by* / *Invited by*: reset its MFA, gave it a role, invited it ...). An
-administrator nobody suspects joins nothing. Over the alerts of such a group the same chain is looked for; when it
+same known attacker address, or when an account that was already under real suspicion (its password is known, or
+an alert of at least Medium that was not dismissed) acted on another one afterwards (*Initiated by* / *Invited
+by*: reset its MFA, gave it a role, invited it ...). An administrator nobody suspects joins nothing, and what is
+done ABOUT an account - disabling it, enabling it again, revoking its sessions - is the answer to an attack and
+ties nobody together. Over the alerts of such a group the same chain is looked for; when it
 runs across at least two accounts it is raised as "Attack across N accounts: ..." (chain score +15).
 
-**Incidents** (`radar/incidents.py`, tray > Incidents...). Alerts that were reminders (at least Low, not only
+**Incidents** (`radar/incidents.py`, RADAR window > Incidents). Alerts that were reminders (at least Low, not only
 logged) about the same account or the same known attacker address, no more than 7 days apart, are one incident;
 chains of such pairs join. Chain alerts name the incident; responses (sessions revoked, password reset, account
 disabled) and logged-only findings are shown with it as context but neither make an incident nor join two. The
 window lists the incidents of the last 30 days with their alerts in order; the open reminders of one incident can
 be dismissed together.
+
+"About an account" means the account it happened to. An alert that only names an account as the one who did
+something (*Initiated by* / *Invited by*: a consent, a policy change, a key that was read) joins an incident about
+that account when it comes after an alert about the account itself; two things an administrator did are their
+work, not an incident. An application ties alerts together through its own sign-ins (a new credential or consent,
+then a sign-in from somewhere new) - a credential and a consent alone are an application being set up. Not part
+of an incident: an alert that was merged into another, a chain that no longer holds, and what merely does not
+work (a failing app credential). How far an incident got is told by what is still open; a stage whose alerts
+were all dismissed is shown as settled. A single alert is never an incident, however severe: it is in the
+reminders and the alert history.
 
 **Microsoft 365 support cases.** Opening a case in the admin center adds the Microsoft Support tenant
 (`b4c546a4-…`) as cross-tenant service provider (actor: the admin, recorded silently); while an engineer works on it,
@@ -195,7 +224,7 @@ consent is an admin decision, mostly routine. Grouped per app and week:
 |---|---|
 | App-only permission that controls the tenant (`AppRoleAssignment.ReadWrite.All`, `RoleManagement.ReadWrite.Directory`, `Application.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `Group(Member).ReadWrite.All`, `full_access_as_app` …) | alert, 75 |
 | App-only access to content (mail, files, sites, chats, calendars, hunting …) or any `*.ReadWrite*` | alert, 55 |
-| App-only read of directory data; any delegated consent (acts within each user's own rights) | **signal** 5–35: alerts only with another ≥ Medium alert about the consenting admin or the app within ±7 days (+25). App credential/consent alerts do not count as partner (app onboarding) |
+| App-only read of directory data; any delegated consent (acts within each user's own rights) | **signal** 5–35: alerts only with another ≥ Medium alert about the consenting admin or the app from up to 7 days before the consent to 1 day after it (+25) - the suspicion comes first. Consents that only let an app sign people in (below 10) are left out. App credential/consent alerts do not count as partner (app onboarding), nor does a chain the consent is itself a step of. When the partner no longer counts, the consent goes back to being context |
 | The same permission granted to the same app again (just-in-time pattern, remembered in plugin state) | signal ("re-grant") |
 | A non-admin consented while user consent is disabled / user consent switched on in the authorization policy | alert, ≥ 70 |
 

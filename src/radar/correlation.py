@@ -13,6 +13,8 @@ SUBJECT_FIELDS = ("User", "Account", "Invited by", "Initiated by", "Member", "Gu
 _EMAIL = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ANY_ALERT = "*"
 NOT_A_PARTNER_RULES = {"mfa_exposure_report", "health"}
+SUMMARY_PLUGIN = "correlation"  # alerts that sum up other alerts (attack chains, see radar.chains)
+REPORT_SIGNAL = "report"        # a regular report: kept for RADAR > Reports, never a reminder
 
 
 @dataclass(frozen=True)
@@ -34,11 +36,16 @@ CORRELATIONS = [
                 "Inviter's account was disabled {days} day(s) after inviting a private mailbox (leaver taking data?)",
                 min_signal_score=50),
     # an admin consent is routine IT work - unless the admin (phished / compromised) or the app is involved in
-    # something else suspicious. App onboarding itself (new secret + consent) is not a partner.
-    Correlation("app_consent", ANY_ALERT, 7, 7, 25,
+    # something else suspicious. App onboarding itself (new secret + consent) is not a partner. The suspicion has
+    # to come first (an attacker signs in, then consents - a day of slack for the logs); what somebody consented to
+    # a week before anything else happened is not explained by it. Consents that only let an app sign people in
+    # (score below 10) give nothing away and are left out.
+    Correlation("app_consent", ANY_ALERT, 7, 1, 25,
                 "The admin or app behind this consent has other suspicious activity: {partner}",
-                exclude_partner_rules=frozenset({"consent_grant", "app_credentials"})),
+                min_signal_score=10, exclude_partner_rules=frozenset({"consent_grant", "app_credentials"})),
 ]
+# how the reasons written by the correlations begin (to tell them from a signal's own factors)
+REASON_PREFIXES = tuple(sorted({c.reason.split("{")[0] for c in CORRELATIONS}))
 
 
 @dataclass(frozen=True)

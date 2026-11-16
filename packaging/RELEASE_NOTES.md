@@ -1,5 +1,74 @@
 RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID.
 
+**New in 1.0.7** (one window)
+
+- Incidents, ongoing attacks, alert history, reports and all settings are now in one RADAR window with a
+  navigation on the left. The reminders, the details of an alert and the live map stay windows of their own.
+- Settings have pages: detection, offices, virtual desktops, reminders and sound, appearance and start, account
+  and connection, plugins, advanced. What was a submenu of the tray menu is a switch or a button there.
+- The tray menu is short: open RADAR, show reminders, live map, scan now, pause, settings, exit. A click on the
+  tray icon opens the RADAR window.
+- The navigation shows how many incidents are open and how many accounts are under attack; its lower left
+  corner says what RADAR is doing, when it last scanned and when it scans next.
+- Tables are easier to read: a line under every row, the severity as a coloured pill, only the state in
+  colour, and times as "Today 13:48". Suggested offices and virtual desktops have an Add button in their row.
+- Sharp on every monitor: with screens of different scaling (say 150 % and 100 %) RADAR's windows were blurry
+  on one of them. A window is now drawn for the screen it opens on.
+- On the first start the window opens on the set-up page; the other sections are switched off until RADAR can
+  read what it needs.
+
+Fewer reminders about the same thing, and fewer about nothing:
+
+- One password campaign against several accounts is one alert that names them all. A disabled account among
+  them is a line in it; an account where something happened (the password worked, a break-in, the person is
+  locked out) keeps an alert of its own.
+- A risky sign-in that is also the first from a new country is one alert, not two.
+- Attack chains: what an administrator does about an account (disabling it, revoking its sessions) no longer
+  ties the two accounts into one "attack across accounts"; an account counts as suspected only when its password
+  is known or an alert of at least Medium is open. Steps you dismissed with the whole chain in view weigh less,
+  and a chain whose steps are all settled or no longer add up leaves the reminders. A chain lists each step once.
+- App consents are raised by other suspicious activity only when that came first, and not at all when the
+  consent merely lets an app sign people in.
+- Background activity from a new country on the person's own, long-used device and a network they use anyway is
+  only logged. More networks that hide where someone is are recognised by name.
+- A password-only (ROPC) sign-in of an admin account without MFA stays High inside the office too.
+- An app credential that keeps failing is one alert for as long as it fails the same way: dismissed once, it
+  stays dismissed, and it says that it is an operational problem.
+- The weekly MFA exposure report is no longer a reminder: it is in *Reports*, with a mark in the navigation when
+  its figures have changed.
+- Dismissing a chain offers to dismiss its open steps as well (and the other way round).
+- Low alerts you have seen and that did not change for 7 days close by themselves into the alert history
+  (*Settings > Reminders and sound*; can be switched off).
+- After the update the open reminders are judged once with the new rules, from the data kept on the PC.
+
+The *Incidents* page is laid out for someone on watch:
+
+- On the left the incidents, most urgent first: severity with the highest risk score, who it is about, how far it
+  got and how much of it is still open, when it last moved.
+- On the right the chosen incident: a track of the five stages of an attack with the time each was reached, the
+  accounts and attacker addresses, since when, and what was already done; then its strongest finding with the
+  reasons that weigh most, and what to do; then its alerts in order.
+- An incident has a window of its own (double-click it, or *Open details* with no alert selected): the same
+  summary as on the page, the whole advice, and for each of its alerts the reasons for its rating. Its open
+  reminders are dismissed or snoozed together from there; an alert's evidence and links are one double-click on.
+- The page says how many open alerts are not part of an incident: those are in the reminders.
+- The reminders show an incident as one row ("Incident: who - how many alerts - how far it got") instead of its
+  chain alert and every step: it is opened, snoozed and dismissed as one. The window's title counts things to
+  handle, not alerts.
+- A details window no longer opens behind the RADAR window or an incident's window while the reminders show.
+- What makes an incident is stricter: what an administrator did counts only after an alert about their own
+  account, an application only through its own sign-ins, and a failing integration not at all. How far an
+  incident got is told by what is still open.
+
+Risk assessments say what they count:
+
+- A rating that is held at a minimum says so and why (a device code sign-in is at least Low because, with a
+  phished code, the sign-in is always completed on the victim's own device and network).
+- Device code and ROPC sign-ins name the flow once instead of counting it in two or three lines.
+- Registering a device is no longer rated up because that device has no identity yet.
+- For a risky sign-in the detection Entra's rating is made of is named, not counted again; and the country of
+  a cloud, VPN or hosting address is named, not counted.
+
 **New in 1.0.6** (connecting the dots across accounts)
 
 - Known attacker addresses: what any check proves about an address (a stolen session, a phishing proxy, a

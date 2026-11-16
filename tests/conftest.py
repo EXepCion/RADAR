@@ -44,3 +44,12 @@ def _no_animations():
     theme.set_animations(False)
     yield
     theme.set_animations(False)
+
+
+@pytest.fixture(autouse=True)
+def _no_dialogs(monkeypatch):
+    """Nothing waits for an answer in a test: what goes with a dismissal is not taken along unless a test says so."""
+    from radar.app import App
+
+    monkeypatch.setattr(App, "ask_companions", lambda self, extra, parent=None: False)
+    yield

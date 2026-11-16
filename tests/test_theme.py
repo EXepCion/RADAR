@@ -188,7 +188,8 @@ def test_details_window_is_laid_out_before_it_is_shown(root):
     def places():
         root.update()
         widgets = [win.info, win.side_text, win.tree, win.row_text, win.hint]
-        return [(w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height()) for w in widgets] + [
+        x0, y0 = win.top.winfo_rootx(), win.top.winfo_rooty()  # inside the window: where it is on the screen is not layout
+        return [(w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for w in widgets] + [
             win.paned.sashpos(0)]
 
     first = places()
@@ -269,7 +270,8 @@ def test_live_report_window_shows_data_age_and_refresh_button(root):
     def places():
         root.update()
         widgets = [age.button, age.label, win.info, win.tree]
-        return [(w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height()) for w in widgets]
+        x0, y0 = win.top.winfo_rootx(), win.top.winfo_rooty()  # inside the window: where it is on the screen is not layout
+        return [(w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for w in widgets]
 
     old = datetime.now(timezone.utc) - timedelta(hours=5, minutes=3)
     age.set(old, busy=True)  # opened with cached data, refresh running
@@ -338,7 +340,8 @@ def test_wide_window_puts_evidence_beside_the_cards_and_refits_on_resize(root):
     if screen < theme.px(1900):
         top.destroy()
         pytest.skip("screen too narrow for the wide layout")
-    tall_sash = win.paned.sashpos(0)
+    tall_sash, start_width = win.paned.sashpos(0), top.winfo_width()
+    assert not win._wide                          # it opens with the evidence below the cards
     top.geometry(f"{theme.px(1880)}x{top.winfo_height()}+0+0")
     _wait(root)
     assert win._wide and str(win.paned.cget("orient")) == "horizontal"
@@ -347,7 +350,7 @@ def test_wide_window_puts_evidence_beside_the_cards_and_refits_on_resize(root):
     assert theme.px(900) <= cards.winfo_width() <= theme.px(1160)  # a readable column, not the full width
     assert abs(evidence.winfo_height() - win.body.winfo_height()) <= 2  # the table uses the full height
     assert win.info.yview() == (0.0, 1.0) and win.tree.winfo_ismapped() and win.info.winfo_ismapped()
-    top.geometry(f"{theme.px(1120)}x{top.winfo_height()}")
+    top.geometry(f"{start_width}x{top.winfo_height()}")   # back to the width it opened with
     _wait(root)
     assert not win._wide and str(win.paned.cget("orient")) == "vertical"
     assert cards.winfo_rooty() < evidence.winfo_rooty()
@@ -409,3 +412,27 @@ def test_hand_pointer_over_buttons(root):
     button.event_generate("<Enter>")
     assert str(button.cget("cursor")) == ""  # nothing to click
     top.destroy()
+
+
+def test_a_window_that_opens_over_one_raised_above_the_reminders_is_raised_too(root):  # noqa: F811
+    front = tk.Toplevel(root)       # stands for the reminders: always on top
+    front.geometry("300x200+100+100")
+    main = tk.Toplevel(root)        # opened over it: raised above it
+    main.geometry("900x600+50+50")
+    child = tk.Toplevel(root)       # opened from that one, beside the reminders but over the raised window
+    child.geometry("300x200+600+400")
+    away = tk.Toplevel(root)        # touches neither
+    away.geometry("200x150+1200+800")
+    root.update()
+    theme.keep_clear_of(lambda: front)
+    try:
+        assert theme.stay_in_front(main) and theme.is_raised(main)
+        assert theme.stay_in_front(child) and theme.is_raised(child)       # never behind the window it came from
+        assert not theme.stay_in_front(away) and not theme.is_raised(away)
+        theme.release_raised()
+        assert not theme.is_raised(main) and not bool(main.attributes("-topmost"))
+    finally:
+        theme.keep_clear_of(lambda: None)
+        theme.release_raised()
+        for w in (front, main, child, away):
+            w.destroy()

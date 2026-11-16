@@ -15,7 +15,9 @@ from PIL import ImageTk
 
 from ..plugins.signin_threats import hosts as model
 from . import icons, theme
-from .richtext import card, card_label, stable_label
+from .cardtable import CardTable
+from .parts import card, on_card
+from .richtext import card_label, stable_label
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -35,7 +37,7 @@ LONGEST_STATUS = ("'CX' would match almost every device - use a longer name or p
 
 class HostsWindow:
     def __init__(self, root: tk.Tk, app: "App", entries: list[dict[str, str]],
-                 on_save: Callable[[list[dict[str, str]]], str | None]):
+                 on_save: Callable[[list[dict[str, str]]], str | None], parent: tk.Misc | None = None, on_close=None):
         """``on_save(entries)`` stores them and returns None, or the reason why it could not."""
         self.app = app
         self.entries = [dict(e) for e in entries]
@@ -43,80 +45,85 @@ class HostsWindow:
         self._current: dict[str, str] | None = None
         self._loading = False
         self._suggestions: list[dict[str, Any]] = []
-        top = self.top = theme.new_window(root)
+        top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
+        pad = 0 if theme.is_panel(top) else px(20)  # (a page has its host's margins)
         top.title("Virtual desktops")
         top.geometry(f"{px(WIDTH)}x{min(px(740), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(860), px(560))
-        top.bind("<Escape>", lambda _e: top.destroy())
+        top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
         top.iconphoto(False, self._icon)
 
-        header = ttk.Frame(top, padding=(px(20), px(16), px(20), px(4)))
-        header.pack(fill="x")
+        header = ttk.Frame(top, padding=(pad, px(16), pad, px(4)))
+        if not theme.is_panel(top):  # (as a page, the main window's settings carry the heading)
+            header.pack(fill="x")
         ttk.Label(header, text="Virtual desktops and shared hosts", style="Title.TLabel").pack(fill="x")
         ttk.Label(header, text=HELP, style="Muted.TLabel", justify="left", wraplength=px(WIDTH - 40)).pack(
             fill="x", pady=(px(4), 0))
 
-        footer = ttk.Frame(top, padding=(px(20), px(4), px(20), px(14)))
-        footer.pack(side="bottom", fill="x")
-        self.status = stable_label(footer, LONGEST_STATUS, width=px(WIDTH - 40))
-        self.status.pack(fill="x", pady=(0, px(8)))
-        buttons = ttk.Frame(footer)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
-        ttk.Button(buttons, text="Save", style="Accent.TButton", command=self.save).pack(side="right", padx=(0, px(6)))
-
-        body = ttk.Frame(top, padding=(px(20), px(8), px(20), 0))
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=2)
-        body.rowconfigure(1, weight=3)
         c = theme.color
+        body = ttk.Frame(top, padding=(pad, px(8), pad, px(8) if theme.is_panel(top) else px(14)))
+        body.pack(fill="both", expand=True)
 
-        # ---- configured
+        def caption(parent: tk.Misc, text: str) -> tk.Label:
+            return card_label(parent, text, "muted", font=theme.FONT_CAPTION)
+
+        # ---- configured: the list, and under it the selected entry (the name of each field above it)
         upper = card(body)
-        upper.grid(row=0, column=0, sticky="nsew")
-        form = tk.Frame(upper, background=c("card"))
-        form.pack(side="bottom", fill="x", pady=(px(8), 0))
+        upper.pack(fill="x")
+        form = on_card(upper, padx=px(12), pady=px(10))
+        form.pack(side="bottom", fill="x")
+        tk.Frame(upper, height=1, background=c("border"), bd=0, highlightthickness=0).pack(side="bottom", fill="x")
+        form.columnconfigure(0, weight=2, uniform="host")
+        form.columnconfigure(1, weight=3, uniform="host")
         self.vars = {"match": tk.StringVar(), "label": tk.StringVar()}
-        card_label(form, "Name, pattern or IP range", "muted").pack(side="left")
-        self.match_entry = ttk.Entry(form, textvariable=self.vars["match"], width=28)
-        self.match_entry.pack(side="left", padx=(px(8), px(14)))
-        card_label(form, "What it is", "muted").pack(side="left")
-        self.label_entry = ttk.Entry(form, textvariable=self.vars["label"], width=24)
-        self.label_entry.pack(side="left", padx=(px(8), px(14)))
+        caption(form, "Name, pattern with * or IP range").grid(row=0, column=0, sticky="w")
+        self.match_entry = ttk.Entry(form, textvariable=self.vars["match"])
+        self.match_entry.grid(row=1, column=0, sticky="ew", padx=(0, px(12)), pady=(px(3), 0))
+        caption(form, "What it is").grid(row=0, column=1, sticky="w")
+        self.label_entry = ttk.Entry(form, textvariable=self.vars["label"])
+        self.label_entry.grid(row=1, column=1, sticky="ew", padx=(0, px(12)), pady=(px(3), 0))
         for var in self.vars.values():
             var.trace_add("write", lambda *_a: self._edited())
+        ttk.Button(form, text="Add", command=self.add).grid(row=1, column=2, padx=(0, px(6)))
         self.remove_btn = ttk.Button(form, text="Remove", command=self.remove, state="disabled")
-        self.remove_btn.pack(side="right")
-        ttk.Button(form, text="Add", command=self.add).pack(side="right", padx=(0, px(6)))
-        self.tree = ttk.Treeview(upper, columns=COLS, show="headings", selectmode="browse", height=5)
+        self.remove_btn.grid(row=1, column=3)
+        self.tree = CardTable(upper, COLS, selectmode="browse", height=4, border=False)
         for col in COLS:
             self.tree.heading(col, text=col, anchor="w")
             self.tree.column(col, width=px(WIDTHS[col]), stretch=col == COLS[1], anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._select())
 
-        # ---- suggestions
+        # ---- suggestions, and at the bottom what the editor has to say, with Save
         low = card(body)
-        low.grid(row=1, column=0, sticky="nsew", pady=(px(10), 0))
-        head = tk.Frame(low, background=c("card"))
-        head.pack(fill="x", pady=(0, px(6)))
-        card_label(head, "Found in the sign-ins of the last 30 days", font=theme.FONT_BOLD).pack(side="left")
-        self.suggest_note = card_label(head, "Looking through the sign-in history...", "muted", font=theme.FONT_CAPTION)
-        self.suggest_note.pack(side="left", padx=(px(10), 0))
-        sbar = tk.Frame(low, background=c("card"))
-        sbar.pack(side="bottom", fill="x", pady=(px(8), 0))
+        low.pack(fill="both", expand=True, pady=(px(10), 0))
+        foot = on_card(low, padx=px(16), pady=px(10))
+        foot.pack(side="bottom", fill="x")
+        tk.Frame(low, height=1, background=c("border"), bd=0, highlightthickness=0).pack(side="bottom", fill="x")
+        ttk.Button(foot, text="Discard changes" if theme.is_panel(top) else "Cancel",
+                   command=lambda: theme.close(top)).pack(side="right")
+        ttk.Button(foot, text="Save", style="Accent.TButton", command=self.save).pack(side="right", padx=(px(12), px(6)))
+        self.status = stable_label(foot, LONGEST_STATUS, width=px(WIDTH - 330), background=c("card"))
+        self.status.pack(fill="x")
+        sbar = on_card(low, padx=px(12), pady=px(10))
+        sbar.pack(side="bottom", fill="x")
         self.add_selected_btn = ttk.Button(sbar, text="Add selected", command=self._add_selected, state="disabled")
         self.add_selected_btn.pack(side="left")
         self.add_all_btn = ttk.Button(sbar, text="Add all", command=self._add_all, state="disabled")
         self.add_all_btn.pack(side="left", padx=(px(6), 0))
-        card_label(sbar, "A shared PC people take turns on is not a virtual desktop: leave it out.", "muted",
-                   font=theme.FONT_CAPTION).pack(side="left", padx=(px(14), 0))
-        self.suggest = ttk.Treeview(low, columns=SUGGEST_COLS, show="headings", selectmode="extended", height=6)
+        caption(sbar, "A shared PC people take turns on is not a virtual desktop: leave it out.").pack(
+            side="left", padx=(px(14), 0))
+        head = on_card(low, padx=px(16))
+        head.pack(fill="x", pady=(px(12), px(4)))
+        card_label(head, "Suggestions: machines several people work on (last 30 days)", font=theme.FONT_BOLD).pack(side="left")
+        self.suggest_note = card_label(head, "Looking through the sign-in history...", "muted", font=theme.FONT_CAPTION)
+        self.suggest_note.pack(side="left", padx=(px(10), 0))
+        self.suggest = CardTable(low, SUGGEST_COLS, selectmode="extended", height=3, border=False)
         for col in SUGGEST_COLS:
             self.suggest.heading(col, text=col, anchor="w")
             self.suggest.column(col, width=px(SUGGEST_WIDTHS[col]), stretch=col == "Why", anchor="w")
+        self.suggest.action("Add", lambda iid: self._take([iid]))
         self.suggest.pack(fill="both", expand=True)
         self.suggest.bind("<<TreeviewSelect>>", lambda _e: self._buttons())
 
@@ -238,4 +245,4 @@ class HostsWindow:
         if error:
             self._say(f"Could not save: {error}", error=True)
             return
-        self.top.destroy()
+        theme.close(self.top)

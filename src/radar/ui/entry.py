@@ -15,9 +15,11 @@ from PIL import ImageTk
 from .. import linkify
 from ..linkify import Entity
 from . import icons, theme
-from .richtext import (LinkHandler, StackedNotebook, StatusLine, attach_table_menu, fit_columns, scrolled_text,
+from .richtext import (LinkHandler, StatusLine, attach_table_menu, fit_columns, scrolled_text,
                        stable_label)
 from .tables import make_sortable
+from .cardtable import CardTable
+from .parts import UnderlineTabs
 from .theme import px
 
 SIGNIN_LOGS_URL = linkify.SIGNIN_LOGS_URL
@@ -203,8 +205,8 @@ class _LogWindow:
 
     def _table_tab(self, parent: tk.Misc, cols: list[str], rows: list[list[str]],
                    entities: list[Entity | None]) -> ttk.Frame:
-        frame = ttk.Frame(parent, padding=px(8))
-        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        frame = ttk.Frame(parent)
+        tree = CardTable(frame, cols, selectmode="browse", xscroll=True, border=False)  # (the tabs' card is the frame)
         for c in cols:
             tree.heading(c, text=c, anchor="w")
         shown = rows or [["(none)"] + [""] * (len(cols) - 1)]
@@ -226,12 +228,7 @@ class _LogWindow:
                     if iid in targets:
                         self.links.default(targets[iid])
                 tree.bind("<Double-1>", open_row)
-        ys = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        xs = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
         tree.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
-        xs.grid(row=1, column=0, sticky="ew")
         if targets:
             ttk.Label(frame, text="Double-click a policy to open it in Entra.", style="Muted.TLabel").grid(
                 row=2, column=0, sticky="w", pady=(px(4), 0))
@@ -272,7 +269,7 @@ class EntryWindow(_LogWindow):
         ttk.Button(self.buttons, text="Copy Request ID", command=self.copy_id).pack(side="left", padx=(px(6), 0))
         self.copy_json_btn = ttk.Button(self.buttons, text="Copy JSON", command=self.copy_json, state="disabled")
         self.copy_json_btn.pack(side="right", padx=(0, px(6)))
-        self.tabs = StackedNotebook(self.top)  # pages are swapped, not re-mapped: no flash
+        self.tabs = UnderlineTabs(self.top)  # pages are swapped, not re-mapped: no flash
         self.tabs.pack(fill="both", expand=True, padx=px(20), pady=(px(4), 0))
 
     # ----------------------------------------------------------- content
@@ -458,14 +455,11 @@ class AuditWindow(_LogWindow):
         # The list is there from the start with fixed columns: nothing is inserted or resized when the entries
         # have loaded.
         frame = ttk.Frame(self.paned)
-        tree = self.list = ttk.Treeview(frame, columns=AUDIT_COLS, show="headings", selectmode="browse", height=5)
+        tree = self.list = CardTable(frame, AUDIT_COLS, selectmode="browse", height=5)
         for c in AUDIT_COLS:
             tree.heading(c, text=c, anchor="w")
             tree.column(c, width=px(AUDIT_WIDTHS[c]), stretch=c == AUDIT_COLS[-1], anchor="w")
-        ys = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=ys.set)
         tree.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         self.paned.add(frame, weight=0)

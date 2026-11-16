@@ -92,6 +92,9 @@ class Finding:
     #: non-empty = weak context signal of this kind: stored, but only becomes an alert when it correlates
     #: with other activity of the same person (see radar.correlation)
     signal: str = ""
+    #: keys of earlier findings this one takes the place of (one alert for what used to be several): their open
+    #: alerts leave the reminders and stay in the history, naming this one
+    supersedes: list[str] = field(default_factory=list)
 
 
 class PluginState:

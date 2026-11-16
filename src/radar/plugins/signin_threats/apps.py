@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS app_failures (
     sp_id TEXT NOT NULL, week TEXT NOT NULL, code INTEGER NOT NULL, n INTEGER NOT NULL, ips TEXT NOT NULL,
     first_ts REAL NOT NULL, last_ts REAL NOT NULL, PRIMARY KEY (sp_id, week, code));
 CREATE TABLE IF NOT EXISTS app_ids (id TEXT PRIMARY KEY, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS app_failing (
+    sp_id TEXT NOT NULL, how TEXT NOT NULL, since TEXT NOT NULL, last TEXT NOT NULL, PRIMARY KEY (sp_id, how));
 """
 
 
@@ -170,6 +172,19 @@ class AppStore:
                 for code, n, ips, lo, hi in self.c.execute(
                     "SELECT code, n, ips, first_ts, last_ts FROM app_failures WHERE sp_id=? AND week=?", (sp_id, week))]
 
+    def failing_since(self, sp_id: str, how: str, now: datetime) -> str:
+        """The week an app began to fail this way without a break (a week without it ends the run). An alert about
+        it is keyed by that week: one alert for as long as it goes on - dismissed once, it stays dismissed - and a
+        new one when it starts again or fails differently."""
+        week, before = _week(now), _week(now - timedelta(days=7))
+        row = self.c.execute("SELECT since, last FROM app_failing WHERE sp_id=? AND how=?", (sp_id, how)).fetchone()
+        since = row[0] if row and row[1] in (week, before) else week
+        self.c.execute("INSERT INTO app_failing(sp_id, how, since, last) VALUES(?,?,?,?) "
+                       "ON CONFLICT(sp_id, how) DO UPDATE SET since=excluded.since, last=excluded.last",
+                       (sp_id, how, since, week))
+        self.c.commit()
+        return since
+
     def purge(self, now: datetime, days: int = 30) -> None:
         cut = (now - timedelta(days=days)).timestamp()
         self.c.execute("DELETE FROM app_profile WHERE last_ts<?", (cut,))
@@ -253,8 +268,11 @@ def app_findings(store: AppStore, rows: list[AppSignIn], now: datetime) -> list[
         guessing = bool(nets) and bool(foreign)
         score = 55 if guessing else 30
         reasons = ", ".join(f"{CREDENTIAL_ERRORS[c]} ({n})" for c, n, _, _, _ in failed)
+        how = ("tried|" if guessing else "failing|") + "+".join(str(c) for c in sorted({c for c, _, _, _, _ in failed}))
+        since = store.failing_since(sp, how, now)
         out.append(Finding(
-            key=f"appfail|{sp}|{week}", rule_id="app_signins", severity=_sev(score), score=score,
+            key=f"appfail|{sp}|{how}|{since}", rule_id="app_signins", severity=_sev(score), score=score,
+            supersedes=[f"appfail|{sp}|{week}"],  # (how an earlier version named it: a new alert every week)
             factors=[(score, f"{total} failed sign-ins with the app's credential this week: {reasons}"
                              + (f" - from {len(foreign)} IP(s) outside its usual networks" if guessing else ""))],
             subjects=[f"app:{app.lower()}"],
@@ -267,7 +285,10 @@ def app_findings(store: AppStore, rows: list[AppSignIn], now: datetime) -> list[
                       + ". Usually an expired or rotated secret that was not updated where the app runs - the "
                         "integration does not work.")),
             occurred_at=min(lo for _, _, _, lo, _ in failed),
-            fields={"App": app, "Failures this week": str(total), "Errors": reasons, "From": ", ".join(ips[:10])},
+            fields={"App": app, "Failures this week": str(total), "Errors": reasons, "From": ", ".join(ips[:10]),
+                    "Failing since": f"week {since.split('-W')[-1]} of {since.split('-W')[0]}",
+                    "Kind": ("Possible attack on the app's credentials" if guessing else
+                             "Operational: an integration that does not work - not an attack")},
             recommendation=("Find out who runs the integration and update its secret / certificate (or remove the app "
                             "if it is no longer used)." if not guessing else
                             "Rotate the app's credentials and check which IPs tried them."),

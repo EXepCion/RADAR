@@ -201,7 +201,7 @@ def ongoing_attacks(rc: RuleContext, hours: float = 72) -> AttackOverview:
     enabled = frozenset(r.meta.id for r in rules.RULES) - {"mfa_exempt_watch"}
     sub = RuleContext.build(failures, rc.history, settings, rc.now, enabled_rules=enabled,
                             asn_resolver=rc.asn_resolver, accounts=rc.accounts)
-    campaigns = {f.key.split("|")[1]: f for f in rules.distributed_attack(sub)}
+    campaigns = {f.key.split("|")[1]: f for f in rules.distributed_attack(sub, merge=False)}  # (a row per account)
 
     brute_min = int(rc.cfg("brute_force").get("min_failures", 10))
     exempt_min = int(rc.cfg("mfa_exempt_watch").get("min_failures", 3))

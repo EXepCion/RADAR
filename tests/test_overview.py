@@ -146,7 +146,9 @@ def test_attacks_window_shows_rows_and_opens_assessment(root, history):
     assert {r[1] for r in rows} == {"priya@contoso.com", "scanner@contoso.com"}
     assert next(r for r in rows if r[1] == "priya@contoso.com")[5] == "dismissed"
     assert next(r for r in rows if r[1] == "scanner@contoso.com")[3] == "EXCLUDED"
-    assert "2 account(s) under password guessing, 1 with the password apparently known" in win.status.cget("text")
+    # the figures are on the tiles (once); the line under the title says where the attacks came from
+    assert [win.tiles.text(i) for i in range(3)] == ["2", "1", "1"]
+    assert "attacking IP(s)" in win.status.cget("text") and "under password guessing" not in win.status.cget("text")
     win.accounts_tree.selection_set(win.accounts_tree.get_children()[0])
     win.open_selected()
     win.tabs.select(1)
@@ -163,7 +165,8 @@ def _geometry(win):
     win.top.update()
     widgets = {"status": win.status, "tabs": win.tabs, "table": win.accounts_tree, "row": win.row_text,
                "button": win.open_btn, "hint": win.hint.label}
-    places = {name: (w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height()) for name, w in widgets.items()}
+    x0, y0 = win.top.winfo_rootx(), win.top.winfo_rooty()  # inside the window: where it is on the screen is not layout
+    places = {name: (w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for name, w in widgets.items()}
     places["sash"] = win.body.sashpos(0)
     return places
 
@@ -259,7 +262,8 @@ def test_switching_tabs_keeps_every_table_mapped(root, history):
     unmapped = []
     for tree in win._trees:
         tree.bind("<Unmap>", lambda _e: unmapped.append(1), add="+")
-    place = lambda w: (w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height())  # noqa: E731
+    place = lambda w: (w.winfo_rootx() - win.top.winfo_rootx(), w.winfo_rooty() - win.top.winfo_rooty(),  # noqa: E731
+                       w.winfo_width(), w.winfo_height())
     first = place(win.accounts_tree)
     for index, tree in list(enumerate(win._trees)) + [(0, win.accounts_tree)]:
         win.tabs.select(index)

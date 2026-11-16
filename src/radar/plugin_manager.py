@@ -133,7 +133,7 @@ class PluginManager:
                 continue
             if path.name not in allowed:  # importing it would already run it: wait for the user's word
                 self.unapproved.append(path.name)
-                log.warning("User plugin %s is not loaded: not allowed yet (tray menu > Plugins)", path.name)
+                log.warning("User plugin %s is not loaded: not allowed yet (RADAR > Settings > Plugins)", path.name)
                 continue
             modname = f"radar_user_plugin_{re.sub(r'[^0-9a-zA-Z_]', '_', path.stem)}"
             try:

@@ -20,7 +20,9 @@ from . import icons, theme
 from .richtext import (LinkHandler, StatusLine, attach_table_menu, card, card_label, fit_columns, pill,
                        stable_label,
                        scrolled_text)
+from .riskcard import RiskCard
 from .tables import make_sortable
+from .cardtable import CardTable
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -137,7 +139,9 @@ class DetailsWindow:
         top.attributes("-topmost", True)
         top.lift()
         top.focus_force()
-        top.after(400, lambda: top.attributes("-topmost", False))
+        # (in front of the window it was opened from - and it stays above the reminders and whatever was raised
+        #  above them, see theme.stay_in_front)
+        top.after(400, lambda: None if theme.is_raised(top) or not top.winfo_exists() else top.attributes("-topmost", False))
         top.after(120, self._animate_risk)
 
     def _reset(self) -> None:
@@ -154,6 +158,7 @@ class DetailsWindow:
         self._fit_job: str | None = None
         self.row_text = None
         self.side: ttk.Frame | None = None
+        self.__dict__.pop("risk", None)  # (written again when the alert has a risk assessment)
         self._rows: dict[str, dict[str, str]] = {}
 
     def _signature(self) -> tuple:
@@ -409,41 +414,8 @@ class DetailsWindow:
         side.grid_propagate(False)  # fixed width: the text inside is grid-managed
         pad = text.card_blocks(padding=18)
         if a.factors:
-            indent = pad + px(40)
-            text.configure(tabs=(indent - px(8), "right", indent))
-            text.tag_configure("score_num", font=theme.FONT_DISPLAY)
-            text.tag_configure("bar_line", spacing1=px(2), spacing3=px(12))
-            text.tag_configure("factor", lmargin2=indent, spacing3=px(8))
-            text.tag_raise("factor", "card")
-            text.begin_card("Risk assessment", first=True)
-            text.write(str(a.score), "card", "score_num")
-            text.write(f"  / 100 · {a.severity.label}\n", "card", "muted")
-            bar = self.bar = tk.Canvas(text, height=px(6), width=px(300), highlightthickness=0, bd=0,
-                                       background=theme.color("track"))
-            self._bar_fill = bar.create_rectangle(0, 0, 0, px(6), width=0,
-                                                  fill="#%02x%02x%02x" % icons.SEVERITY_RGB[a.severity])
-            self._bar_progress = 1.0
-            text.configure(state="normal")
-            text.window_create("end-1c", window=bar)
-            text.tag_add("card", "end-2c")
-            text.configure(state="disabled")
-            text.write("\n", "card", "bar_line")
-            text.tag_add("bar_line", "end-3c linestart", "end-1c")
-
-            def fit_bar(_e: tk.Event | None = None) -> None:
-                try:
-                    bar.configure(width=max(px(60), text.winfo_width() - 2 * pad))
-                    self._draw_bar(self._bar_progress)
-                except tk.TclError:
-                    pass
-            text.bind("<Configure>", fit_bar, add="+")
-            for points, reason in a.factors:
-                sign = "pos" if points > 0 else "neg" if points < 0 else "muted"
-                text.write(f"\t{points:+d}" if points else "\t±0", "card", "factor", "bold", sign)
-                text.write("\t", "card", "factor")
-                text.write_value(reason, tags=("card", "factor"))
-                text.write("\n", "card", "factor")
-            text.end_card()
+            self.risk = RiskCard(text, a, pad)  # (the same card an incident's window shows for its alerts)
+            self.bar, self._bar_fill = self.risk.bar, self.risk.fill
         if quick:
             start = text.index("end-1c")
             text.begin_card("Open in Entra", first=not a.factors)
@@ -455,21 +427,11 @@ class DetailsWindow:
             text.tag_add("quick_card", start, "end-1c")  # hidden while the links stand below the facts instead
 
     def score_text(self) -> str:
-        try:
-            return self.side_text.get("score_num.first", "score_num.last")
-        except (tk.TclError, AttributeError):
-            return ""
+        risk = getattr(self, "risk", None)
+        return risk.score_text() if risk is not None else ""
 
     def _set_score(self, value: int) -> None:
-        t = self.side_text
-        try:
-            start = t.index("score_num.first")
-            t.configure(state="normal")
-            t.delete("score_num.first", "score_num.last")
-            t.insert(start, str(value), ("card", "score_num"))
-            t.configure(state="disabled")
-        except tk.TclError:
-            pass
+        self.risk.set_score(value)
 
     def _evidence(self, parent: tk.Misc) -> tk.Frame:
         a = self.alert
@@ -485,7 +447,7 @@ class DetailsWindow:
         split = self.evidence_split = ttk.PanedWindow(frame, orient="vertical", style="Card.TPanedwindow")
         split.pack(fill="both", expand=True)
         table = ttk.Frame(split, style="Card.TFrame")
-        tree = self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="browse", height=6)
+        tree = self.tree = CardTable(table, cols, selectmode="browse", height=6, xscroll=True)
         for c in cols:
             tree.heading(c, text=c, anchor="w")
         fit_columns(tree, cols, a.evidence)
@@ -494,12 +456,7 @@ class DetailsWindow:
             self._rows[iid] = row
             tree.insert("", "end", iid=iid, values=[str(row.get(c, "")) for c in cols])
         self.sort = make_sortable(tree, cols)
-        vsb = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
-        hsb = ttk.Scrollbar(table, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
         split.add(table, weight=3)
@@ -636,19 +593,13 @@ class DetailsWindow:
 
     # ------------------------------------------------------------ animation
     def _draw_bar(self, progress: float) -> None:
-        self._bar_progress = progress
-        try:
-            width = int(self.bar.cget("width"))  # the configured width (winfo_width lags behind a resize)
-            self.bar.coords(self._bar_fill, 0, 0, int(width * self.alert.score / 100 * progress), px(6))
-        except tk.TclError:
-            pass
+        self.risk.draw(progress)  # (AttributeError without a risk card: the caller knows)
 
     def _animate_risk(self) -> None:
         """Risk bar grows to the score while the number counts up (instant with animations off)."""
         if not self.alert.factors or not self.exists():
             return
-        score = self.alert.score
-        theme.animate(self.bar, 700, lambda t: (self._draw_bar(t), self._set_score(int(round(score * t)))))
+        self.risk.animate()
 
     # ------------------------------------------------------------ actions
     def selected_row(self) -> dict[str, str] | None:

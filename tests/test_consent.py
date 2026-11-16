@@ -159,8 +159,11 @@ def test_user_consent_switched_on_is_detected():
 
 def test_consent_signal_activates_with_suspicious_sign_in_of_the_admin_but_not_with_app_onboarding():
     ac = AlertCenter(Store(":memory:"))
-    sig = findings(consent(1, "chris@contoso.com", "AnythingMCP", "openid email profile"))["AnythingMCP"]
-    assert ac.ingest("directory_audit", [sig]) == []
+    found = findings(consent(1, "chris@contoso.com", "AnythingMCP", "openid email profile"),
+                     consent(2, "chris@contoso.com", "HubSpot", "User.Read Contacts.Read openid"))
+    sig, basic = found["HubSpot"], found["AnythingMCP"]
+    assert sig.score >= 10 > basic.score                   # (one reads data, the other only signs people in)
+    assert ac.ingest("directory_audit", [sig, basic]) == []
     onboarding = Finding(key="diraudit|app_credentials|chris@contoso.com|2026-W45", rule_id="app_credentials",
                          severity=Severity.MEDIUM, score=55, title="App credentials added: chris@contoso.com",
                          occurred_at=sig.occurred_at, fields={"Initiated by": "chris@contoso.com"},
@@ -170,8 +173,30 @@ def test_consent_signal_activates_with_suspicious_sign_in_of_the_admin_but_not_w
                      title="Session replayed from another network after MFA: chris@contoso.com",
                      occurred_at=sig.occurred_at + timedelta(days=1), fields={"User": "chris@contoso.com"})
     popped = ac.ingest("signin_threats", [replay])
-    activated = [a for a in popped if a.signal]
-    assert len(activated) == 1 and activated[0].score == 30 and "Session replayed" in activated[0].fields["Correlated with"]
+    activated = [a for a in popped if a.signal]                # the sign-in-only consent stays what it is: context
+    assert [a.key for a in activated] == [sig.key] and activated[0].score == sig.score + 25
+    assert "Session replayed" in activated[0].fields["Correlated with"]
+
+
+def test_consent_is_not_raised_by_what_happened_days_after_it_and_goes_back_when_its_partner_is_judged_anew():
+    ac = AlertCenter(Store(":memory:"))
+    sig = findings(consent(2, "chris@contoso.com", "HubSpot", "User.Read Contacts.Read openid"))["HubSpot"]
+    ac.ingest("directory_audit", [sig])
+
+    def replay(key, days, score=80):
+        return Finding(key=key, rule_id="aitm_replay", severity=Severity.HIGH if score >= 70 else Severity.INFO,
+                       score=score, title=f"Session replayed ({key}): chris@contoso.com",
+                       occurred_at=sig.occurred_at + timedelta(days=days), fields={"User": "chris@contoso.com"})
+
+    assert [a for a in ac.ingest("signin_threats", [replay("late", 4)]) if a.signal] == []   # the consent came first
+    assert [a.key for a in ac.ingest("signin_threats", [replay("before", -2)]) if a.signal] == [sig.key]
+    stored = next(a for a in ac.recent() if a.key == sig.key)
+    assert stored.status == "active" and stored.score == sig.score + 25
+    assert ac.replace_assessment(replay("before", -2, score=10), Severity.LOW)   # judged harmless after all
+    ac.correlate_all()
+    stored = next(a for a in ac.recent() if a.key == sig.key)
+    assert stored.status == "muted" and stored.score == sig.score and "Correlated with" not in stored.fields
+    assert [tuple(x) for x in stored.factors] == [tuple(x) for x in sig.factors]
 
 
 def test_plugin_routes_consents_and_reads_the_consent_setting(tmp_path):

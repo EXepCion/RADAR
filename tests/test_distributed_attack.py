@@ -135,10 +135,49 @@ def test_user_mistyping_at_home_is_not_an_attack(history):
 
 def test_campaign_scope_lists_other_targets(history):
     other = campaign(user="u3", upn="omar@contoso.com", n=10)
-    out = rules.distributed_attack(setup(history, other))
+    out = rules.distributed_attack(setup(history, other), merge=False)   # a row per account (Ongoing attacks)
     by_user = {f.fields["Account"]: f for f in out}
     assert by_user["priya@contoso.com"].fields["Same campaign also targets"] == "omar@contoso.com"
     assert by_user["omar@contoso.com"].fields["Same campaign also targets"] == "priya@contoso.com"  # never itself
+
+
+def test_one_campaign_against_several_accounts_is_one_alert(history):
+    from radar.plugins.signin_threats.accounts import AccountDirectory, AccountInfo
+
+    rows = campaign(user="u3", upn="omar@contoso.com", n=10) + campaign(user="u4", upn="left@contoso.com", n=9)
+    rc = setup(history, rows)
+    rc.accounts = AccountDirectory({"u4": AccountInfo(user_id="u4", upn="left@contoso.com", enabled=False)})
+    out = rules.distributed_attack(rc)
+    assert len(out) == 1
+    f = out[0]
+    assert f.title == "Password attack from rotating IPs on 2 accounts: omar@contoso.com, priya@contoso.com"
+    assert f.severity == Severity.MEDIUM and f.subjects == ["omar@contoso.com", "priya@contoso.com"]
+    assert f.fields["Failed attempts"] == "30" and f.fields["Disabled accounts also tried"] == "left@contoso.com"
+    assert f.fields["Per account"].splitlines()[0] == "priya@contoso.com: 20 attempts from 20 IPs"
+    assert {r["User"] for r in f.evidence} == {"omar@contoso.com", "priya@contoso.com"}
+    assert sorted(k.split("|")[1] for k in f.supersedes) == ["u1", "u3", "u4"]   # (the alerts it takes the place of)
+    assert f.key.startswith("dpa-campaign|")
+
+
+def test_guessing_at_a_disabled_account_alone_is_only_logged(history):
+    from radar.plugins.signin_threats.accounts import AccountDirectory, AccountInfo
+
+    rows = campaign(user="u4", upn="left@contoso.com", n=12)
+    history.add(rows)
+    rc = RuleContext.build(rows, history, {}, T0 + timedelta(hours=2),
+                           accounts=AccountDirectory({"u4": AccountInfo(user_id="u4", upn="left@contoso.com", enabled=False)}))
+    f = rules.distributed_attack(rc)[0]
+    assert f.severity == Severity.INFO and any("nothing can come of it" in text for _p, text in f.factors)
+
+
+def test_an_account_where_the_password_worked_keeps_its_own_alert(history):
+    worked = make_signin(-30, user_id="u3", upn="omar@contoso.com", ip="45.77.1.1", asn=29999, country="US",
+                         error_code=50074, failure_reason="Strong authentication is required")
+    rows = campaign(user="u3", upn="omar@contoso.com", n=10) + [worked] + campaign(user="u5", upn="nia@contoso.com", n=10)
+    out = {f.key.split("|")[0]: f for f in rules.distributed_attack(setup(history, rows))}
+    assert set(out) == {"dpa", "dpa-campaign"}
+    assert "got past the password" in out["dpa"].title and out["dpa"].fields["Account"] == "omar@contoso.com"
+    assert out["dpa-campaign"].subjects == ["nia@contoso.com", "priya@contoso.com"]
 
 
 def test_preliminary_record_is_replaced_by_completed_one_but_not_new(history):

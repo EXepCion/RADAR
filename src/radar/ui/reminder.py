@@ -6,7 +6,7 @@ import time
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PIL import ImageTk
 
@@ -14,6 +14,7 @@ from ..alerts import Alert
 from ..plugin_api import Severity
 from . import icons, theme
 from .details import DetailsWindow
+from .cardtable import CardTable
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -76,6 +77,10 @@ class ReminderWindow:
         self._images: dict[str, ImageTk.PhotoImage] = {}
         self._alerts: dict[str, Alert] = {}
         self._details: dict[int, DetailsWindow] = {}
+        self._members: dict[str, list[Alert]] = {}   # row -> the open alerts it stands for (several: an incident)
+        self._groups: dict[str, Any] = {}            # row -> its incident (rows that are one)
+        self._row_of: dict[int, str] = {}            # alert -> its row
+        self._when: dict[str, Any] = {}              # row -> the time it shows
         self._placed = False
         self._tick_job: str | None = None
         self._attention = False
@@ -87,6 +92,7 @@ class ReminderWindow:
         top.title("Reminders")
         top.geometry(f"{px(680)}x{px(520)}")
         top.minsize(px(520), px(400))
+        theme.on_rescale(self._rescaled)
         top.iconphoto(False, self._img("bell32", icons.bell(32)), self._img("bell16", icons.bell(16)))
         top.protocol("WM_DELETE_WINDOW", self.hide)
         top.bind("<Delete>", lambda _e: self.dismiss_selected())
@@ -158,20 +164,16 @@ class ReminderWindow:
 
         body = ttk.Frame(top, padding=(px(12), px(10), px(12), 0))
         body.pack(fill="both", expand=True)
-        listing = tk.Frame(body, background=card_bg, highlightthickness=0, highlightbackground=theme.color("border"),
-                           highlightcolor=theme.color("border"))
-        listing.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(listing, columns=("severity", "occurred"), show="tree headings", selectmode="extended")
-        self.tree.heading("#0", text="Subject", anchor="w")
+        self._dots: dict[str, ImageTk.PhotoImage] = {}  # row -> the dot in the colour of its severity
+        self.tree = CardTable(body, ["subject", "severity", "occurred"], selectmode="extended")
+        self.tree.heading("subject", text="Subject", anchor="w")
         self.tree.heading("severity", text="Severity", anchor="w")
         self.tree.heading("occurred", text="Occurred", anchor="w")
-        self.tree.column("#0", width=px(360), stretch=True)
-        self.tree.column("severity", width=px(110), stretch=False)
-        self.tree.column("occurred", width=px(130), stretch=False)
-        vsb = ttk.Scrollbar(listing, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.tree.column("subject", width=px(360), stretch=True)
+        self.tree.column("severity", width=px(120), stretch=False)
+        self.tree.column("occurred", width=px(140), stretch=False)
+        self.tree.image_of("subject", self._dots.get)
+        self.tree.pack(fill="both", expand=True)
         self._f_bold = theme.FONT_TABLE_BOLD
         self.tree.tag_configure("new", font=self._f_bold, background=theme.color("new_row"))
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_header())
@@ -183,14 +185,31 @@ class ReminderWindow:
 
     # -------------------------------------------------------------- state
     def _selected(self) -> list[Alert]:
-        return [self._alerts[i] for i in self.tree.selection() if i in self._alerts]
+        """The open alerts of the selected rows (a row that is an incident stands for all of its open alerts)."""
+        return [a for i in self.tree.selection() for a in self._members.get(i, ())]
+
+    def _selected_rows(self) -> list[str]:
+        return [i for i in self.tree.selection() if i in self._members]
 
     def _update_header(self) -> None:
+        rows = self._selected_rows()
         sel = self._selected()
-        alert = sel[0] if sel else None
+        alert = self._alerts.get(rows[0]) if rows else None
         if alert is None:
             self.h_icon.configure(image=self._img("badge", icons.badge(Severity.INFO, px(36))))
             self._set_header_text("No reminders", "", "")
+            return
+        inc = self._groups.get(rows[0])
+        if inc is not None:  # an incident: what it is, how far it got, what weighs most
+            from .incidents import short_title
+
+            members = self._members[rows[0]]
+            sev = max(a.severity for a in members)
+            self.h_icon.configure(image=self._img(f"badge-{sev.name}", icons.badge(sev, px(36))))
+            when = (f"{sev.label} \u00b7 risk {max(a.score for a in members)}   \u00b7   Incident, {len(members)} open "
+                    f"alert{'s' if len(members) != 1 else ''}" + (f"   \u00b7   reached: {inc.stage_name}" if inc.stage_name else ""))
+            summary = (f"{len(rows)} rows selected. " if len(rows) > 1 else "") + (f"Strongest finding: {inc.why}" if inc.why else "")
+            self._set_header_text(short_title(inc), when, summary)
             return
         sev = alert.severity
         self.h_icon.configure(image=self._img(f"badge-{sev.name}", icons.badge(sev, px(36))))
@@ -199,8 +218,8 @@ class ReminderWindow:
         when = (f"{sev.label}{score}   ·   {origin}   ·   "
                 f"{theme.local_time(alert.occurred_at or alert.first_seen, '%a %d.%m. %H:%M')}")
         summary = alert.summary
-        if len(sel) > 1:
-            summary = f"{len(sel)} reminders selected. " + summary
+        if len(rows) > 1:
+            summary = f"{len(rows)} rows selected. " + summary
         self._set_header_text(alert.title, when, summary)
 
     def _set_header_text(self, title: str, when: str, summary: str) -> None:
@@ -217,20 +236,61 @@ class ReminderWindow:
             self._text_width = width
             self._set_header_text(*self._header_text)
 
+    def _rows(self, alerts: list[Alert]) -> list[tuple[str, list[Alert], Any]]:
+        """What the list shows: (row, the open alerts it stands for, its incident or None). Alerts that belong to
+        one incident are one row - one thing to look at and to decide; every other alert is a row of its own.
+        Most urgent first: by severity, then by risk score, then the latest."""
+        from datetime import datetime, timedelta, timezone
+
+        from .. import incidents
+
+        rows: list[tuple[str, list[Alert], Any]] = []
+        inside: set[int] = set()
+        try:
+            now = datetime.now(timezone.utc)
+            found = incidents.group(self.app.alerts.since(now - timedelta(days=incidents.LOOKBACK_DAYS + 1)), now)
+        except Exception:  # noqa: BLE001 - the reminders must come up whatever happens to the grouping
+            log.exception("The reminders could not be grouped into incidents")
+            found = []
+        active = {a.id: a for a in alerts}
+        for inc in found:
+            members = [active[a.id] for a in inc.alerts if a.id in active and a.id not in inside]
+            if members:
+                inside.update(a.id for a in members)
+                rows.append((f"incident:{inc.id}", members, inc))
+        rows += [(str(a.id), [a], None) for a in alerts if a.id not in inside]
+        rows.sort(key=lambda r: (-max(int(a.severity) for a in r[1]), -max(a.score for a in r[1]),
+                                 -max(a.when.timestamp() for a in r[1])))
+        return rows
+
     def refresh(self) -> None:
+        from .incidents import who
+
         alerts = self.app.alerts.active()
         previous = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
-        self._alerts = {}
-        for a in alerts:
-            iid = str(a.id)
-            self._alerts[iid] = a
-            self.tree.insert("", "end", iid=iid, text=f" {a.title}",
-                             image=self._img(f"dot-{a.severity.name}", icons.severity_dot(a.severity, px(16))),
-                             values=(f"{a.severity.label} · {a.score}" if a.score else a.severity.label,
-                                     theme.humanize(a.occurred_at or a.first_seen)),
-                             tags=() if a.seen else ("new",))
-        keep = [i for i in previous if i in self._alerts] or ([str(alerts[0].id)] if alerts else [])
+        self._alerts, self._members, self._groups, self._row_of, self._when = {}, {}, {}, {}, {}
+        self._dots.clear()
+        for iid, members, inc in self._rows(alerts):
+            sev, score = max(a.severity for a in members), max(a.score for a in members)
+            lead = max(members, key=lambda a: (int(a.severity), a.score))
+            self._alerts[iid] = lead  # (the alert a row is shown by; for an incident its strongest open one)
+            self._members[iid] = members
+            self._when[iid] = max(a.occurred_at or a.first_seen for a in members)
+            for a in members:
+                self._row_of[a.id] = iid
+            if inc is not None:
+                self._groups[iid] = inc
+                title = "  \u00b7  ".join(p for p in (
+                    f"Incident: {who(inc)}", f"{len(members)} alert{'s' if len(members) != 1 else ''}", inc.stage_name) if p)
+            else:
+                title = lead.title
+            self._dots[iid] = self._img(f"dot-{sev.name}", icons.severity_dot(sev, px(16)))
+            self.tree.insert("", "end", iid=iid,
+                             values=(title, f"{sev.label} · {score}" if score else sev.label, theme.humanize(self._when[iid])),
+                             tags=() if all(a.seen for a in members) else ("new",))
+        first = self.tree.get_children()
+        keep = [i for i in previous if i in self._alerts] or (list(first[:1]) if first else [])
         if keep:
             self.tree.selection_set(keep)
             self.tree.focus(keep[0])
@@ -241,8 +301,8 @@ class ReminderWindow:
             self.hide()
 
     def _update_title(self) -> None:
-        n = len(self._alerts)
-        unseen = sum(1 for a in self._alerts.values() if not a.seen)
+        n = len(self._members)  # things to handle: an incident counts once
+        unseen = sum(1 for members in self._members.values() if not all(a.seen for a in members))
         self.top.title(f"{n} Reminder{'s' if n != 1 else ''}" + (f" ({unseen} new)" if unseen else ""))
 
     def mark_selected_seen(self) -> None:
@@ -255,12 +315,30 @@ class ReminderWindow:
         self.app.alerts.mark_seen(a.id for a in unseen)
         for a in unseen:
             a.seen = True
-            if self.tree.exists(str(a.id)):
-                self.tree.item(str(a.id), tags=())
+            row = self._row_of.get(a.id, "")
+            if self.tree.exists(row) and all(m.seen for m in self._members.get(row, ())):
+                self.tree.item(row, tags=())
         self._update_title()
         self.app.on_alerts_changed()
 
+    def _rescaled(self) -> None:
+        """The scale changed (the next window opens on a screen with another scaling) while this window is hidden:
+        it was built in advance, so it is built again."""
+        try:
+            if self.top.winfo_viewable():
+                return
+            for child in self.top.winfo_children():
+                child.destroy()
+            self._placed = False
+            self.top.minsize(px(520), px(400))
+            self.top.geometry(f"{px(680)}x{px(520)}")
+            self._build()
+        except tk.TclError:
+            log.debug("reminder window not rebuilt", exc_info=True)
+
     def show(self, attention: bool = False) -> bool:
+        if not self.top.winfo_viewable():
+            theme.adapt_to_monitor(self.root)  # sharp on the screen it comes up on
         self.refresh()
         if not self._alerts:
             return False
@@ -285,7 +363,8 @@ class ReminderWindow:
         self.top.lift()
         if attention:
             # put the (highest ranked) new reminder into the header; selecting it this way does not mark it seen
-            first_new = next((iid for iid in self.tree.get_children() if not self._alerts[iid].seen), None)
+            first_new = next((iid for iid in self.tree.get_children()
+                              if not all(a.seen for a in self._members.get(iid, ()))), None)
             if first_new:
                 self.tree.selection_set(first_new)
                 self.tree.focus(first_new)
@@ -365,9 +444,9 @@ class ReminderWindow:
 
     def _tick(self) -> None:
         self._tick_job = None
-        for iid, a in self._alerts.items():
+        for iid, when in self._when.items():
             if self.tree.exists(iid):
-                self.tree.set(iid, "occurred", theme.humanize(a.occurred_at or a.first_seen))
+                self.tree.set(iid, "occurred", theme.humanize(when))
         if self.visible:
             self._schedule_tick()
 
@@ -380,7 +459,7 @@ class ReminderWindow:
         self.stop_attention()
         sel = self._selected()
         if sel:
-            self.app.alerts.dismiss(a.id for a in sel)
+            self.app.dismiss_alerts([a.id for a in sel], self.top)
             self._after_change()
 
     def dismiss_all(self) -> None:
@@ -397,10 +476,15 @@ class ReminderWindow:
             self._after_change()
 
     def open_selected(self) -> None:
+        """The details of the selected rows: an alert's details, an incident's own window."""
         self.stop_attention()
-        self.mark_seen(self._selected()[:5])
-        for alert in self._selected()[:5]:
-            self.open_details(alert)
+        rows = self._selected_rows()[:5]
+        self.mark_seen([a for row in rows for a in self._members[row]])
+        opener = getattr(self.app, "open_incident", None)
+        for row in rows:
+            inc = self._groups.get(row)
+            if inc is None or opener is None or not opener(inc.id):
+                self.open_details(self._alerts[row])
 
     def open_details(self, alert: Alert) -> None:
         win = self._details.get(alert.id)
@@ -409,7 +493,7 @@ class ReminderWindow:
             return
         self._details[alert.id] = DetailsWindow(
             self.root, self.app, alert,
-            on_dismiss=lambda a: (self.app.alerts.dismiss([a.id]), self._after_change()),
+            on_dismiss=lambda a: (self.app.dismiss_alerts([a.id], self.top), self._after_change()),
             on_snooze=lambda a: (self.app.alerts.snooze([a.id], self._snooze_minutes()), self._after_change()),
             snooze_label=self.snooze_var.get())
 

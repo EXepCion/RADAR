@@ -92,11 +92,12 @@ start when you log on and starts it. Remove that kind of installation with
 ## Signing in
 
 RADAR signs in silently with the account you are signed in to Windows with (through the Windows account broker),
-or with another account you choose under *Settings > Account*.
+or with another account you choose under *Settings > Account and connection*.
 
 To ask Microsoft Graph for data a program also needs an application identity. RADAR has none of its own - it is
-not a service, and nobody runs a shared registration for it. So **on its first start RADAR opens a set-up window**
-(later: *Settings > Account > Set-up and connection check*) where you choose how it signs in. It then signs in
+not a service, and nobody runs a shared registration for it. So **on its first start RADAR opens its window on the set-up page**
+(later: *Settings > Account and connection*) where you choose how it signs in. Until that has worked, the other
+sections of the window are switched off. It then signs in
 and tries, step by step, everything it needs to read - the sign-in log, the audit log, the accounts, the
 Conditional Access policies - and tells you in plain words what is missing (a role, a licence, admin consent) and
 what to do about it. *Check again* repeats the check, for example after a role was assigned. When everything
@@ -124,18 +125,20 @@ button that opens the connection check.
 
 ## First steps
 
-Everything is in the tray icon's menu (right-click the shield in the notification area).
+RADAR lives in the notification area. A click on the shield opens the RADAR window; a right-click gives the short
+menu: *Open RADAR*, *Show reminders*, *Live map*, *Scan now*, *Pause monitoring*, *Settings*, *Exit*. Everything
+else is in the RADAR window (*Open RADAR*), under *Settings*:
 
-1. **Settings > Offices...** - the public IP addresses your sites sign in from. Sign-ins from there count as "in
-   the office": the rules trust them and the map shows the office. The window proposes addresses many people sign
+1. **Settings > Offices** - the public IP addresses your sites sign in from. Sign-ins from there count as "in
+   the office": the rules trust them and the map shows the office. The page proposes addresses many people sign
    in from.
-2. **Settings > Virtual desktops...** - Citrix, Azure Virtual Desktop and shared servers. A sign-in from one says
-   where the machine is, not where the person is; travel rules and the map ignore it. The window proposes
+2. **Settings > Virtual desktops** - Citrix, Azure Virtual Desktop and shared servers. A sign-in from one says
+   where the machine is, not where the person is; travel rules and the map ignore it. The page proposes
    candidates.
 3. **Settings > Detection** - switch whole functions or single rules on and off.
    One rule depends on a setting in Entra: *MFA prompt reported by the user* only works when *Report suspicious
    activity* is switched on there (Entra ID > Authentication methods > Settings). The connection check tells you,
-   and the rule's menu entry says when it is inactive.
+   and the rule's line says when it is inactive.
 4. **Settings > Advanced > Edit settings file** - everything else (thresholds, allowed countries, break-glass
    accounts, accounts pinned to fixed addresses, retention times). Changes apply when the file is saved.
 
@@ -144,18 +147,25 @@ failed, blue while scanning, grey while paused.
 
 ## The windows
 
+The **RADAR window** has a navigation on the left - *Incidents*, *Ongoing attacks*, *Alert history*, *Reports*,
+*Live map* - and *Settings* at the bottom; its lower left corner shows what RADAR is doing and who it is signed in
+as. The reminders, the details of an alert and the live map are windows of their own.
+
 - **Reminders** - comes up when a new alert arrives, flashes until you touch it, plays a sound on the default
   playback device unless that device is muted. *Open item* shows the details: what happened, the risk assessment
   factor by factor, the evidence rows, the recommended action and links into the Entra admin center. *Dismiss* and
-  *Snooze* hide a reminder; it returns by itself if it gets worse.
-- **Incidents** - alerts that belong to one story (the same account or the same attacker address, within days)
-  as one line each, with the story as a timeline: what happened in which order, which accounts and addresses are
-  involved, what was already done. The open reminders of an incident can be dismissed together.
+  *Snooze* hide a reminder; it returns by itself if it gets worse. Alerts that belong to one incident are one
+  row there: opened, snoozed and dismissed as one.
+- **Incidents** - alerts that belong to one story (the same account or the same attacker address, within days),
+  the most urgent first. For the chosen one: how far along an attack it is and when each stage was reached, which
+  accounts and addresses are involved, what was already done, its strongest finding, what to do, and its alerts
+  in order. A double-click opens the incident in a window of its own, with the risk assessment of each alert; its
+  open reminders are snoozed or dismissed together.
 - **Alert history** - every alert RADAR still keeps (90 days), with filters and a search box. *Reactivate* brings a
   dismissed alert back.
 - **Ongoing attacks** - password guessing, known passwords, stolen sessions and the attacking addresses, computed
   from the local history each time, independent of what you dismissed.
-- **MFA exposure report** - all accounts that can sign in without MFA, with clean-up hints.
+- **Reports** - the MFA exposure report: all accounts that can sign in without MFA, with clean-up hints.
 - **Live map** - offices and towns with the number of people signed in, password attacks as arrows, a feed of
   sign-ins, attacks and account events (password resets, MFA methods, reported MFA prompts, devices, accounts,
   admin roles). Click a
@@ -194,7 +204,7 @@ There is no telemetry. RADAR talks to:
 |---|---|---|
 | Microsoft (sign-in service and Microsoft Graph) | the sign-in and the queries that read your tenant's logs and directory. The sign-in token is sent to `graph.microsoft.com` only. | - |
 | RIPEstat (`stat.ripe.net`) | the number of a network (AS number) that sign-ins came from and RADAR does not know yet, to get the network's registered name. No address, no account, nothing else. | `lookup_asn_names: false` in the settings file |
-| GitHub (`api.github.com`) | once a day: "what is the latest release of RADAR?" (see below) | *Settings > Check for new versions* |
+| GitHub (`api.github.com`) | once a day: "what is the latest release of RADAR?" (see below) | *Settings > Appearance and start* |
 | AbuseIPDB, ipinfo.io, Microsoft's admin portals | only when **you** click such a link in an alert: your browser opens the page, with the IP address or network number in the address. | do not click |
 
 ## New versions
@@ -202,8 +212,7 @@ There is no telemetry. RADAR talks to:
 Once a day RADAR asks GitHub for the latest release of RADAR (one request to `api.github.com`; nothing about you
 or your tenant is in it). When a newer version exists, a notification says so - a click on it opens the release
 page in your browser - and the tray menu shows "New version ... available" until you have updated. Switch the
-check off under *Settings > Check for new versions*; *Settings > Advanced > Look for a new version now* checks at
-once.
+check off under *Settings > Appearance and start*; *Look now* on the same page checks at once.
 
 RADAR does not update itself. The release files are not code-signed, and a program that downloads and runs
 unsigned programs on its own would be a weak spot in a security tool. To update, download the new installer and
@@ -211,8 +220,8 @@ run it; it replaces the program and keeps your settings and data.
 
 ## Writing your own check (plugin)
 
-Put a `.py` file into `%LOCALAPPDATA%\RADAR\plugins` and choose *Settings > Advanced > Reload plugins*. The file
-then appears in the *Plugins* menu as "(new) ...: allow it to load"; RADAR does not run a file from that folder
+Put a `.py` file into `%LOCALAPPDATA%\RADAR\plugins` and choose *Settings > Plugins > Reload plugins*. The file
+then appears on that page as new, with *Allow it to load*; RADAR does not run a file from that folder
 before you have said yes to it there. Once allowed, every `radar.plugin_api.Plugin` subclass in it is picked up:
 
 ```python
@@ -273,7 +282,7 @@ RADAR gets better with reports from tenants that are not like the one it was bui
 - a window or the map behaved oddly,
 - you have an idea for a check or an improvement.
 
-Say which version you use (tray menu) and what you saw. **Take out names, addresses and tenant IDs before you
+Say which version you use (*Settings*, lower left) and what you saw. **Take out names, addresses and tenant IDs before you
 post** - an issue is public; the log file and screenshots usually contain them. There is no promise of an answer
 or a fix, but every report is read.
 

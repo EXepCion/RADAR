@@ -7,11 +7,16 @@ from typing import Callable
 
 ASC, DESC = " ▲", " ▼"
 _NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_SEVERITY = re.compile(r"(info|low|medium|high)(?:\s*\u00b7\s*(\d+))?", re.IGNORECASE)  # "High" or "High, with its score"
+_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3}
 
 
 def sort_key(value: str) -> tuple:
     """Numbers sort numerically and before text; everything else case-insensitively (ISO dates sort correctly)."""
     text = (value or "").strip()
+    level = _SEVERITY.fullmatch(text)
+    if level:  # by how bad, then by the risk score - not by the alphabet
+        return (0, _RANK[level.group(1).lower()] * 1000.0 + float(level.group(2) or 0), "")
     compact = text.replace("'", "").replace(",", "").replace(" ", "")
     if _NUMBER.fullmatch(compact):
         return (0, float(compact), "")

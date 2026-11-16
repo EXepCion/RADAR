@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
 
+from ...correlation import REPORT_SIGNAL
 from ...plugin_api import Finding, Rule, Severity
 from . import indicators, netintel
 from .history import SignInHistory
@@ -333,7 +334,9 @@ def risky_signin(rc: RuleContext) -> list[Finding]:
             continue
         extra = [Factor(-15, "Risk remediated (MFA / password change completed)")] if s.risk_state == "remediated" else []
         # Entra flagged it: never drop below Low, but let context rank it.
-        groups[(s.user_id or s.who, _day(s.created))].append((s, rc.assessor.assess(s, base, reason, extra, floor=30)))
+        groups[(s.user_id or s.who, _day(s.created))].append((s, rc.assessor.assess(
+            s, base, reason, extra, floor=30, covers=("risk_rating",),
+            floor_reason="Entra ID Protection flagged it - confirm it safe or compromised there")))
     out = []
     for (user, day), items in groups.items():
         signins = [s for s, _ in items]
@@ -358,6 +361,39 @@ def risky_signin(rc: RuleContext) -> list[Finding]:
                               "compromise, revoke sessions and reset the password; otherwise confirm safe."),
             links=_user_links(s) + [("Entra: risky sign-ins", RISKY_SIGNINS_URL)],
         ))
+    return out
+
+
+def fold_same_signin(findings: list[Finding]) -> list[Finding]:
+    """A sign-in that Entra ID Protection rates risky AND that is the first from a new country is one event: it is
+    reported once, as the risky sign-in, which says so and counts it. The new-country finding is left out (and an
+    alert it already has is closed into this one)."""
+    def ids(f: Finding, ending: str = "") -> set[str]:
+        return {r["Sign-in ID"] for r in f.evidence if r.get("Sign-in ID") and str(r.get("Location", "")).endswith(ending)}
+
+    risky = [f for f in findings if f.rule_id == "risky_signin"]
+    out = []
+    for f in findings:
+        country = f.fields.get("Country", "")
+        host = next((r for r in risky if f.rule_id == "new_country" and country
+                     and r.fields.get("User") == f.fields.get("User") and ids(r) & ids(f, f", {country}")), None)
+        if host is None:
+            out.append(f)
+            continue
+        why = next((text for _points, text in f.factors), f"First sign-in from {country}")
+        # where a cloud, VPN or hosting address is counted to says nothing about where the person is: the network
+        # is already counted, the country is named only
+        elsewhere = any(str(text).split(" network: ")[0].lower() in netintel.ASN_CATEGORY_POINTS
+                        for _points, text in host.factors if " network: " in str(text))
+        points = 0 if elsewhere else 10
+        host.factors = list(host.factors) + [(points, f"{why} - the same sign-in" + (
+            " (the country of such a network's address says little: not counted)" if elsewhere else ""))]
+        host.score = min(100, (host.score or 0) + points)
+        host.severity = severity_for(host.score)
+        label = host.fields.get("Risk score", "").partition("/100")[2]
+        host.fields["Risk score"] = f"{host.score}/100{label}"
+        host.fields["New country"] = why
+        host.supersedes = list(host.supersedes) + [f.key]
     return out
 
 
@@ -458,10 +494,82 @@ def _iso_week(dt: datetime) -> str:
     return f"{year}-W{week:02d}"
 
 
-def distributed_attack(rc: RuleContext) -> list[Finding]:
+ATTACK_ADVICE = ("The attacker is guessing the password from rotating proxy IPs. Make sure MFA is enforced for "
+                 "this account (ideally phishing-resistant), reset the password if it may be reused or leaked, "
+                 "and consider blocking admin tools (Azure AD PowerShell / Azure CLI) for non-admins with "
+                 "Conditional Access. Smart Lockout may also lock the user out from unfamiliar locations.")
+
+
+@dataclass
+class _Target:
+    """One account of a rotating-IP attack, as the rule worked it out."""
+    user_id: str
+    who: str
+    upn: str
+    finding: Finding
+    failures: list[SignIn]
+    flagged: int
+    tools: Counter
+    account: list[Factor]   # what the account itself adds (no MFA, admin ...)
+    disabled: bool
+    plain: bool             # every attempt failed at the password, and nobody is locked out or reported a prompt
+
+
+def _campaign(rc: RuleContext, targets: list[_Target], disabled: list[_Target], hours: int) -> Finding:
+    """One alert for a campaign that guesses at several accounts and got nowhere with any of them."""
+    failures = [s for t in targets for s in t.failures]
+    ips, networks = {s.ip for s in failures}, {s.asn for s in failures if s.asn}
+    countries = Counter(s.country for s in failures if s.country)
+    lead = max(targets, key=lambda t: (sum(f.points for f in t.account), len(t.failures)))  # the most exposed account
+    factors = [Factor(40, f"{len(failures)} failed passwords against {len(targets)} accounts from {len(ips)} IPs, "
+                          f"{len(networks)} networks, {len(countries)} countries in {hours} h")]
+    flagged = sum(t.flagged for t in targets)
+    if flagged:
+        factors.append(Factor(10, f"Entra ID Protection flagged {flagged} attempt(s) as risky"))
+    tools = sum((t.tools for t in targets), Counter())
+    if tools:
+        factors.append(Factor(10, "Attack-tool fingerprints: " + ", ".join(f"{t} x{n}" for t, n in tools.most_common(4))))
+    factors.append(Factor(-10, "Every attempt failed at the password (Smart Lockout is blocking)"))
+    factors.extend(Factor(f.points, f"Most exposed account {lead.who}: {f.text}") for f in lead.account)
+    score = max(0, min(100, sum(f.points for f in factors)))
+    names = sorted(t.who for t in targets)
+    shown = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+    fields = {"Accounts": ", ".join(names)[:400],
+              "Per account": "\n".join(f"{t.who}: {len(t.failures)} attempts from {len({s.ip for s in t.failures})} IPs"
+                                       for t in sorted(targets, key=lambda t: -len(t.failures)))[:900],
+              "Failed attempts": str(len(failures)), "Distinct IPs": str(len(ips)),
+              "Top countries": ", ".join(f"{c} ({n})" for c, n in countries.most_common(6)),
+              "Targeted apps": ", ".join(f"{app} ({n})" for app, n in Counter(s.app for s in failures).most_common(4))}
+    if disabled:
+        fields["Disabled accounts also tried"] = ", ".join(sorted(t.who for t in disabled))[:300]
+    share = max(3, MAX_EVIDENCE // len(targets))  # every account is seen in the evidence
+    rows = [s for t in targets for s in sorted(t.failures, key=lambda s: s.created, reverse=True)[:share]]
+    return _scored(
+        Assessment(score=score, factors=factors, label="", context=""),
+        key=f"dpa-campaign|{_iso_week(rc.now)}", rule_id="distributed_attack",
+        title=f"Password attack from rotating IPs on {len(targets)} accounts: {shown}",
+        summary=(f"One campaign is guessing passwords of {len(targets)} accounts from {len(ips)} different IPs in "
+                 f"{len(countries)} countries (about one attempt per IP, typical of residential-proxy botnets). "
+                 f"All attempts failed at the password."
+                 + (f" {len(disabled)} disabled account(s) are tried as well: nothing can come of that."
+                    if disabled else "")),
+        occurred_at=min(s.created for s in failures),
+        fields=fields, subjects=sorted({t.upn.lower() for t in targets if "@" in t.upn}),
+        evidence=_evidence(rows), recommendation=ATTACK_ADVICE.replace("this account", "these accounts"),
+        links=_user_links(lead.failures[0]),
+        supersedes=[t.finding.key for t in targets + disabled],
+    )
+
+
+def distributed_attack(rc: RuleContext, merge: bool = True) -> list[Finding]:
     """Low-and-slow password guessing against one account from rotating (residential proxy) IPs.
 
     Per-IP rules (spray) and per-hour rules (brute force) miss it: every IP tries ~once.
+
+    One campaign usually guesses at several accounts. Where it got nowhere, that is ONE thing to know and to handle:
+    such accounts are reported together (``merge``), a disabled account among them as a line - nothing can come of
+    guessing at it. An account where something happened (the password worked, a break-in, the person is locked
+    out, a prompt was reported) keeps an alert of its own.
     """
     cfg = rc.cfg("distributed_attack")
     window = timedelta(hours=float(cfg.get("window_hours", 72)))
@@ -474,6 +582,7 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
     targeted = rc.history.candidates(start, end, FAILED_PASSWORD_CODES, "user_id", min_ips)  # cheap pre-filter
     scope: dict[str, str] = {}
     out = []
+    targets: list[_Target] = []
     for user_id in targeted:
         acct = rc.accounts.get(user_id) if rc.accounts else None
         if acct and acct.mfa_excluded and rc.rule_on("mfa_exempt_watch"):
@@ -489,7 +598,7 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
         if len(failures) < min_failures or len(ips) < min_ips:
             continue
         scope[user_id] = failures[0].who
-        if user_id not in users:
+        if user_id not in users and not merge:
             continue  # nothing new for this account in this run; only counted for campaign scope
         # A correct password from the user's own IP/network (or followed by his completed sign-in from the same
         # IP) is the user answering an MFA prompt, not the attacker - e.g. after a password reset. An unknown
@@ -540,8 +649,12 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
         if reported:
             factors.append(Factor(25, f"The person reported an MFA prompt as not theirs "
                                       f"({reported[-1].created.astimezone():%d.%m. %H:%M}): the password is known"))
-        if acct:
-            factors.extend(Assessor.account_factors(acct, failures[0]))
+        account_factors = Assessor.account_factors(acct, failures[0]) if acct else []
+        factors.extend(account_factors)
+        off = bool(acct and not acct.enabled)
+        plain = not (past_password or break_ins or locked_out or reported)
+        if merge and off and plain:
+            factors.append(Factor(-30, "Only tried, and the account is disabled: nothing can come of it"))
         score = max(0, min(100, sum(f.points for f in factors)))
         a = Assessment(score=score, factors=factors, label="", context=acct.context(rc.now) if acct else "")
         first = failures[0]
@@ -553,7 +666,7 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
             fields["Not counted"] = (f"{len(own_prompts)} MFA prompt(s) from the user's own IP/network "
                                      f"({', '.join(sorted({f'{s.app} from {s.ip}' for s in own_prompts})[:3])}): "
                                      f"the user signing in, not the attacker")
-        out.append(_scored(
+        targets.append(_Target(user_id, first.who, first.upn or first.who, _scored(
             a, key=f"dpa|{user_id}|{_iso_week(rc.now)}", rule_id="distributed_attack",
             title=(f"Password attack {'got past the password' if past_password else 'with possible break-in' if break_ins else 'locked the person out' if locked_out else 'from rotating IPs'}: "
                    f"{first.who}"),
@@ -567,16 +680,30 @@ def distributed_attack(rc: RuleContext) -> list[Finding]:
             occurred_at=min(s.created for s in failures),
             fields=fields,
             evidence=_evidence(break_ins + past_password + locked_out + failures),
-            recommendation=("The attacker is guessing the password from rotating proxy IPs. Make sure MFA is enforced for "
-                            "this account (ideally phishing-resistant), reset the password if it may be reused or leaked, "
-                            "and consider blocking admin tools (Azure AD PowerShell / Azure CLI) for non-admins with "
-                            "Conditional Access. Smart Lockout may also lock the user out from unfamiliar locations."),
+            recommendation=ATTACK_ADVICE,
             links=_user_links(first),
-        ))
+        ), failures, flagged, tools, account_factors, off, plain))
     if len(scope) > 1:
-        for f in out:
-            others = sorted(name for uid, name in scope.items() if name != f.fields["Account"])
-            f.fields["Same campaign also targets"] = ", ".join(others)
+        for t in targets:
+            others = sorted(name for uid, name in scope.items() if name != t.finding.fields["Account"])
+            t.finding.fields["Same campaign also targets"] = ", ".join(others)
+    if not merge:
+        return [t.finding for t in targets]
+    quiet = [t for t in targets if t.plain]
+    live = [t for t in quiet if not t.disabled]
+    dead = [t for t in quiet if t.disabled]
+    out = [t.finding for t in targets if not t.plain and t.user_id in users]
+    if any(t.user_id in users for t in quiet):  # something new in this run
+        if len(live) >= 2:
+            out.append(_campaign(rc, live, dead, int(window.total_seconds() // 3600)))
+        elif live:
+            f = live[0].finding
+            if dead:
+                f.fields["Disabled accounts also tried"] = ", ".join(sorted(t.who for t in dead))[:300]
+                f.supersedes = [t.finding.key for t in dead]
+            out.append(f)
+        else:
+            out.extend(t.finding for t in dead if t.user_id in users)  # logged only (below Low)
     return out
 
 
@@ -738,6 +865,23 @@ def new_country(rc: RuleContext) -> list[Finding]:
     return out
 
 
+OWN_DEVICE = "Known device of the user"
+OWN_NETWORKS = ("User's usual network", "Habitual network of the user")
+
+
+def _background_assessment(rc: RuleContext, s: SignIn, why: str) -> Assessment:
+    """Background activity abroad stays at least Low - except on a device the person has long used AND a network
+    they use anyway: that is their phone or laptop, wherever the address is counted to. It is logged only."""
+    a = rc.assessor.assess(s, 25, why)
+    texts = [f.text for f in a.factors]
+    own = any(t.startswith(OWN_DEVICE) for t in texts) and any(t.startswith(OWN_NETWORKS) for t in texts)
+    if own:
+        a.factors.append(Factor(0, "The person's own device on a network they use anyway: logged only"))
+    else:
+        a.score = max(25, a.score)
+    return a
+
+
 def new_country_background(rc: RuleContext) -> list[Finding]:
     """Background activity (no sign-in by hand) from a country the account was not seen in: a phone or laptop
     travelling - or a sign-in token of the account in use somewhere else. new_country only sees sign-ins by hand."""
@@ -765,7 +909,7 @@ def new_country_background(rc: RuleContext) -> list[Finding]:
             continue  # signed in by hand from there as well: that is new_country's alert
         usual = ", ".join(c for c, _ in baseline.most_common(5))
         why = f"First activity from {country} (usually {usual}), in the background only"
-        s, a = _best([(x, rc.assessor.assess(x, 25, why, floor=25)) for x in items])
+        s, a = _best([(x, _background_assessment(rc, x, why)) for x in items])
         devices = sorted({x.device_name or " ".join(p for p in (x.os, x.browser) if p) or "unidentified device" for x in items})
         out.append(_scored(
             a, key=f"country-bg|{user_id}|{country}", rule_id="new_country_background",
@@ -796,7 +940,8 @@ def legacy_auth(rc: RuleContext) -> list[Finding]:
         groups[(s.user_id or s.who, s.client_app, _day(s.created))].append(s)
     out = []
     for (user, client, day), items in groups.items():
-        s, a = _best([(x, rc.assessor.assess(x, 45, f"Legacy protocol {client} (cannot enforce MFA)", floor=35))
+        s, a = _best([(x, rc.assessor.assess(x, 45, f"Legacy protocol {client} (cannot enforce MFA)", floor=35,
+                                             floor_reason="a protocol without MFA stays worth knowing wherever it is used"))
                       for x in items])
         out.append(_scored(
             a, key=f"legacy|{user}|{client}|{day}", rule_id="legacy_auth",
@@ -860,7 +1005,25 @@ def device_code(rc: RuleContext) -> list[Finding]:
     out = []
     for (user, protocol, day), items in groups.items():
         what = "Device code" if protocol == "devicecode" else "ROPC (password-only)"
-        s, a = _best([(x, rc.assessor.assess(x, 40, f"{what} sign-in", floor=30)) for x in items])
+        # The flow is the finding: it is counted once, in the base (ROPC cannot ask for MFA at all, hence more).
+        base, why, covers = ((55, "Device code sign-in (the code can be handed to someone else: token phishing)", ("flow",))
+                             if protocol == "devicecode" else
+                             (65, "ROPC sign-in: the password alone, MFA cannot be asked for in this flow",
+                              ("flow", "password_only")))
+
+        def office(x: SignIn) -> tuple[int, str] | None:
+            # A password-only flow on an admin account that needs no MFA: whoever has the password has the role. Being
+            # in the office takes little off that - the flow is there for scripts, and the password sits in one.
+            acct = rc.accounts.get(x.user_id) if rc.accounts else None
+            if protocol == "ropc" and acct and acct.mfa_excluded and acct.privileged_tier:
+                return -10, "counts for little here: an admin account without MFA whose password sits in a script"
+            return None
+
+        s, a = _best([(x, rc.assessor.assess(
+            x, base, why, floor=30, covers=covers, office=office(x),
+            floor_reason=("with a phished code the sign-in is always completed in the victim's own browser, on their "
+                          "own device and network - that cannot clear it" if protocol == "devicecode"
+                          else "a sign-in with the password alone stays worth knowing"))) for x in items])
         out.append(_scored(
             a, key=f"devicecode|{user}|{day}" if protocol == "devicecode" else f"ropc|{user}|{day}",
             rule_id="device_code",
@@ -1108,7 +1271,9 @@ def sensitive_app(rc: RuleContext) -> list[Finding]:
             a = rc.assessor.assess(s, 30, f"First use of {what} by this user (admin / recon tool)")
         elif s.resource_id == netintel.DEVICE_REGISTRATION_RESOURCE:
             what = "Device registration"
-            a = rc.assessor.assess(s, 35, "Registered/joined a device to Entra ID (persistence after phishing)")
+            # (the device that is being registered has no identity yet: that it has none says nothing)
+            a = rc.assessor.assess(s, 35, "Registered/joined a device to Entra ID (persistence after phishing)",
+                                   covers=("device_identity",))
         else:
             continue
         groups[(s.user_id, what, _day(s.created))].append((s, a))
@@ -1420,10 +1585,9 @@ def mfa_exposure_report(rc: RuleContext) -> list[Finding]:
                f"{candidates} to review" + (f", {attacked} UNDER ATTACK" if attacked else "")),
         summary=(f"{len(excluded)} accounts are excluded from MFA ({groups}) and {len(gaps)} enabled accounts have no "
                  f"MFA method registered - whoever knows their password can register their own. Clean-up candidates: "
-                 f"{candidates} ({', '.join(f'{n} {k}' for k, n in flagged.most_common())}). Open the item for the "
-                 f"full list (the weekly reminder keeps the first {MAX_EVIDENCE} rows; tray > MFA exposure report... "
-                 f"lists all)."),
-        occurred_at=rc.now,
+                 f"{candidates} ({', '.join(f'{n} {k}' for k, n in flagged.most_common())}). RADAR > Reports "
+                 f"lists them all (this weekly record keeps the first {MAX_EVIDENCE} rows)."),
+        occurred_at=rc.now, signal=REPORT_SIGNAL,  # kept for RADAR > Reports, never a reminder
         fields={"Excluded via": groups, "Excluded from MFA": str(len(excluded)), "No MFA registered": str(len(gaps)),
                 "To review": str(candidates), "Under password attack": str(attacked)},
         evidence=rows,
@@ -1956,7 +2120,7 @@ RULES: list[RuleDef] = [
     RuleDef(Rule("mfa_exempt_watch", "MFA-excluded accounts (strict)",
                  "Accounts that can sign in without MFA: any deviation from their 30-day pattern"), mfa_exempt_watch),
     RuleDef(Rule("mfa_exposure_report", "MFA exposure report: weekly reminder",
-                 "Overview of accounts without MFA with clean-up candidates (on demand: tray > MFA exposure report...)"),
+                 "Overview of accounts without MFA with clean-up candidates (on demand: RADAR > Reports)"),
             mfa_exposure_report),
     RuleDef(Rule("account_state", "Disabled / break-glass account sign-ins",
                  "Sign-ins of disabled accounts and of emergency access accounts"), account_state),

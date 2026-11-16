@@ -10,13 +10,21 @@ It is raised only if it starts with targeting / a known password and goes furthe
 least three stages - so "travelled abroad, then registered a passkey" (3 -> 4) stays quiet.
 
 In hindsight: a finding that was judged harmless on its own ("logged only", below Low) can still be a step of a
-chain that two real steps already make - it never starts one and never makes one by itself. Slow attacks: steps
+chain that two real steps already make - it never starts one and never makes one by itself. The same goes for
+guessing at an account that is disabled: it cannot get anywhere, so nothing follows from it. Slow attacks: steps
 normally follow each other within days; two steps that are each at least Medium may lie further apart.
 
+What the user dismissed: a step that was dismissed before the later steps were known counts in full - dismissing
+each step by itself is exactly how a chain gets overlooked. A step dismissed with the whole chain in view (after
+its last step was on screen) is settled: it keeps its place but weighs less, the chain is rated by its strongest
+step that is not settled, and a chain whose real steps are all settled is not raised.
+
 Across accounts (``spread_findings``): accounts are taken together when their alerts name the same known attacker
-address, or when an account that is itself under suspicion acted on another one (reset its MFA, gave it a role,
-invited it ...). The chain is then looked for over all their alerts - "A's password known, A resets B's MFA, B
-signs in from the attacker's address" is one story, not three.
+address, or when an account that is itself under real suspicion (its password is known, or an alert of at least
+Medium) acted on another one (reset its MFA, gave it a role, invited it ...). What an administrator does ABOUT an
+account - disabling it, enabling it again, revoking its sessions - is the answer to an attack and ties nobody
+together. The chain is then looked for over all their alerts - "A's password known, A resets B's MFA, B signs in
+from the attacker's address" is one story, not three.
 """
 from __future__ import annotations
 
@@ -48,7 +56,7 @@ RULE_STAGES = {
     # 2 - the password is known
     "password_not_completed": 2, "mfa_fatigue": 2, "mfa_report": 2,
     # 3 - a sign-in that may not be the user
-    "risky_signin": 3, "new_country": 3, "impossible_travel": 3, "session_theft": 3, "aitm_replay": 3, "signin_wave": 3,
+    "risky_signin": 3, "new_country": 3, "new_country_background": 3, "impossible_travel": 3, "session_theft": 3, "aitm_replay": 3, "signin_wave": 3,
     "device_code": 3, "new_shared_ip": 3, "account_state": 3, "pinned_accounts": 3, "legacy_auth": 3,
     # 4 - staying in / getting data out
     "mfa_change": 4, "sensitive_app": 4, "consent_grant": 4, "app_credentials": 4, "guest_invites": 4,
@@ -59,6 +67,11 @@ RULE_STAGES = {
 # signals that are reactions / records, not attacker steps
 OWN_PROMPT_MARK = "(probably their own sign-in)"  # set by the mfa_report rule
 NOT_LINKS = {"account_disabled", "account_enabled", "support_case", "sessions_revoked", "password_reset"}
+# what is done ABOUT an account never ties the one who did it to that account (a password reset can: an attacker
+# in an admin's account resets passwords to get into other accounts)
+NOT_ACTIONS = NOT_LINKS - {"password_reset"}
+DISMISSED = "dismissed"
+DISABLED_MARK = "Account is disabled (attempts cannot succeed)"  # written by the sign-in checks (scoring.py)
 
 
 @dataclass(frozen=True)
@@ -73,6 +86,14 @@ class Link:
     rule: str = ""
     weak: bool = False             # judged harmless on its own (below Low): only counts inside a chain
     subject: str = ""
+    seen: datetime | None = None          # when RADAR first showed it
+    dismissed_at: datetime | None = None  # when the user dismissed it (None: not dismissed)
+
+    def dismissed_since(self, when: datetime | None) -> bool:
+        """Dismissed by the user, and that at or after ``when`` (None: whenever)."""
+        if self.status != DISMISSED:
+            return False
+        return when is None or self.dismissed_at is None or self.dismissed_at >= when
 
     @property
     def end(self) -> datetime:
@@ -125,11 +146,14 @@ def links_by_subject(alerts: Iterable, now: datetime, lookback_days: int = LOOKB
             continue
         if stage == 3 and _only_failures(a.evidence):
             stage = 1  # blocked attempts (e.g. a risky sign-in that failed) are targeting, not access
+        # guessing at a disabled account cannot get anywhere: no start of a chain
+        pointless = stage == 1 and any(DISABLED_MARK in str(reason) for _points, reason in a.factors)
         for subject in a.subjects:
             if "@" in subject:
                 out.setdefault(subject, []).append(
                     Link(a.when, stage, score, a.title, a.status, a.key, _last_activity(a), a.rule_id,
-                         weak=score < MIN_LINK_SCORE, subject=subject))
+                         weak=score < MIN_LINK_SCORE or pointless, subject=subject,
+                         seen=getattr(a, "first_seen", None), dismissed_at=getattr(a, "dismissed_at", None)))
     return out
 
 
@@ -165,19 +189,66 @@ def is_attack_chain(chain: list[Link]) -> bool:
         return False  # one rule seeing one thing evolve already reminds on its own (e.g. break-glass attempts + use)
     if not chain or chain[0].weak or sum(1 for x in chain if not x.weak) < 2:
         return False  # harmless-looking findings only complete a chain that two real steps already make
+    done = settled(chain)
+    if all(x.key in done for x in chain if not x.weak):
+        return False  # every real step was dismissed with the whole chain in view: nothing new to show
     return len(stages) >= 2 and (stages[0] <= 2 and stages[-1] >= 3 or len(stages) >= 3)
+
+
+def settled(chain: list[Link]) -> set[str]:
+    """Keys of the steps the user dismissed with the whole chain in view: after its last step was on screen."""
+    shown = [x.seen for x in chain if x.seen is not None]
+    complete = max(shown) if shown else None
+    return {x.key for x in chain if x.dismissed_since(complete)}
+
+
+def _leading(chain: list[Link]) -> Link:
+    """The step the chain is rated by: its strongest one that is not settled (else simply the strongest)."""
+    done = settled(chain)
+    return max([x for x in chain if x.key not in done] or chain, key=lambda x: x.score)
+
+
+def _step_points(x: Link, done: set[str]) -> int:
+    return WEAK_STEP_POINTS if x.weak or x.key in done else STEP_POINTS
 
 
 def chain_score(chain: list[Link]) -> int:
     stages = {x.stage for x in chain}
-    strongest = max(x.score for x in chain)
-    weak = sum(1 for x in chain if x.weak)
-    score = strongest + STEP_POINTS * (len(chain) - 1 - weak) + WEAK_STEP_POINTS * weak
+    lead, done = _leading(chain), settled(chain)
+    strongest = lead.score
+    score = strongest + sum(_step_points(x, done) for x in chain if x is not lead)
     if 2 in stages and stages & {3, 4}:
         score += 10  # the password was known AND something happened afterwards
     if len(chain) == 2:
         score = min(score, max(69, strongest))  # two steps: Medium, unless one step is High on its own
     return max(25, min(100, score))
+
+
+def _step_factors(chain: list[Link]) -> list[tuple[int, str]]:
+    """How the rating comes about: the leading step, then what each other step adds."""
+    lead, done = _leading(chain), settled(chain)
+    out = [(lead.score, f"Strongest step still open: {STAGE_NAMES[lead.stage]} - {lead.title}"
+            if done else "Strongest single step")]
+    for i, x in enumerate(chain, 1):
+        if x is lead:
+            continue
+        note = " (harmless on its own)" if x.weak else " (dismissed with the chain in view)" if x.key in done else ""
+        out.append((_step_points(x, done), f"Step {i}: {STAGE_NAMES[x.stage]} - {x.title}{note}"))
+    if 2 in {x.stage for x in chain} and {3, 4} & {x.stage for x in chain}:
+        out.append((10, "Password known, then further activity"))
+    return out
+
+
+def _step_rows(chain: list[Link], owners: dict[str, set[str]] | None = None) -> list[dict[str, str]]:
+    """The steps as evidence rows. ``_key`` names the alert behind a step (hidden in the UI)."""
+    rows = []
+    for x in chain:
+        row = {"Time": x.when.astimezone().strftime("%Y-%m-%d %H:%M"), "Stage": f"{x.stage} {STAGE_NAMES[x.stage]}"}
+        if owners is not None:
+            row["Account"] = ", ".join(sorted(owners[x.key]))
+        row.update({"Step": x.title, "Score": str(x.score), "Reminder": x.status, "_key": x.key})
+        rows.append(row)
+    return rows
 
 
 def chain_findings(alerts: Iterable, now: datetime) -> list[Finding]:
@@ -206,18 +277,12 @@ def chain_findings(alerts: Iterable, now: datetime) -> list[Finding]:
                      f"{max(1, (chain[-1].when - chain[0].when).days)} day(s), in the order of an account takeover: "
                      f"{steps}. Each step alone may look harmless or was dismissed; together they deserve a look."),
             occurred_at=chain[0].when,
-            factors=[(max(x.score for x in chain), "Strongest single step")]
-                    + [(WEAK_STEP_POINTS if x.weak else STEP_POINTS,
-                        f"Step {i + 1}: {STAGE_NAMES[x.stage]} - {x.title}" + (" (harmless on its own)" if x.weak else ""))
-                       for i, x in enumerate(chain[1:], 1)]
-                    + ([(10, "Password known, then further activity")]
-                       if 2 in {x.stage for x in chain} and {3, 4} & {x.stage for x in chain} else [])
+            factors=_step_factors(chain)
                     + ([(-15, "Sessions were revoked after the last step (handled?)")] if handled else []),
             fields={"Account": subject, "Chain": steps,
                     "From / to": f"{chain[0].when.astimezone():%d.%m. %H:%M} - {chain[-1].end.astimezone():%d.%m. %H:%M}",
                     **({"Sessions revoked": revs[-1].astimezone().strftime("%d.%m. %H:%M")} if revs else {})},
-            evidence=[{"Time": x.when.astimezone().strftime("%Y-%m-%d %H:%M"), "Stage": f"{x.stage} {STAGE_NAMES[x.stage]}",
-                       "Step": x.title, "Score": str(x.score), "Reminder": x.status} for x in chain],
+            evidence=_step_rows(chain),
             recommendation=("Check whether these steps belong together. If the account was not used by its owner in "
                             "this way: revoke sessions, reset the password, review MFA methods, app consents, inbox "
                             "rules and recent role changes of the account."),
@@ -259,9 +324,14 @@ def connected_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> l
         accounts = [s for s in a.subjects if "@" in s]
         for ip in attacker_addresses(a):
             by_address.setdefault(ip, set()).update(accounts)
+        if a.signal in NOT_ACTIONS:
+            continue  # an administrator answering an attack (account disabled ...) does not join it
         actors = {e for f in ACTOR_FIELDS for e in _emails((a.fields or {}).get(f))}
         for actor in actors:
-            suspected = any(l.stage >= 2 and not l.weak and l.when <= a.when + ORDER_TOLERANCE
+            # under real suspicion: the password is known, or an alert of at least Medium that was not dismissed
+            suspected = any((l.stage == 2 or (l.stage >= 3 and l.score >= STRONG_SCORE)) and not l.weak
+                            and not l.dismissed_since(getattr(a, "first_seen", None))
+                            and l.when <= a.when + ORDER_TOLERANCE
                             and a.when - l.end <= SLOW_STEP_GAP and l.key != a.key for l in by_subject.get(actor, ()))
             if suspected:
                 for target in accounts:
@@ -305,18 +375,10 @@ def spread_findings(alerts: Iterable, now: datetime) -> list[Finding]:
                      f"{steps}. The accounts belong together because their alerts name the same attacker address or "
                      f"because one of them, already under suspicion, acted on another."),
             occurred_at=chain[0].when,
-            factors=[(max(x.score for x in chain), "Strongest single step")]
-                    + [(WEAK_STEP_POINTS if x.weak else STEP_POINTS,
-                        f"Step {i + 1}: {STAGE_NAMES[x.stage]} - {x.title}" + (" (harmless on its own)" if x.weak else ""))
-                       for i, x in enumerate(chain[1:], 1)]
-                    + ([(10, "Password known, then further activity")]
-                       if 2 in {x.stage for x in chain} and {3, 4} & {x.stage for x in chain} else [])
-                    + [(SPREAD_POINTS, f"The steps run across {len(accounts)} accounts")],
+            factors=_step_factors(chain) + [(SPREAD_POINTS, f"The steps run across {len(accounts)} accounts")],
             fields={"Accounts": ", ".join(accounts)[:300], "Chain": steps,
                     "From / to": f"{chain[0].when.astimezone():%d.%m. %H:%M} - {chain[-1].end.astimezone():%d.%m. %H:%M}"},
-            evidence=[{"Time": x.when.astimezone().strftime("%Y-%m-%d %H:%M"), "Stage": f"{x.stage} {STAGE_NAMES[x.stage]}",
-                       "Account": ", ".join(sorted(owners[x.key])), "Step": x.title, "Score": str(x.score),
-                       "Reminder": x.status} for x in chain],
+            evidence=_step_rows(chain, owners),
             recommendation=("Treat these accounts as one incident. Start with the account of the first step: revoke its "
                             "sessions and reset its password, then undo what it did to the others (MFA methods, roles, "
                             "invitations) and check each of them the same way."),

@@ -157,6 +157,7 @@ class SignInThreatsPlugin(Plugin):
                                  ", ".join(sorted({f"{m.value} ({m.source})" for m in marked}))[:300])
             except Exception:
                 ctx.log.exception("Attacker addresses could not be worked out")
+            findings = rules.fold_same_signin(findings)  # one sign-in, one alert
             resolver.save()
             if ctx.rule_enabled("app_signins"):
                 findings.extend(self._app_signins(ctx, history, now))
@@ -464,7 +465,7 @@ class SignInThreatsPlugin(Plugin):
                     except Exception:
                         ctx.log.exception("Rule %s failed", rule.meta.id)
             resolver.save()
-            return findings
+            return rules.fold_same_signin(findings)
         finally:
             history.close()
 

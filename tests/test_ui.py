@@ -21,6 +21,11 @@ class FakeApp:
     def describe_origin(self, alert):
         return "test"
 
+    def dismiss_alerts(self, ids, parent=None):
+        ids = list(ids)
+        self.alerts.dismiss(ids)
+        return ids
+
     def play_reminder_sound(self):
         return False, "test"
 
