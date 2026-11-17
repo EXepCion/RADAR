@@ -192,6 +192,12 @@ def test_details_window_is_laid_out_before_it_is_shown(root):
         return [(w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for w in widgets] + [
             win.paned.sashpos(0)]
 
+    width, same, until = -1, 0, time.monotonic() + 3
+    while same < 8 and time.monotonic() < until:   # (a small screen cuts the window to its width a moment later)
+        root.update()
+        time.sleep(0.03)
+        same = same + 1 if win.top.winfo_width() == width else 0
+        width = win.top.winfo_width()
     first = places()
     end = time.monotonic() + 0.6
     while time.monotonic() < end:
