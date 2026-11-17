@@ -12,7 +12,7 @@ from radar.ui import theme
 
 NOW = datetime.now(timezone.utc)
 ANNA, BEA, CARL = "anna@contoso.com", "bea@contoso.com", "carl@contoso.com"
-ADDRESS = {chains.ATTACKER_ADDRESS_FIELD: "203.0.113.77 - a stolen session (anna@contoso.com, 08.11. 10:00)"}
+ADDRESS = {chains.ATTACKER_ADDRESS_FIELD: "203.0.113.77 - a stolen session (anna@contoso.com, 08.11. 10:00 UTC+1)"}
 
 
 def alert(key, rule, score, days_ago, user=ANNA, signal="", **fields):
@@ -129,17 +129,22 @@ def test_incident_window_shows_the_story_and_dismisses_it_as_one(root):
                 for i in win.tree.get_children("")]
         assert rows == [("High \u00b7 90", "anna, bea", "Persistence \u00b7 3/3 open"),   # how bad, who, how far
                         ("Medium \u00b7 45", "carl", "Suspicious access \u00b7 2/2 open")]
-        assert "2 incidents in the last 30 days: 2 open, 0 closed. Data as of" in win.summary.cget("text")
+        assert win.summary.cget("text").startswith("Last 30 days. Data as of ")      # (how many: on the buttons beside it)
         # the first incident is selected: its alerts in order, the cross-account chain among them
         steps = [(win.steps.set(i, "Stage"), win.steps.set(i, "Severity")) for i in win.steps.get_children("")]
         assert steps == [("Summary", "High"), ("Password known", "High"), ("Persistence", "Low")]   # what sums it up, then
         assert win.steps.heading("Time", "text").endswith("\u25b2")                                    # as it happened
-        # the chosen incident: its name (the stages are on the track, not in the name), why it is open (in the alarm
-        # colour), how far it got and when, what holds it together
-        assert win.title_label.cget("text") == f"Attack across 2 accounts: {ANNA}, {BEA}"
-        assert win.badge.cget("text") == "High \u00b7 90"
-        assert win.state_label.cget("text") == "Open \u00b7 3 of 3 alerts"
-        assert str(win.state_label.cget("foreground")) == theme.color("error")
+        # the chosen incident: who, how bad and how open is said once, in the list - the right side does not repeat it,
+        # an arrowhead at the height of the selected incident shows whose it is
+        root.update()
+        assert not win.title_label.winfo_ismapped() and not win.badge.winfo_ismapped() and not win.state_label.winfo_ismapped()
+        first, second = win.tree.get_children("")
+        assert win.pointer.shown_at == win.tree.row_middle(first) - win.pointer.winfo_rooty()
+        win.tree.selection_set(second)
+        win._incident_selected()
+        assert win.pointer.shown_at == win.tree.row_middle(second) - win.pointer.winfo_rooty() > 0
+        win.tree.selection_set(first)
+        win._incident_selected()
         track = win.track.texts()
         assert [(n, state) for n, _note, state in track] == [
             ("Targeted", "skipped"), ("Password known", "reached"), ("Suspicious access", "skipped"),
@@ -147,8 +152,9 @@ def test_incident_window_shows_the_story_and_dismisses_it_as_one(root):
         assert all(note for _n, note, state in track if state == "reached")          # when each was reached
         assert win._fact_full["Accounts"] == f"{ANNA}, {BEA}" and win._fact_full["Attacker addresses"] == "203.0.113.77"
         assert win._fact_full["Done so far"] == "Nothing on record"
-        assert win._full["why"].startswith(f"password_not_completed: {ANNA} (High, 75)")   # the strongest finding
-        assert "Treat these accounts as one incident" in win._full["advice"]               # what the chain advises
+        assert win._fact_full["Strongest finding"].startswith(f"password_not_completed: {ANNA} (High, 75)")
+        assert "Treat these accounts as one incident" in win._fact_full["What to do"]      # what the chain advises
+        assert win.hint.label.cget("text") == ""                                         # no words on how to use the page
         # the open ones are shown first; the buttons say how many there are of each
         assert win.filter.chosen == "open" and win.filter.text("open") == "Open 2"
         assert str(win.open_btn.cget("state")) == "normal" and str(win.dismiss_btn.cget("state")) == "normal"
@@ -159,22 +165,20 @@ def test_incident_window_shows_the_story_and_dismisses_it_as_one(root):
         win.open_selected()
         assert app.opened[-1] == f"password_not_completed: {ANNA}"
         win.dismiss_incident()
-        assert app.dismissed == 1 and "3 reminders of the incident dismissed" in win.hint.label.cget("text")
+        assert app.dismissed == 1 and win.hint.label.cget("text") == "3 reminders dismissed."
         # the incident is closed now: gone from the open ones, there under "Closed" and "All"
         assert [win.tree.set(i, "Incident") for i in win.tree.get_children("")] == ["carl"]
         assert win.filter.text("closed") == "Closed 1"
         win.show_filter("all")
         states = {win.tree.set(i, "Incident"): progress(win._incidents[i]) for i in win.tree.get_children("")}
-        assert states == {"anna, bea": "Persistence \u00b7 closed", "carl": "Suspicious access \u00b7 2/2 open"}
+        assert states == {"anna, bea": "Persistence \u00b7 closed " + datetime.now().strftime("%d.%m."), "carl": "Suspicious access \u00b7 2/2 open"}
         win.tree.selection_set([i for i in win.tree.get_children("") if not win._incidents[i].open])
         win._incident_selected()
-        why = win.state_label.cget("text")   # the closed incident says why it is closed
-        assert why.startswith("Closed \u00b7 last alert dismissed ")
+        assert "closed " in win._fact_full["Period"]     # when it was closed: with the period
         assert all(state in ("settled", "skipped", "ahead") for _n, _note, state in win.track.texts())   # nothing of it is open
         app.opened.clear()
         win.open_incident()                                    # (a double-click on it in the list)
         assert app.opened == ["incident a1"]
-        assert str(win.state_label.cget("foreground")) == theme.color("muted")
         assert str(win.dismiss_btn.cget("state")) == "disabled"
         assert {a.status for a in app.alerts.since(NOW - timedelta(days=31)) if BEA in a.subjects} == {DISMISSED}
         assert {a.status for a in app.alerts.since(NOW - timedelta(days=31)) if CARL in a.subjects} == {ACTIVE}
@@ -332,15 +336,18 @@ def test_an_incident_has_a_window_of_its_own_with_the_same_summary_and_the_reaso
     try:
         root.update()
         assert isinstance(win.block, Summary)                                   # the block the page shows, not a copy
-        assert win.block.title_label.cget("text") == f"Attack across 2 accounts: {ANNA}, {BEA}"
+        root.update()                                                           # its name and state: in the title bar,
+        assert win.top.title() == f"Incident  \u00b7  High 90  \u00b7  Open \u00b7 3 of 3 alerts  \u00b7  Attack across 2 accounts: {ANNA}, {BEA}"
+        assert not win.block.title_label.winfo_ismapped() and not win.block.state_label.winfo_ismapped()   # not again inside
         assert win.block.full["Attacker addresses"] == "203.0.113.77"
-        assert "Treat these accounts as one incident" in win.advice.cget("text")          # the whole advice
+        assert "Treat these accounts as one incident" in win.block.fact_labels["What to do"].cget("text")   # the advice
+        assert win.block.full["Strongest finding"].startswith(f"password_not_completed: {ANNA} (High, 75)")   # what weighs most
         assert [win.steps.set(i, "Stage") for i in win.steps.get_children("")] == ["Summary", "Password known", "Persistence"]
         win.step_sort("Severity")                                               # a click on a header: by that column
         assert [win.steps.set(i, "Severity") for i in win.steps.get_children("")] == ["Low", "High", "High"]
         win.step_sort("Time")
         # the strongest finding is selected to begin with: why it is rated as it is, every reason with its points
-        assert win._why_full == f"password_not_completed: {ANNA}" and "\n" not in win.why_title.cget("text")   # one line
+        assert win._why_full == f"password_not_completed: {ANNA}" and not win.why_title.winfo_ismapped()   # no title of its own:
         assert "Risk assessment" in win.reasons.get("1.0", "end")
         # shown, not said, that the assessment is the selected alert's: an arrowhead at the height of its row
         rows = win.steps.get_children("")
@@ -362,7 +369,7 @@ def test_an_incident_has_a_window_of_its_own_with_the_same_summary_and_the_reaso
         win.dismiss()                                                           # all of it at once, the summing-up alert too
         assert {a.status for a in app.alerts.recent() if a.key != "lone"} == {DISMISSED}
         assert next(a for a in app.alerts.recent() if a.key == "lone").status == ACTIVE   # what is not part of it stays
-        assert str(win.dismiss_btn.cget("state")) == "disabled" and win.block.state_label.cget("text").startswith("Closed")
+        assert str(win.dismiss_btn.cget("state")) == "disabled" and "  \u00b7  Closed" in win.top.title()
     finally:
         win.top.destroy()
 
@@ -390,7 +397,9 @@ def test_the_reminders_show_an_incident_as_one_row_that_is_dismissed_or_snoozed_
         win.tree.selection_set(first)
         win._update_header()
         assert win.h_title.cget("text").startswith("Attack across 2 accounts")
-        assert "Incident, 3 open alerts" in win._header_text[1] and win._header_text[2].startswith("Strongest finding: ")
+        # the header adds what the row does not say (the period, what weighs most) - not the level and count again
+        assert "alerts" not in win._header_text[1] and "risk" not in win._header_text[1] and "UTC" in win._header_text[1]
+        assert win._header_text[2].startswith("Strongest finding: ") and "(High" not in win._header_text[2]
         win.open_selected()
         assert opened == ["a1"]                                          # an incident opens in its own window
         assert win.top.title() == "3 Reminders (2 new)"                 # looked at: all of its alerts are seen
@@ -443,3 +452,56 @@ def test_the_risk_assessment_in_an_incidents_window_is_the_card_of_the_alerts_de
     finally:
         win.top.destroy()
         details.top.destroy()
+
+
+def test_the_page_opens_on_what_is_open_and_says_plainly_when_that_is_nothing(root):
+    from radar.ui.incidents import IncidentsWindow, progress
+
+    class App:
+        def __init__(self):
+            self.alerts = center(alert("a1", "password_not_completed", 75, 3, **ADDRESS), alert("b1", "mfa_change", 40, 2, user=BEA, **ADDRESS),
+                                 alert("lone", "risky_signin", 80, 1, user=CARL))
+
+        def on_alerts_dismissed(self):
+            pass
+
+        def dismiss_alerts(self, ids, parent=None):
+            self.alerts.dismiss(list(ids))
+            return list(ids)
+
+    app = App()
+    app.alerts.dismiss([a.id for a in app.alerts.recent() if a.key != "lone"])     # the incident is closed, one alert is open
+    win = IncidentsWindow(root, app)
+    try:
+        root.update()
+        assert win.filter.chosen == "open" and win.tree.get_children("") == ()     # not "all": nothing open is shown as that
+        assert win.empty_title.cget("text") == "No open incidents"
+        assert win.empty_link.cget("text") == "1 closed in the last 30 days"
+        assert "1 more open alert is not part of an incident (1 High)" in win.empty_note.cget("text")   # not "all clear"
+        assert win.pointer.shown_at is None and not win._right.winfo_ismapped()     # the right side is nobody's: empty
+        assert str(win.open_btn.cget("state")) == "disabled"
+        win.empty_link.event_generate("<Button-1>")                                 # the closed ones are one click away
+        root.update()
+        assert win.filter.chosen == "closed" and len(win.tree.get_children("")) == 1
+        row = win.tree.get_children("")[0]
+        assert progress(win._incidents[row]).startswith("Persistence \u00b7 closed ")   # ... and look closed: when, and
+        assert win.tree.tag_configure("closed", "pill") == "sev_info_bg|sev_info_fg"      # without the alarm colour
+        assert win.frame._edge == "link" and win.pointer.shown_at is not None and win._right.winfo_ismapped()
+        win.show_filter("open")
+        root.update()
+        assert win.empty_title.cget("text") == "No open incidents" and win.tree.get_children("") == ()
+    finally:
+        win.top.destroy()
+
+
+def test_what_was_only_logged_is_context_and_not_a_stop_of_the_line():
+    """The line shows a stop as passed over when only a logged finding stands for it - the table must not name
+    that stop for the logged finding."""
+    from radar.ui.incidents import step_rows
+
+    ac = center(alert("a1", "new_country", 45, 3), alert("a2", "sensitive_app", 0, 2), alert("a3", "role_assignment", 55, 1),
+                chain=False)
+    inc = next(i for i in incidents.group(ac.since(NOW - timedelta(days=31)), NOW) if i.open)
+    kinds = {a.rule_id: row[2] for a, row in step_rows(inc)}
+    assert set(inc.stages) == {3, 5}                                  # Persistence (4): nothing that counts
+    assert kinds == {"new_country": "Suspicious access", "sensitive_app": "Context", "role_assignment": "Escalation"}

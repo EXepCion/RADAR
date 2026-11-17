@@ -164,7 +164,7 @@ class OfficesWindow:
             self._select()
         else:
             self._load_form(None)
-        self._say("No office yet. Pick an address below (most people sign in from the offices) or add one by hand."
+        self._say("No office yet: take a suggested address, or add one by hand."
                   if first_time or not self.offices else "")
         theme.style_window(top)
         top.lift()

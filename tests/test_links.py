@@ -266,7 +266,7 @@ def test_audit_window_shows_targets_properties_and_app_only_note(root):
     root.update()
     body = win.text.get("1.0", "end")
     assert "Update a partner cross-tenant access setting" in body  # the highlighted entry is shown
-    assert '"IsMfaAccepted": true' in body and "App-only" in body and "WindowsPowerShell/5.1.26100.33648" in body
+    assert "IsMfaAccepted\t\ttrue" in body and "App-only" in body and "WindowsPowerShell/5.1.26100.33648" in body
     found = links_in(win.text)
     assert ("app", "Ops Automation") in found and ("user", "00000000-0000-4000-8000-000000000005") in found
     assert ("ip", "5.1.26100") not in found
@@ -362,3 +362,157 @@ def test_log_windows_do_not_move_when_the_record_arrives(root):
     assert _places(entry.top, *widgets) == before
     assert entry.status_label.winfo_reqheight() <= entry.status_label.winfo_height()  # the long hint is not cut off
     entry.top.destroy()
+
+
+POLICY_OLD = {"id": "p1", "displayName": "Require MFA for everyone", "state": "enabled",
+              "conditions": {"users": {"includeUsers": ["All"], "excludeUsers": ["00000000-0000-4000-8000-000000000021"],
+                                       "excludeGroups": []},
+                             "applications": {"includeApplications": ["All"]}, "clientAppTypes": ["all"]},
+              "grantControls": {"operator": "OR", "builtInControls": ["mfa"]}}
+POLICY_NEW = {"id": "p1", "displayName": "Require MFA for everyone", "state": "enabledForReportingButNotEnforced",
+              "conditions": {"users": {"includeUsers": ["All"],
+                                       "excludeUsers": ["00000000-0000-4000-8000-000000000021",
+                                                        "00000000-0000-4000-8000-000000000022"],
+                                       "excludeGroups": ["00000000-0000-4000-8000-000000000031"]},
+                             "applications": {"includeApplications": ["All"]}, "clientAppTypes": ["all"]},
+              "grantControls": {"operator": "OR", "builtInControls": ["mfa", "compliantDevice"]}}
+
+
+def test_a_change_is_compared_setting_by_setting():
+    from radar.ui.entry import compare
+
+    rows = compare(json.dumps([json.dumps(POLICY_OLD)]), json.dumps([json.dumps(POLICY_NEW)]))
+    changed = [r for r in rows if r[3] != "same"]
+    assert changed == [
+        ("state", "enabled", "enabledForReportingButNotEnforced", "changed"),
+        ("conditions.users.excludeUsers", "", "00000000-0000-4000-8000-000000000022", "added"),   # only the new entry
+        ("conditions.users.excludeGroups", "", "00000000-0000-4000-8000-000000000031", "added"),
+        ("grantControls.builtInControls", "", "compliantDevice", "added")]
+    assert ("conditions.users.excludeUsers", "00000000-0000-4000-8000-000000000021",
+            "00000000-0000-4000-8000-000000000021", "same") in rows
+    assert ("state", "enabledForReportingButNotEnforced", "enabled", "changed") in compare(json.dumps(POLICY_NEW),
+                                                                                           json.dumps(POLICY_OLD))
+    # plain values, as most audit entries have them: one row; the order of a list says nothing
+    assert compare("[true]", "[false]") == [("", "true", "false", "changed")]
+    assert compare(None, '["a"]') == [("", "", "a", "added")] and compare('["a"]', None) == [("", "a", "", "removed")]
+    assert [r[3] for r in compare('["a", "b"]', '["b", "a"]')] == ["same", "same"]
+    # entries with an id are compared by it: one put in front does not make all the others look changed
+    old, new = {"rules": [{"id": "x", "v": 1}]}, {"rules": [{"id": "n", "v": 5}, {"id": "x", "v": 1}]}
+    assert [r for r in compare(old, new) if r[3] != "same"] == [("rules[n].id", "", "n", "added"),
+                                                                ("rules[n].v", "", "5", "added")]
+
+
+def test_audit_window_compares_before_and_after_and_marks_what_changed(root):
+    from test_ui import FakeApp
+
+    from radar.ui.entry import AuditWindow
+
+    rec = {"id": "Directory_1", "correlationId": "c1", "activityDateTime": "2026-11-10T10:02:20Z",
+           "activityDisplayName": "Update conditional access policy", "category": "Policy", "result": "success",
+           "initiatedBy": {"user": {"userPrincipalName": "admin@contoso.com"}},
+           "targetResources": [{"type": "Policy", "id": "p1", "displayName": "Require MFA for everyone",
+                                "modifiedProperties": [{"displayName": "ConditionalAccessPolicy",
+                                                        "oldValue": json.dumps(POLICY_OLD),
+                                                        "newValue": json.dumps(POLICY_NEW)}]}]}
+    win = AuditWindow(root, FakeApp(), "subtitle", highlight="Directory_1")
+    win.show_records([rec])
+    root.update()
+    text = win.text
+    body = text.get("1.0", "end")
+    assert "Setting\tBefore\tAfter" in body and "ConditionalAccessPolicy\n" in body
+    assert "state\tenabled\tenabledForReportingButNotEnforced" in body
+    assert "includeApplications" not in body and '"conditions"' not in body       # what stayed is not in the way
+    marked = lambda tag: [text.get(a, b) for a, b in zip(*[iter(text.tag_ranges(tag))] * 2)]  # noqa: E731
+    assert "enabled" in marked("diff_old") and "enabledForReportingButNotEnforced" in marked("diff_new")
+    assert "compliantDevice" in "".join(marked("diff_new")) and "mfa" not in "".join(marked("diff_new"))
+    assert ("user", "00000000-0000-4000-8000-000000000022") in links_in(text)       # who was excluded: one click away
+    # every value of a column starts at the same place, side by side
+    starts = set()
+    for line in range(1, int(text.index("end").split(".")[0])):
+        content = text.get(f"{line}.0", f"{line}.end")
+        if "diff" in text.tag_names(f"{line}.0") and content.count(chr(9)) == 2 and not content.startswith("Setting"):
+            assert text.count(f"{line}.0", f"{line}.end", "displaylines") in (None, 0, (0,)), content  # one line each
+            first = content.index(chr(9))
+            for at in (first + 1, content.index(chr(9), first + 1) + 1):
+                box = text.bbox(f"{line}.{at}")
+                if box and at < len(content) and content[at] != chr(9) and not text.dump(f"{line}.{at}", f"{line}.{at + 1}", image=True):
+                    starts.add(box[0])
+    assert len(starts) == 2, starts
+    assert str(win.unchanged_box.cget("state")) == "normal"
+    win.unchanged_box.invoke()                                                    # the rest on demand
+    assert "conditions.applications.includeApplications\tAll\tAll" in text.get("1.0", "end")
+    win.top.destroy()
+
+
+def test_a_long_value_wraps_inside_its_own_column(root):
+    from test_ui import FakeApp
+
+    from radar.ui.entry import AuditWindow, _wrap
+
+    assert _wrap("one two three", 60, lambda t: 10 * len(t)) == ["one", "two", "three"]
+    assert _wrap("abcdefghij", 40, lambda t: 10 * len(t)) == ["abcd", "efgh", "ij"] and _wrap("", 40, len) == [""]
+    long_old = "Applies to every sign-in from outside the offices, " * 4
+    long_new = "Applies to sign-ins of administrators only; everybody else is exempt, " * 4
+    rec = {"id": "Directory_1", "correlationId": "c1", "activityDateTime": "2026-11-10T10:02:20Z",
+           "activityDisplayName": "Update conditional access policy", "result": "success",
+           "initiatedBy": {"user": {"userPrincipalName": "admin@contoso.com"}},
+           "targetResources": [{"type": "Policy", "id": "p1", "displayName": "Require MFA", "modifiedProperties": [
+               {"displayName": "ConditionalAccessPolicy", "oldValue": json.dumps({"description": long_old, "state": "on"}),
+                "newValue": json.dumps({"description": long_new, "state": "off"})}]}]}
+    win = AuditWindow(root, FakeApp(), "subtitle", highlight="Directory_1")
+    win.show_records([rec])
+    _settle(win.top)
+    text = win.text
+    last = int(text.index("end").split(".")[0])
+    rows = [text.get(f"{n}.0", f"{n}.end") for n in range(1, last)]
+    part = [r for r in rows if "administrators" in r or "outside the offices" in r]
+    assert len(part) > 2 and part[0].startswith("description" + chr(9)) and all(r.startswith(chr(9)) for r in part[1:])
+    width, starts = text.winfo_width(), {0: set(), 1: set()}
+    for n, row in enumerate(rows, 1):
+        if "diff" not in text.tag_names(f"{n}.0") or row.count(chr(9)) != 2:
+            continue
+        assert text.count(f"{n}.0", f"{n}.end", "displaylines") in (None, 0, (0,)), row    # no line wraps by itself
+        end = text.bbox(f"{n}.end")
+        assert end is None or end[0] <= width, row                                        # ... or runs out of the window
+        first = row.index(chr(9))
+        for column, at in enumerate((first + 1, row.index(chr(9), first + 1) + 1)):
+            if at < len(row) and row[at] != chr(9) and text.bbox(f"{n}.{at}"):
+                starts[column].add(text.bbox(f"{n}.{at}")[0])
+    assert len(starts[0]) == 1 and len(starts[1]) == 1 and starts[0] != starts[1], starts  # before | after, side by side
+    win.top.destroy()
+
+
+def test_an_audit_entry_starts_with_what_was_changed_and_follows_the_width(root):
+    from test_ui import FakeApp
+
+    from radar.ui.entry import AuditWindow
+
+    long_old = "Applies to every sign-in from outside the offices, " * 3
+    rec = {"id": "Directory_1", "correlationId": "c1", "activityDateTime": "2026-11-10T10:02:20Z",
+           "activityDisplayName": "Update conditional access policy", "result": "success",
+           "initiatedBy": {"user": {"userPrincipalName": "admin@contoso.com"}},
+           "targetResources": [{"type": "Policy", "id": "p1", "displayName": "Require MFA", "modifiedProperties": [
+               {"displayName": "ConditionalAccessPolicy", "oldValue": json.dumps({"description": long_old}),
+                "newValue": json.dumps({"description": "Short"})}]}]}
+    win = AuditWindow(root, FakeApp(), "subtitle", highlight="Directory_1")
+    win.show_records([rec])
+    _settle(win.top)
+    body = win.text.get("1.0", "end")
+    # who did it and when is in the list above: the entry itself begins with the target and the comparison
+    assert body.startswith("Targets (1)") and body.index("Setting") < body.index("Activity\n") < body.index("Initiated by")
+    lines = lambda: sum(1 for row in win.text.get("1.0", "end").split("\n") if "outside" in row)  # noqa: E731
+    wide = lines()
+    tabs = win.text.tag_cget("diff", "tabs")
+
+    class Narrower:
+        width = win.text.winfo_width() // 2
+
+    win.text.configure(width=1)
+    win.top.geometry(f"{win.top.winfo_width() // 2}x{win.top.winfo_height()}")
+    _settle(win.top)
+    if win.text.winfo_width() > Narrower.width * 1.5:     # (the window manager did not follow: say it by hand)
+        win._text_resized(Narrower)
+    assert win.text.tag_cget("diff", "tabs") != tabs       # the columns follow the width ...
+    assert lines() >= wide                                 # ... and the long value is broken again for its column
+    assert "Setting" in win.text.get("1.0", "end")
+    win.top.destroy()

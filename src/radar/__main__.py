@@ -8,6 +8,7 @@ Options (mainly for diagnostics; run with python.exe to see console output):
 """
 from __future__ import annotations
 
+from . import timefmt
 import argparse
 import logging
 import logging.handlers
@@ -138,7 +139,7 @@ def _demo_findings() -> list:
     from .plugins.signin_threats.rules import SIGNIN_LOGS_URL
 
     now = datetime.now(timezone.utc)
-    ev = lambda m, user, ip, loc, res: {"Time": (now - timedelta(minutes=m)).astimezone().strftime("%Y-%m-%d %H:%M:%S"),  # noqa: E731
+    ev = lambda m, user, ip, loc, res: {"Time": timefmt.sortable(now - timedelta(minutes=m), seconds=True),  # noqa: E731
                                          "User": user, "Application": "Office 365 Exchange Online",
                                          "IP address": ip, "Location": loc, "Result": res}
     return [

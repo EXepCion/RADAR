@@ -225,10 +225,30 @@ h3 .act::before { content: ""; }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function token(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  // The zone of a moment as its offset to UTC ("UTC+1", "UTC-3:30") - in the viewer's zone, or in the zone given.
+  function zoneLabel(d, tz) {
+    if (tz) {
+      try {
+        var name = "";
+        new Intl.DateTimeFormat("en-GB", { timeZone: tz, timeZoneName: "shortOffset" }).formatToParts(d)
+          .forEach(function (x) { if (x.type === "timeZoneName") name = x.value; });
+        if (name) return name.replace("GMT", "UTC").replace(/([+-])0(\d)/, "$1$2").replace(/[+-]0$/, "");
+      } catch (e) { /* unknown zone or older browser: the viewer's zone below */ }
+    }
+    var minutes = -d.getTimezoneOffset(), a = Math.abs(minutes), h = Math.floor(a / 60), m = a % 60;
+    return minutes === 0 ? "UTC" : "UTC" + (minutes < 0 ? "-" : "+") + h + (m ? ":" + ("0" + m).slice(-2) : "");
+  }
+  // The one place a clock time is written: hour and minute, always with the zone (see tests/test_timezones.py).
+  function clockWithZone(d, tz) {
+    var options = { hour: "2-digit", minute: "2-digit", hour12: false }, zone = tz || undefined, text;
+    try { text = new Intl.DateTimeFormat("en-GB", zone ? Object.assign({ timeZone: zone }, options) : options).format(d); }
+    catch (e) { zone = undefined; text = new Intl.DateTimeFormat("en-GB", options).format(d); }
+    return text + " " + zoneLabel(d, zone);
+  }
   function hhmm(iso) {
     if (!iso) return "";
     var d = new Date(iso), today = new Date().toDateString() === d.toDateString();
-    var t = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+    var t = clockWithZone(d);
     return today ? t : ("0" + d.getDate()).slice(-2) + "." + ("0" + (d.getMonth() + 1)).slice(-2) + ". " + t;
   }
   function ago(iso) {
@@ -252,21 +272,13 @@ h3 .act::before { content: ""; }
       return Date.UTC(+p[2], +p[1] - 1, +p[0]) / 86400000;
     }
     var days = Math.round(dayNumber(now) - dayNumber(d));
-    var time = fmt({ hour: "2-digit", minute: "2-digit", hour12: false }, d);
-    var mine = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
-    var zoneName = "";
-    if (zone && mine !== time) {
-      try {
-        new Intl.DateTimeFormat("en-GB", { timeZone: zone, timeZoneName: "short" }).formatToParts(d)
-          .forEach(function (x) { if (x.type === "timeZoneName") zoneName = x.value; });
-      } catch (e) { zoneName = ""; }
-    }
+    var time = clockWithZone(d, zone);  // the time there, with the zone of the place
     var day = days <= 0 ? "today" : days === 1 ? "yesterday" : days + " days ago";
-    return { days: days, day: day, time: time, zone: zoneName, date: fmt({ day: "numeric", month: "short" }, d) };
+    return { days: days, day: day, time: time, date: fmt({ day: "numeric", month: "short" }, d) };
   }
   function whenThere(iso, tz, until) {  // for the movement list: when the stop began and, if it lasted, until when
     var p = partsThere(iso, tz);
-    var text = p.day + (p.days > 1 ? " \u00b7 " + p.date : "") + "\n" + p.time + (p.zone ? " " + p.zone : "");
+    var text = p.day + (p.days > 1 ? " \u00b7 " + p.date : "") + "\n" + p.time;
     if (until && new Date(until).getTime() - new Date(iso).getTime() > 30 * 60000) {
       var u = partsThere(until, tz);
       text += "\nuntil " + (u.days === p.days ? "" : u.day + " ") + u.time;

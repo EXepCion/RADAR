@@ -123,7 +123,7 @@ def test_header_height_is_stable_across_selections(root):
     root.update()
     heights.add(win.header.winfo_height())
     assert len(heights) == 1 and len(list_tops) == 1
-    assert win.h_summary.cget("text").count("\n") <= 2 and win.h_summary.cget("text").endswith("…")
+    assert win.h_summary.cget("text").count("\n") <= 1 and win.h_summary.cget("text").endswith("…")  # two lines
     assert "\n" not in win.h_title.cget("text")
     win.top.destroy()
 
@@ -208,3 +208,55 @@ def test_only_dismiss_button_in_details_dismisses(ui):
     root.update()
     assert app.alerts.get(first).status == "dismissed"
     assert app.alerts.count_active() == 1
+
+
+def test_the_alert_header_says_how_bad_and_when_and_keeps_the_rest_for_the_pointer(root):
+    """Under the title: the level and when it happened. Not the score a second time (it is on the Risk assessment
+    card), not the rule and the times of detection in one long line."""
+    from datetime import datetime, timedelta, timezone
+
+    from radar.alerts import Alert
+    from radar.plugin_api import Finding, Severity
+    from radar.ui import theme
+    from radar.ui.details import DetailsWindow
+
+    theme.init(root)
+    then = datetime.now(timezone.utc) - timedelta(hours=3)
+    alert = Alert.from_finding("signin_threats", Finding(
+        key="k", rule_id="impossible_travel", severity=Severity.HIGH, score=85, title="Impossible travel: z@contoso.com",
+        occurred_at=then, factors=[(45, "9,350 km in 37 min")], fields={"User": "z@contoso.com"}))
+    win = DetailsWindow(root, FakeApp(), alert, on_dismiss=lambda _a: None)
+    root.update()
+
+    def texts(widget):
+        out = [str(widget.cget("text"))] if widget.winfo_class() in ("TLabel", "Label") else []
+        return out + [t for child in widget.winfo_children() for t in texts(child)]
+
+    header = win.header_when.master
+    shown = [t for t in texts(header) if t]
+    assert shown == [theme.local_time(then, "%a %d.%m.%Y %H:%M")]          # (beside the pill with the level)
+    note = win.header_note("Sign-in threat detection > Impossible travel")
+    assert note.startswith("Detected ") and note.endswith("Sign-in threat detection > Impossible travel")
+    win.top.destroy()
+
+
+def test_the_reminder_header_adds_what_the_row_does_not_say(root):
+    """Level, score and source are in the row (and in the icon): under the title only the exact time, then what
+    happened."""
+    from datetime import datetime, timedelta, timezone
+
+    from radar.ui import theme
+    from radar.ui.reminder import ReminderWindow
+
+    app = FakeApp()
+    then = datetime.now(timezone.utc) - timedelta(hours=5)
+    app.alerts.ingest("p", [Finding(key="k", title="Risky sign-in: z@contoso.com", severity=Severity.HIGH, score=85,
+                                    occurred_at=then, factors=[(45, "unfamiliar network")], summary="What happened.")])
+    win = ReminderWindow(root, app)
+    win.show()
+    root.update()
+    title, when, summary = win._header_text
+    assert title == "Risky sign-in: z@contoso.com" and summary == "What happened."
+    assert when == theme.local_time(then, "%a %d.%m. %H:%M") and "UTC" in when
+    assert "High" not in when and "risk" not in when and "plugin" not in when
+    win.top.destroy()

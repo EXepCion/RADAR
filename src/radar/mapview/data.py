@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from .. import timefmt
 import dataclasses
 import math
 from collections import defaultdict
@@ -322,7 +323,7 @@ class Assessor:
                 days[key].add(s.created.date())
                 latest = (s, key)
         if latest and latest[0].created >= since and not latest[1].startswith("office:"):
-            return latest[1], f"where the work computer was last seen ({latest[0].created.astimezone():%H:%M})"
+            return latest[1], f"where the work computer was last seen ({timefmt.clock(latest[0].created)})"
         homes = sorted((k for k in days if k.startswith("city:") and k.rsplit("|", 1)[-1] == phone.country),
                        key=lambda k: len(days[k]), reverse=True)
         if homes:

@@ -371,8 +371,13 @@ class Pointer(tk.Canvas):
         self.bind("<<ThemeChanged>>", lambda _e=None: self.after_idle(self._draw), add="+")
 
     def at(self, root_y: int | None) -> None:
-        if root_y != self._y:
-            self._y = root_y
+        # kept as a height inside this strip: it stays right when the window is moved
+        try:
+            y = None if root_y is None else int(root_y - self.winfo_rooty())
+        except tk.TclError:
+            return
+        if y != self._y:
+            self._y = y
             self._draw()
 
     def recolor_colors(self, _mapping: dict[str, str]) -> None:
@@ -381,10 +386,7 @@ class Pointer(tk.Canvas):
     @property
     def shown_at(self) -> int | None:
         """The y inside the pointer's own strip it points from (None: hidden)."""
-        try:
-            return None if self._y is None else int(self._y - self.winfo_rooty())
-        except tk.TclError:
-            return None
+        return self._y
 
     def _draw(self) -> None:
         from PIL import Image, ImageDraw, ImageTk

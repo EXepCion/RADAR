@@ -5,6 +5,7 @@ explains its verdict; pure volume patterns (spray, brute force, MFA fatigue) use
 """
 from __future__ import annotations
 
+from ... import timefmt
 import fnmatch
 import ipaddress
 import math
@@ -648,7 +649,7 @@ def distributed_attack(rc: RuleContext, merge: bool = True) -> list[Finding]:
         reported = [c for c in rc.history.changes(rc.now - window, rc.now, user_id) if c.kind == REPORT_KIND]
         if reported:
             factors.append(Factor(25, f"The person reported an MFA prompt as not theirs "
-                                      f"({reported[-1].created.astimezone():%d.%m. %H:%M}): the password is known"))
+                                      f"({timefmt.stamp(reported[-1].created)}): the password is known"))
         account_factors = Assessor.account_factors(acct, failures[0]) if acct else []
         factors.extend(account_factors)
         off = bool(acct and not acct.enabled)
@@ -1639,7 +1640,7 @@ def _collapse_changes(changes: list[AccountChange]) -> list[str]:
     out = []
     for c, details in lines:
         specific = [d for d in details if d.lower() != "user registered security info"] or details
-        out.append(f"{c.created.astimezone():%d.%m. %H:%M} {' / '.join(specific)}"
+        out.append(f"{timefmt.stamp(c.created)} {' / '.join(specific)}"
                    + (f" by {c.actor}" if c.by_admin else ""))
     return out
 
@@ -1712,7 +1713,7 @@ def mfa_change(rc: RuleContext) -> list[Finding]:
             pts, s, new_dev, new_net, sa = max(fresh, key=lambda x: x[0])
             what = " and ".join(w for w, flag in (("device", new_dev), ("network", new_net)) if flag)
             factors.append(Factor(_clamp(pts, 0, 40), f"Afterwards: sign-in from a new {what} at "
-                                                      f"{s.created.astimezone():%H:%M}: {_where(rc, s)}"
+                                                      f"{timefmt.clock(s.created)}: {_where(rc, s)}"
                                                       + (f" - {sa.top_reasons(2)}" if sa.factors else "")))
         elif continued and reg and _context(rc, reg)[0] > 0:
             factors.append(Factor(0, "Afterwards only the (unfamiliar) device the change was made from"))
@@ -1737,7 +1738,7 @@ def mfa_change(rc: RuleContext) -> list[Finding]:
             seen_where: dict[tuple, str] = {}
             for x in sorted(fresh, key=lambda x: x[1].created):
                 seen_where.setdefault((x[1].ip, x[1].device_id or x[1].client),
-                                      f"{x[1].created.astimezone():%d.%m. %H:%M} {_where(rc, x[1])}")
+                                      f"{timefmt.stamp(x[1].created)} {_where(rc, x[1])}")
             fields["New devices/networks afterwards"] = "; ".join(list(seen_where.values())[:5])
         out.append(_scored(
             a, key=f"mfachg|{user_id}|{_day(t0)}", rule_id="mfa_change",
@@ -1817,7 +1818,7 @@ def aitm_replay(rc: RuleContext) -> list[Finding]:
             pairs[r.session_id] = (o, r)
     for sid, (o, r) in pairs.items():
         minutes = (r.created - o.created).total_seconds() / 60
-        extra = [Factor(0, f"MFA at {o.created.astimezone():%H:%M} from {_where(rc, o)}")]
+        extra = [Factor(0, f"MFA at {timefmt.clock(o.created)} from {_where(rc, o)}")]
         before = o.created
         familiar = rc.history.user_asns(r.user_id, before)
         if o.asn in familiar and r.asn in familiar:
@@ -1877,7 +1878,7 @@ def mfa_report(rc: RuleContext) -> list[Finding]:
             continue
         acct = rc.accounts.get(c.user_id) if rc.accounts else None
         upn = (acct.upn if acct else "") or c.upn or c.user_id
-        when = f"{c.created.astimezone():%d.%m. %H:%M}"
+        when = f"{timefmt.stamp(c.created)}"
         near = rc.history.query(c.created - timedelta(minutes=10), c.created + timedelta(minutes=10),
                                 user_id=c.user_id, interactive_only=True)
         s = _report_prompt(rc, c)

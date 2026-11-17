@@ -40,6 +40,7 @@ LIGHT = {
     "error": "#a4262c", "pos": "#a4262c", "neg": "#107c10", "warn": "#8a5300",
     "sev_high_bg": "#fde7e9", "sev_high_fg": "#a4262c", "sev_medium_bg": "#fdeadb", "sev_medium_fg": "#8a3b00",
     "sev_low_bg": "#fff4ce", "sev_low_fg": "#7a4600", "sev_info_bg": "#ebebeb", "sev_info_fg": "#5d5d5d",
+    "diff_add": "#dff6dd",
 }
 DARK = {
     "window": "#202020", "card": "#2b2b2b", "border": "#3d3d3d", "track": "#454545", "heading_bg": "#323232",
@@ -49,6 +50,7 @@ DARK = {
     "error": "#ff99a4", "pos": "#ff99a4", "neg": "#6ccb5f", "warn": "#fcb76a",
     "sev_high_bg": "#4a2327", "sev_high_fg": "#ff99a4", "sev_medium_bg": "#4a2f1a", "sev_medium_fg": "#ffb86b",
     "sev_low_bg": "#4a3b10", "sev_low_fg": "#f9e2a6", "sev_info_bg": "#3a3a3a", "sev_info_fg": "#ababab",
+    "diff_add": "#1e3a22",
 }
 # light-palette constants kept for callers / tests that compare against them
 MUTED, HEADER_BG, TEXT_BG, BORDER = LIGHT["muted"], LIGHT["window"], LIGHT["card"], LIGHT["border"]
@@ -859,8 +861,12 @@ def keep_ui_responsive() -> None:
         sys.setswitchinterval(UI_SWITCH_INTERVAL)
 
 
-def local_time(dt: datetime | None, fmt: str = "%A %d.%m.%Y %H:%M") -> str:
-    return dt.astimezone().strftime(fmt) if dt else "-"
+def local_time(dt: datetime | None, fmt: str | None = None) -> str:
+    """A time in local time, written as ``fmt`` says (weekday, date and time without one), with its time zone
+    (see radar.timefmt)."""
+    from .. import timefmt
+
+    return timefmt.stamp(dt, fmt or timefmt.LONG) if dt else "-"
 
 
 # --------------------------------------------------------------- attention

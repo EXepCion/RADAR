@@ -13,6 +13,7 @@ Everything has its fixed place: choosing another incident changes the texts, nev
 """
 from __future__ import annotations
 
+from .. import timefmt
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
@@ -26,7 +27,8 @@ from ..alerts import ACTIVE, DISMISSED, MUTED, SNOOZED, Alert
 from ..plugin_api import Severity
 from . import icons, theme
 from .cardtable import CardTable
-from .parts import Badge, Hint, Segments, StageTrack, card, on_card
+from .parts import Badge, Hint, Pointer, Segments, StageTrack, card, on_card
+from .rounded import Rounded
 from .richtext import StatusLine, stable_label
 from .tables import make_sortable
 from .theme import px
@@ -37,25 +39,37 @@ if TYPE_CHECKING:  # pragma: no cover
 WIDTH, MARGIN = 1180, 20
 LIST = 440  # the width of the list of incidents; the chosen incident takes the rest
 COLS = ["Severity", "Incident", "Last activity"]
-WIDTHS = {"Severity": 128, "Incident": 180, "Last activity": 106}
+WIDTHS = {"Severity": 122, "Incident": 190, "Last activity": 100}
 STEP_COLS = ["Time", "Severity", "Stage", "State", "Alert"]
-STEP_WIDTHS = {"Time": 110, "Severity": 90, "Stage": 132, "State": 86, "Alert": 250}
+STEP_WIDTHS = {"Time": 166, "Severity": 98, "Stage": 128, "State": 82, "Alert": 190}  # (the time with its zone)
 STATE = {ACTIVE: "open", SNOOZED: "snoozed", DISMISSED: "dismissed", MUTED: "logged only"}
 ROLE = {Severity.HIGH: "error", Severity.MEDIUM: "warn"}  # the colour an incident's progress is drawn in (else blue)
-HINT = ("An incident is open while one of its alerts is still a reminder; it opens again by itself when one gets worse "
-        "or a new alert joins. Double-click an incident or one of its alerts for all the details.")
-SUMMARY_TEMPLATE = ("000 incidents in the last 00 days: 000 open, 000 closed. 000 more open alerts are not part of an "
-                    "incident (000 High): see the reminders. Data as of 00:00.")
+HINT = ""  # (the line at the bottom says what was done; how to use the page needs no words)
+SUMMARY_TEMPLATE = ("Last 00 days. 000 more open alerts are not part of an incident (000 High): see the reminders. "
+                    "Data as of 00:00 UTC+00:00.")
 NOTHING = "No incident selected"
-FACTS = ("Accounts", "Attacker addresses", "From - to", "Done so far")
+TRACK_LEGEND = ("Filled: the incident has an open alert of this stage.   Grey: its alerts of this stage were dismissed.   "
+                "Ring: no alert of this stage - the attack was not seen there, the line only passes through.")
+FACTS = ("Accounts", "Attacker addresses", "Period", "Done so far")
+TEXTS = ("Strongest finding", "What to do")  # longer: several lines each
+NO_ADVICE = "Look at its alerts in order and decide for each whether it was the person themselves."
 
 
 def _t(when: Any) -> str:
-    return when.astimezone().strftime("%Y-%m-%d %H:%M") if when else ""
+    return timefmt.sortable(when) if when else ""
 
 
 def _short(values: list[str], limit: int) -> str:
     return ", ".join(values[:limit]) + (f" +{len(values) - limit}" if len(values) > limit else "")
+
+
+def ago(value: str) -> str:
+    """How long ago a time of a table was (timefmt.sortable): 'Now', '3 hours ago', '2 days ago'."""
+    try:
+        when = datetime.strptime(str(value)[:16], timefmt.SORTABLE).astimezone()
+    except (TypeError, ValueError):
+        return value
+    return theme.humanize(when)
 
 
 def state_role(value: str, _tags: tuple = ()) -> str:
@@ -81,9 +95,11 @@ def short_title(incident: incidents.Incident) -> str:
 def progress(incident: incidents.Incident) -> str:
     """The small line under an incident in the list: how far it got, and how much of it is still open."""
     total, still = len(incident.reminders), len(incident.open_alerts)
+    times = [a.dismissed_at for a in incident.reminders if a.dismissed_at]
+    closed = "closed" + (f" {max(times).astimezone():%d.%m.}" if times else "")  # (a date: needs no time zone)
     return " · ".join(p for p in (
         incident.stage_name or "No attack stage",
-        f"{still}/{total} open" if still else "closed") if p)
+        f"{still}/{total} open" if still else closed) if p)
 
 
 def state_line(incident: incidents.Incident) -> str:
@@ -93,17 +109,19 @@ def state_line(incident: incidents.Incident) -> str:
         snoozed = sum(1 for a in still if a.status == SNOOZED)
         return f"Open \u00b7 {len(still)} of {total} alerts" + (f", {snoozed} snoozed" if snoozed else "")
     times = [a.dismissed_at for a in incident.reminders if a.dismissed_at]
-    return "Closed" + (f" \u00b7 last alert dismissed {max(times).astimezone():%d.%m. %H:%M}" if times else "")
+    return "Closed" + (f" \u00b7 last alert dismissed {timefmt.stamp(max(times))}" if times else "")
 
 
 def facts(incident: incidents.Incident) -> dict[str, str]:
     """What holds the incident together and what was done about it (the captions are FACTS)."""
     days = (incident.last - incident.first).days
+    times = [a.dismissed_at for a in incident.reminders if a.dismissed_at] if not incident.open else []
+    closed = f"  \u00b7  closed {timefmt.stamp(max(times))}" if times else ""
     return {
         "Accounts": ", ".join(incident.accounts) or "-",
         "Attacker addresses": ", ".join(incident.addresses) or "None known",
-        "From - to": (f"{incident.first.astimezone():%d.%m. %H:%M} - {incident.last.astimezone():%d.%m. %H:%M}"
-                      + (f" ({days} days)" if days > 1 else "")),
+        "Period": (f"{timefmt.stamp(incident.first)} \u2013 {timefmt.stamp(incident.last)}"
+                   + (f"  \u00b7  {days} days" if days > 1 else "") + closed),
         "Done so far": ", ".join(incident.responses) or "Nothing on record",
     }
 
@@ -119,10 +137,11 @@ def clamp(text: str, font: str, width: int, lines: int, widget: tk.Misc) -> str:
         if measure(trial) <= width or not line:
             line = trial
             continue
-        if len(out) == lines - 1:  # the last line: the rest does not fit
+        if len(out) == lines - 1:  # the last line: the rest does not fit - as much of the next word as there is room for
+            line = trial
             while line and measure(line + "…") > width:
                 line = line[:-1]
-            return "\n".join(out + [line.rstrip(" ,;:") + "…"])
+            return "\n".join(out + [timefmt.keep_whole(line.rstrip(" ,;:") + "…")])
         out.append(line)
         line = word
     return "\n".join(out + [line])
@@ -133,7 +152,11 @@ class Summary(tk.Frame):
     its name, how bad and whether open, how far along an attack it is and when each stage was reached, whom and
     which attacker addresses it is about, since when, what was done. Every part has its fixed place."""
 
-    def __init__(self, parent: tk.Misc, text_width: int):
+    def __init__(self, parent: tk.Misc, text_width: int, header: bool = True, lines: tuple[int, int] = (1, 2)):
+        """``header=False``: without the name, the severity and the open/closed line - where the list beside it
+        already says all three for the incident that is selected (the Incidents page). ``lines``: how many lines the
+        strongest finding and the advice get (what does not fit ends in an ellipsis; the pointer shows all)."""
+        self._lines = dict(zip(TEXTS, lines))
         white = theme.color("card")
         super().__init__(parent, background=white, bd=0, highlightthickness=0)
         self._text_width = text_width
@@ -141,31 +164,48 @@ class Summary(tk.Frame):
         self._title = ""
         self.title_label = tk.Label(self, font=theme.FONT_BOLD, anchor="w", bd=0, padx=0, pady=0, background=white,
                                     foreground=theme.color("text"))
-        self.title_label.pack(fill="x")
         Hint((self.title_label,), lambda: self._title, wrap=px(520))
         line = on_card(self)
-        line.pack(fill="x", pady=(px(6), 0))
+        if header:
+            self.title_label.pack(fill="x")
+            line.pack(fill="x", pady=(px(6), 0))
         self.badge = Badge(line)
         self.badge.pack(side="left")
         self.state_label = tk.Label(line, font=theme.FONT, anchor="w", bd=0, padx=0, pady=0, background=white,
                                     foreground=theme.color("muted"))
         self.state_label.pack(side="left", fill="x", expand=True, padx=(px(10), 0))
         self.track = StageTrack(self, [incidents.chains.STAGE_NAMES[k] for k in sorted(incidents.chains.STAGE_NAMES)])
-        self.track.pack(fill="x", pady=(px(14), px(8)))
+        self.track.pack(fill="x", pady=(px(14) if header else px(4), px(8)))
+        Hint((self.track,), lambda: TRACK_LEGEND, wrap=px(460))  # what the three kinds of points mean
+        # The facts as a list: the names in one column, the values beside them, one line each over the whole width.
+        # A value that still does not fit ends in an ellipsis; the pointer shows all of it.
+        tk.Frame(self, height=1, background=theme.color("border"), bd=0, highlightthickness=0).pack(fill="x", pady=(px(2), px(8)))
         grid = on_card(self)
         grid.pack(fill="x")
-        self._fact_width = (text_width - 3 * px(16)) // 4
+        grid.columnconfigure(1, weight=1)
         self.fact_labels: dict[str, tk.Label] = {}
-        for k, name in enumerate(FACTS):
-            grid.columnconfigure(k, weight=1, uniform="facts")
-            cell = on_card(grid)
-            cell.grid(row=0, column=k, sticky="nsew", padx=(0, px(16) if k < len(FACTS) - 1 else 0))
-            tk.Label(cell, text=name, font=theme.FONT_CAPTION, anchor="w", bd=0, padx=0, pady=0, background=white,
-                     foreground=theme.color("muted")).pack(fill="x")
-            value = self.fact_labels[name] = tk.Label(cell, font=theme.FONT, anchor="nw", justify="left", bd=0, padx=0, pady=0,
-                                                      height=2, background=white, foreground=theme.color("text"))
-            value.pack(fill="x", pady=(px(1), 0))
-            Hint((cell, value), lambda n=name: self.full.get(n, ""))  # the whole text where it is shortened
+        for row, name in enumerate(FACTS + TEXTS):
+            tall = name in TEXTS  # (several lines: its name stands at the top of them)
+            caption = tk.Label(grid, text=name, font=theme.FONT, anchor="nw", bd=0, padx=0, pady=0, background=white,
+                               foreground=theme.color("muted"))
+            caption.grid(row=row, column=0, sticky="nw", padx=(0, px(20)), pady=(px(6) if name == TEXTS[0] else px(2), px(2)))
+            value = self.fact_labels[name] = tk.Label(grid, font=theme.FONT, anchor="nw", justify="left", bd=0, padx=0, pady=0,
+                                                      height=self._lines.get(name, 1), background=white,
+                                                      foreground=theme.color("text"))
+            value.grid(row=row, column=1, sticky="ew", pady=(px(6) if name == TEXTS[0] else px(2), px(2)))
+            value.bind("<Configure>", lambda _e=None, n=name: self._fit_fact(n), add="+")
+            Hint((caption, value), lambda n=name: self.full.get(n, ""))  # the whole text where it is shortened
+
+    def _fit_fact(self, name: str) -> None:
+        """A fact on its one line, as wide as its place is (what does not fit ends in an ellipsis)."""
+        try:
+            label = self.fact_labels[name]
+            width = label.winfo_width()
+            text = self.full.get(name, "")
+            lines = self._lines.get(name, 1)
+            label.configure(text=clamp(text, theme.FONT, width, lines, self) if width > px(40) else text)
+        except tk.TclError:
+            pass
 
     def show(self, inc: incidents.Incident | None) -> None:
         self._title = short_title(inc) if inc else ""
@@ -175,25 +215,28 @@ class Summary(tk.Frame):
                            theme.severity_roles(inc.severity))
             self.state_label.configure(text=state_line(inc), foreground=theme.color("error" if inc.open else "muted"))
             stages = inc.stages
-            self.track.set({stage: f"{when.astimezone():%d.%m. %H:%M}" + ("" if still else ", dismissed")
+            self.track.set({stage: f"{timefmt.stamp(when)}" + ("" if still else ", dismissed")
                             for stage, (when, still) in stages.items()},
                            ROLE.get(inc.severity, "link"), settled=[k for k, (_when, still) in stages.items() if not still])
         else:
             self.badge.set("")
             self.state_label.configure(text="")
             self.track.set({})
-        self.full = facts(inc) if inc else {}
-        for name, label in self.fact_labels.items():
-            label.configure(text=clamp(self.full.get(name, ""), theme.FONT, self._fact_width, 2, self))
+        self.full = {**facts(inc), TEXTS[0]: inc.why, TEXTS[1]: inc.advice or NO_ADVICE} if inc else {}
+        for name in self.fact_labels:
+            self._fit_fact(name)
 
 
 def step_rows(inc: incidents.Incident | None) -> list[tuple[Alert, list[str]]]:
     """The alerts of an incident as table rows (STEP_COLS), in order."""
     rows = []
+    counted = {a.id for a in inc.own_alerts} if inc else set()
     for a in (inc.alerts if inc else []):
         stage = incidents.stage_of(a)
+        # what was only logged is context: it is no stop on the line above, so it does not carry a stop's name
         kind = ("Summary" if a.plugin_id == incidents.chains.CHAIN_PLUGIN else
                 "Response" if a.signal in incidents.chains.NOT_LINKS else
+                "Context" if a.id not in counted else
                 incidents.chains.STAGE_NAMES[stage] if stage else "-")
         rows.append((a, [_t(a.when), "" if kind == "Response" else a.severity.label, kind, STATE.get(a.status, a.status), a.title]))
     return rows
@@ -233,7 +276,7 @@ class IncidentsWindow:
         self.open_btn.pack(side="right")
         self.dismiss_btn = ttk.Button(footer, text="Dismiss its open reminders", command=self.dismiss_incident, state="disabled")
         self.dismiss_btn.pack(side="right", padx=(px(12), px(8)))
-        hint = stable_label(footer, HINT, width=inner - px(380), max_lines=2)
+        hint = stable_label(footer, "w" * 60, width=inner - px(380), max_lines=1)
         hint.pack(fill="x")
         self.hint = StatusLine(hint, HINT)
 
@@ -251,35 +294,56 @@ class IncidentsWindow:
         tree.pill("Severity", lambda value: theme.severity_roles(value.split(" ")[0]) if value else None)  # with the risk
         tree.note_of("Incident", lambda iid: progress(self._incidents[iid]) if iid in self._incidents else "")
         tree.cell_role("Incident", lambda _value, tags: "muted" if "closed" in tags else None)
-        tree.show_as("Last activity")               # "Today 13:48"
+        tree.show_as("Last activity", ago)          # "3 hours ago": what matters for which one first
         self.sort = make_sortable(tree, COLS)
         tree.grid(row=0, column=0, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", lambda _e: self._incident_selected())
         tree.bind("<Double-1>", lambda e: self.open_incident() if tree.identify_row(e.y) else None)
+        tree.tag_configure("closed", pill="sev_info_bg|sev_info_fg")  # colour only where something needs a look
 
-        right = ttk.Frame(body)
-        right.grid(row=0, column=1, sticky="nsew", padx=(px(12), 0))
-        text_w = inner - px(LIST + 12 + 2 * 16 + 6)
+        # in the place of the list when it is empty (same size, same card): nothing open is good news, said plainly
+        empty = self.empty = card(body)
+        empty.grid(row=0, column=0, sticky="nsew")
+        middle = on_card(empty)
+        middle.place(relx=0.5, rely=0.4, anchor="center")
+        white = theme.color("card")
+        self._empty_images = {True: theme.icon(empty, "check", "neg", 28), False: None}
+        self.empty_icon = tk.Label(middle, background=white, bd=0, highlightthickness=0)
+        self.empty_icon.pack(pady=(0, px(8)))
+        self.empty_title = tk.Label(middle, font=theme.FONT_BOLD, background=white, foreground=theme.color("text"), bd=0)
+        self.empty_title.pack()
+        self.empty_link = tk.Label(middle, font=theme.FONT, background=white, foreground=theme.color("link"), bd=0)
+        self.empty_link.pack(pady=(px(6), 0))
+        self.empty_link.bind("<Button-1>", lambda _e=None: self.show_filter("closed") if self.empty_link.cget("text") else None)
+        self.empty_note = tk.Label(middle, font=theme.FONT_CAPTION, background=white, foreground=theme.color("muted"), bd=0,
+                                   wraplength=px(LIST - 60), justify="center")
+        self.empty_note.pack(pady=(px(14), 0))
+        tk.Misc.lower(empty.outer, tree.outer)
+
+        # The chosen incident, on the right. Whose it is, is shown, not said again (the list says who, how bad and how
+        # much of it is open): the right side is framed in the accent colour and an arrowhead on its edge points at
+        # the selected incident and follows it.
+        body.columnconfigure(1, weight=0)
+        body.columnconfigure(2, weight=1)
+        self.pointer = Pointer(body)
+        self.pointer.grid(row=0, column=1, sticky="ns", padx=(px(3), 0))
+        frame = self.frame = Rounded(body, fill="window", edge="link")
+        frame.grid(row=0, column=2, sticky="nsew")
+        right = self._right = tk.Frame(frame, background=theme.color("window"), bd=0, highlightthickness=0)
+        right.pack(fill="both", expand=True, padx=px(8), pady=px(8))
+        text_w = inner - px(LIST + 14 + 2 * 11 + 2 * 16 + 6)
+        tree.on_drawn(self._point)
+        body.bind("<Configure>", lambda _e=None: self._point(), add="+")
 
         # ---- what happened: the chosen incident
         box = card(right)
         box.pack(fill="x")
         about = on_card(box, padx=px(16), pady=px(12))
         about.pack(fill="x")
-        self.block = Summary(about, text_w)
+        self.block = Summary(about, text_w, header=False)
         self.block.pack(fill="x")
         self.title_label, self.badge, self.state_label = self.block.title_label, self.block.badge, self.block.state_label
         self.track, self.fact_labels = self.block.track, self.block.fact_labels
-
-        # ---- how sure, and what now
-        box = card(right)
-        box.pack(fill="x", pady=(px(10), 0))
-        advice = on_card(box, padx=px(16), pady=px(10))
-        advice.pack(fill="x")
-        self._text_width = text_w
-        self._full: dict[str, str] = {}
-        self.why_label = self._passage(advice, "Strongest finding", "why", 0)
-        self.advice_label = self._passage(advice, "What to do", "advice", px(8))
 
         # ---- the evidence: its alerts in order
         steps = self.steps = CardTable(right, STEP_COLS, selectmode="extended")
@@ -302,18 +366,6 @@ class IncidentsWindow:
         top.focus_force()
         tree.focus_set()
 
-    def _passage(self, parent: tk.Misc, caption: str, key: str, gap: int) -> tk.Label:
-        """A caption with two lines of text under it (longer text ends in an ellipsis; the pointer shows all)."""
-        white = theme.color("card")
-        head = tk.Label(parent, text=caption, font=theme.FONT_CAPTION, anchor="w", bd=0, padx=0, pady=0, background=white,
-                        foreground=theme.color("muted"))
-        head.pack(fill="x", pady=(gap, 0))
-        label = tk.Label(parent, font=theme.FONT, anchor="nw", justify="left", bd=0, padx=0, pady=0, height=2,
-                         background=white, foreground=theme.color("text"))
-        label.pack(fill="x", pady=(px(1), 0))
-        Hint((head, label), lambda: self._full.get(key, ""), wrap=px(520))
-        return label
-
     # ------------------------------------------------------------------ state
     def exists(self) -> bool:
         try:
@@ -334,8 +386,8 @@ class IncidentsWindow:
         found = incidents.group(self.app.alerts.since(now - incidents.timedelta(days=incidents.LOOKBACK_DAYS + 1)), now)
         self._all = found
         open_count = sum(1 for i in found if i.open)
-        if not self._filter:
-            self._filter = "open" if open_count else "all"
+        if not self._filter:  # it opens on what is open - also when that is nothing (then it says so, plainly)
+            self._filter = "open"
             self.filter.choose(self._filter, tell=False)
         self.filter.set_text("open", f"Open {open_count}")
         self.filter.set_text("closed", f"Closed {len(found) - open_count}")
@@ -348,16 +400,33 @@ class IncidentsWindow:
             self.tree.insert("", "end", iid=inc.id, tags=("open" if inc.open else "closed",), values=[
                 f"{inc.severity.label} · {inc.risk}" if inc.risk else inc.severity.label, who(inc), _t(inc.last)])
         self.sort.reapply()  # type: ignore[attr-defined]
-        self.summary.configure(text=(
-            f"{len(found)} incident{'s' if len(found) != 1 else ''} in the last {incidents.LOOKBACK_DAYS} days: "
-            f"{open_count} open, {len(found) - open_count} closed."
-            if found else f"No incidents in the last {incidents.LOOKBACK_DAYS} days: no two alerts belong together.")
-            + self._alone(found) + f" Data as of {now.astimezone():%H:%M}.")
+        self.summary.configure(text=(  # (how many are open and closed: on the buttons beside it)
+            f"Last {incidents.LOOKBACK_DAYS} days." if found else f"No incidents in the last {incidents.LOOKBACK_DAYS} days.")
+            + self._alone(found) + f" Data as of {timefmt.clock(now)}.")
         if selected in self._incidents:
             self.tree.selection_set(selected)
         elif shown:
             self.tree.selection_set(shown[0].id)
+        self._show_empty(found, shown)
         self._incident_selected()
+
+    def _show_empty(self, found: list[incidents.Incident], shown: list[incidents.Incident]) -> None:
+        """In the place of the list when it has nothing to show: what that means, and where the rest is."""
+        closed = sum(1 for i in found if not i.open)
+        if shown:
+            tk.Misc.lower(self.empty.outer, self.tree.outer)  # (a canvas: its own lower() is for its items)
+            return
+        if self._filter == "open":
+            title, done = "No open incidents", True
+            link = (f"{closed} closed in the last {incidents.LOOKBACK_DAYS} days" if closed else "")
+        else:
+            title, done = ("No closed incidents" if self._filter == "closed" else "No incidents"), False
+            link = ""
+        self.empty_title.configure(text=title)
+        self.empty_icon.configure(image=self._empty_images[done] or "")
+        self.empty_link.configure(text=link, cursor="hand2" if link else "")
+        self.empty_note.configure(text=self._alone(found).strip())  # single alerts may still be open: not "all clear"
+        tk.Misc.lift(self.empty.outer, self.tree.outer)
 
     def _alone(self, found: list[incidents.Incident]) -> str:
         """What is open beside the incidents: single alerts, which are in the reminders (this page shows stories)."""
@@ -385,8 +454,7 @@ class IncidentsWindow:
         if incident_id not in self._incidents and any(i.id == incident_id for i in self._all):
             self.filter.choose("all")  # it is there, only not among the ones shown
         if incident_id not in self._incidents:
-            self.hint.show("That incident is no longer there: its alerts are older than the window shows, or no "
-                           "longer belong together.", error=True)
+            self.hint.show("That incident is no longer there.", error=True)
             return False
         self.tree.selection_set(incident_id)
         self.tree.see(incident_id)
@@ -402,10 +470,8 @@ class IncidentsWindow:
         self.steps.delete(*self.steps.get_children(""))
         self._steps = {}
         self.block.show(inc)
+        self._point()
         self._fact_full = self.block.full
-        self._full = {"why": inc.why, "advice": inc.advice} if inc else {}
-        self.why_label.configure(text=clamp(self._full.get("why", ""), theme.FONT, self._text_width, 2, self.top))
-        self.advice_label.configure(text=clamp(self._full.get("advice", ""), theme.FONT, self._text_width, 2, self.top))
         for a, values in step_rows(inc):
             iid = str(a.id)
             self._steps[iid] = a
@@ -415,6 +481,20 @@ class IncidentsWindow:
         if keep:
             self.steps.selection_set(keep)
         self._buttons()
+
+    def _point(self) -> None:
+        """The arrowhead at the height of the selected incident."""
+        try:
+            chosen = (self.tree.selection() or [""])[0]
+            self.pointer.at(self.tree.row_middle(chosen) if chosen in self._incidents else None)
+            mine = chosen in self._incidents
+            self.frame.set_edge("link" if mine else "window")  # framed when it is somebody's ...
+            if mine and not self._right.winfo_manager():
+                self._right.pack(fill="both", expand=True, padx=px(8), pady=px(8))
+            elif not mine and self._right.winfo_manager():
+                self._right.pack_forget()  # ... and empty, not a form without values, when no incident is selected
+        except tk.TclError:
+            pass
 
     def _buttons(self) -> None:
         inc = self._incident()
@@ -446,5 +526,4 @@ class IncidentsWindow:
         ids = self.app.dismiss_alerts(ids, self.top)
         self.app.on_alerts_dismissed()
         self.refresh()
-        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} of the incident dismissed. They come back by "
-                       f"themselves if something gets worse, and stay in the alert history.")
+        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} dismissed.")

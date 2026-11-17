@@ -11,6 +11,7 @@ connection and the other sections are switched off until RADAR can read what it 
 """
 from __future__ import annotations
 
+from .. import timefmt
 import logging
 import tkinter as tk
 from datetime import datetime, timezone
@@ -461,6 +462,7 @@ class MainWindow:
         """Bring a section to the front (and, for the settings, one of its pages); built on first use."""
         if page not in self.nav.items or page == MAP or (self._setup_mode and page != SETTINGS):
             page = SETTINGS if self._setup_mode else "incidents"
+        came_from = self.current
         self.nav.select(page)
         if page not in self._frames:
             try:
@@ -477,6 +479,8 @@ class MainWindow:
             if win is not None and not getattr(win, "_loaded_once", False):
                 win._loaded_once = True
                 win.load(then_refresh=True)  # at once what the app has, meanwhile fresh data in the background
+            elif win is not None and came_from != "attacks":
+                win.opened()
         elif page == "reports":
             self._pages["reports"].load()
             try:  # its figures have been looked at: the mark goes
@@ -549,7 +553,8 @@ class MainWindow:
         if sub not in dict(SETTINGS_PAGES) or (self._setup_mode and sub != "account"):
             sub = "account" if self._setup_mode else "detection"
         self.sub_nav.select(sub)
-        self.settings_intro.configure(text=SETUP_INTRO if self._setup_mode else self.INTROS[sub])
+        # (which page it is, the list beside it says; the words are for the first set-up only)
+        self.settings_intro.configure(text=SETUP_INTRO if self._setup_mode else "")
         if sub not in self._sub_frames:
             try:
                 self._sub_frames[sub] = self._build_sub(sub)
@@ -806,9 +811,9 @@ class MainWindow:
         if app.last_scan:
             scheduler = getattr(app, "scheduler", None)
             coming = scheduler.next_scan() if scheduler is not None and hasattr(scheduler, "next_scan") else None
-            then = f"Next scan {coming.astimezone():%H:%M}" if coming else ""
-            return "neg", "Monitoring", f"Last scan {app.last_scan.astimezone():%H:%M}" + (chr(10) + then if then else "")
-        return "muted", "Waiting for first scan", "Starts shortly after RADAR has started"
+            then = f"Next scan {timefmt.clock(coming)}" if coming else ""
+            return "neg", "Monitoring", f"Last scan {timefmt.clock(app.last_scan)}" + (chr(10) + then if then else "")
+        return "muted", "Waiting for first scan", ""
 
     def account_now(self) -> tuple[str, str]:
         """Who RADAR is signed in as: (the person's name, shown on one line; the address, for the hint).
@@ -816,7 +821,9 @@ class MainWindow:
         Where the sign-in did not tell the name, the part of the address before the @ stands for it."""
         account = "" if self._setup_mode else (self.app.auth.account or "")
         if not account:
-            return "Nobody yet", ""
+            # (right after the start the sign-in is still on its way: that is not "nobody")
+            checking = not self._setup_mode and getattr(self.app.auth, "state", "") == "unknown"
+            return ("Checking..." if checking else "Nobody yet"), ""
         name = str(getattr(self.app.auth, "display_name", None) or "").strip()
         return name or account.partition("@")[0], account
 
@@ -843,7 +850,7 @@ class MainWindow:
             return text
         while text and measure(text + "\u2026") > self._status_width:
             text = text[:-1]
-        return text.rstrip() + "\u2026"
+        return timefmt.keep_whole(text.rstrip() + "\u2026")
 
     def _status(self) -> None:
         try:
@@ -974,14 +981,13 @@ class ReportsPage:
                 return
             self.refresh_btn.configure(state="normal")
             self.tree.delete(*self.tree.get_children(""))
-            age = f" Accounts as of {as_of.astimezone():%d.%m. %H:%M}." if as_of else ""
+            age = f" Accounts as of {timefmt.stamp(as_of)}." if as_of else ""
             if finding is None:
                 self.summary.configure(text=(f"MFA exposure report: {error}" if error else getattr(
                     self.app, "NO_EXPOSURE", "No account can sign in without MFA.")) + age)
                 self._set_figures([])
                 return
-            self.summary.configure(text="MFA exposure: every account that can sign in without MFA, with clean-up candidates."
-                                   + age + (f" Not refreshed: {error}" if error else ""))
+            self.summary.configure(text="Accounts that can sign in without MFA." + age + (f" Not refreshed: {error}" if error else ""))
             figures = [(k, v) for k, v in finding.fields.items() if str(v).strip().isdigit()][:5]
             self._set_figures(figures)
             for i, row in enumerate(finding.evidence):

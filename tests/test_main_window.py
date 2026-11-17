@@ -55,7 +55,7 @@ def test_every_page_opens_and_the_old_windows_live_in_it(app, root, caplog):  # 
         settle(root)
         assert (win.current, win.current_settings) == ("settings", key)
         assert win.sub_nav.look(key)["bar"] == theme.color("link")
-        assert win.settings_intro.cget("text") == win.INTROS[key]
+        assert win.settings_intro.cget("text") == ""                    # (which page it is, the list beside it says)
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [r.getMessage() for r in caplog.records]
     # the windows of before are pages now: the same objects the app refreshes after every scan
     assert theme.is_panel(app._incidents.top) and theme.is_panel(app._history.top) and theme.is_panel(app._attacks_win.top)
@@ -314,3 +314,49 @@ def test_the_question_when_dismissing_is_a_window_of_radar_and_answers_by_its_bu
         assert confirm.ask(root, None, "One more reminder belongs to what you dismiss", ["Possible attack chain: dana@contoso.com"],
                            "Dismiss it as well?", yes="Dismiss it as well", no="Only what I chose") is expected
     assert seen[0] == ["Dismiss it as well", "Only what I chose"]
+
+
+def test_coming_back_to_the_attacks_page_tells_it_so(app, root):  # noqa: F811
+    """Opened from the navigation the page starts on the most dangerous kind again - not while it stays in view."""
+    app.count_attacked_accounts = lambda hours=72: 0
+    app.load_attacks = lambda win, hours, refresh=False, then_refresh=False: None
+    win = app._open_main()
+    settle(root)
+    win.show("attacks")
+    page, calls = win.page("attacks"), []
+    page.opened = lambda: calls.append(1)
+    win.show("attacks")                        # it is in view already
+    assert calls == []
+    win.show("incidents")
+    win.show("attacks")
+    assert calls == [1]
+
+
+def test_after_a_start_it_is_known_at_once_who_is_signed_in(app, root):  # noqa: F811
+    """Not 'Nobody yet' until the first scan has its turn (so it looked after every update): RADAR signs in
+    quietly when it starts, and until that has answered the card says that it is checking."""
+    calls = []
+    app.auth.get_token = lambda force_refresh=False: calls.append(1) or "token"
+    app.cfg.set("general", "setup_done", value=True)
+    app.cfg.set("auth", "client_id", value="11111111-2222-4333-8444-555555555555")
+    if True:
+        win = app._open_main()
+        settle(root)
+        app.auth.account, app.auth.state = None, "unknown"
+        assert win.account_now() == ("Checking...", "")
+        app.sign_in_quietly()
+        assert calls == [1]
+        app.auth.account, app.auth.state = "alex.morgan@contoso.com", "ok"
+        assert win.account_now() == ("alex.morgan", "alex.morgan@contoso.com")
+        app.auth.account, app.auth.state = None, "required"      # the sign-in did not work: nobody
+        assert win.account_now() == ("Nobody yet", "")
+
+        def fails(force_refresh=False):
+            raise RuntimeError("no network")
+
+        app.auth.get_token = fails
+        app.sign_in_quietly()                                    # (the next scan reports it: nothing breaks here)
+        app.cfg.set("general", "setup_done", value=False)
+        app.auth.get_token = lambda force_refresh=False: calls.append(2)
+        app.sign_in_quietly()                                    # not set up yet: the set-up signs in, with a window
+        assert calls == [1]

@@ -28,6 +28,7 @@ from the attacker's address" is one story, not three.
 """
 from __future__ import annotations
 
+from . import timefmt
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -243,7 +244,7 @@ def _step_rows(chain: list[Link], owners: dict[str, set[str]] | None = None) -> 
     """The steps as evidence rows. ``_key`` names the alert behind a step (hidden in the UI)."""
     rows = []
     for x in chain:
-        row = {"Time": x.when.astimezone().strftime("%Y-%m-%d %H:%M"), "Stage": f"{x.stage} {STAGE_NAMES[x.stage]}"}
+        row = {"Time": timefmt.sortable(x.when), "Stage": f"{x.stage} {STAGE_NAMES[x.stage]}"}
         if owners is not None:
             row["Account"] = ", ".join(sorted(owners[x.key]))
         row.update({"Step": x.title, "Score": str(x.score), "Reminder": x.status, "_key": x.key})
@@ -280,8 +281,8 @@ def chain_findings(alerts: Iterable, now: datetime) -> list[Finding]:
             factors=_step_factors(chain)
                     + ([(-15, "Sessions were revoked after the last step (handled?)")] if handled else []),
             fields={"Account": subject, "Chain": steps,
-                    "From / to": f"{chain[0].when.astimezone():%d.%m. %H:%M} - {chain[-1].end.astimezone():%d.%m. %H:%M}",
-                    **({"Sessions revoked": revs[-1].astimezone().strftime("%d.%m. %H:%M")} if revs else {})},
+                    "From / to": f"{timefmt.stamp(chain[0].when)} - {timefmt.stamp(chain[-1].end)}",
+                    **({"Sessions revoked": timefmt.stamp(revs[-1])} if revs else {})},
             evidence=_step_rows(chain),
             recommendation=("Check whether these steps belong together. If the account was not used by its owner in "
                             "this way: revoke sessions, reset the password, review MFA methods, app consents, inbox "
@@ -377,7 +378,7 @@ def spread_findings(alerts: Iterable, now: datetime) -> list[Finding]:
             occurred_at=chain[0].when,
             factors=_step_factors(chain) + [(SPREAD_POINTS, f"The steps run across {len(accounts)} accounts")],
             fields={"Accounts": ", ".join(accounts)[:300], "Chain": steps,
-                    "From / to": f"{chain[0].when.astimezone():%d.%m. %H:%M} - {chain[-1].end.astimezone():%d.%m. %H:%M}"},
+                    "From / to": f"{timefmt.stamp(chain[0].when)} - {timefmt.stamp(chain[-1].end)}"},
             evidence=_step_rows(chain, owners),
             recommendation=("Treat these accounts as one incident. Start with the account of the first step: revoke its "
                             "sessions and reset its password, then undo what it did to the others (MFA methods, roles, "

@@ -15,10 +15,10 @@ def settle(root, n=6):  # noqa: F811
 
 def test_times_are_written_the_way_one_reads_them():
     now = datetime(2026, 11, 12, 18, 0)
-    assert friendly_time("2026-11-12 13:48", now) == "Today 13:48"
-    assert friendly_time("2026-11-11 09:20", now) == "Yesterday 09:20"
-    assert friendly_time("2026-11-03 07:05", now) == "03.11. 07:05"
-    assert friendly_time("2025-12-31 23:59", now) == "31.12.2025 23:59"
+    assert friendly_time("2026-11-12 13:48 UTC+1", now) == "Today 13:48 UTC+1"          # (always with the time zone)
+    assert friendly_time("2026-11-11 09:20 UTC+1", now) == "Yesterday 09:20 UTC+1"
+    assert friendly_time("2026-11-03 07:05 UTC-5", now) == "03.11. 07:05 UTC-5"
+    assert friendly_time("2025-12-31 23:59 UTC", now) == "31.12.2025 23:59 UTC"
     assert friendly_time("", now) == "" and friendly_time("never", now) == "never"   # what is no time stays as it is
 
 
@@ -40,7 +40,7 @@ def test_rows_selection_and_sorting_work_like_the_table_it_replaces(root):  # no
     settle(root)
     assert table.get_children("") == ("r0", "r1", "r2") and table["columns"] == tuple(cols)
     assert table.set("r1", "Severity") == "Low" and table.item("r2", "values")[3] == "101" and table.item("r0", "tags") == ("open",)
-    assert table.set("r0", "When") == "2026-11-10 10:00" and table.shown_text("r0", "When") == "10.11. 10:00"
+    assert table.set("r0", "When") == "2026-11-10 10:00" and table.shown_text("r0", "When").startswith("10.11. 10:00 UTC")
 
     # sorting by a column works on the values, numbers as numbers; the arrow goes into the heading
     sort = make_sortable(table, cols)
@@ -93,3 +93,31 @@ def test_the_pointer_over_the_heading_finds_the_column_edges(root):  # noqa: F81
     table = CardTable(root, ["A", "B"], height=2)
     table.column("A", width=100)
     assert table._column_edge(100) == "A" and not table._column_edge(50)  # (dragging there changes the width)
+
+
+def test_a_stretching_column_gives_way_to_the_rows_button_when_the_table_is_narrow(root):  # noqa: F811
+    table = CardTable(root, ["Name", "Why"], height=2)
+    table.column("Name", width=120)
+    table.column("Why", width=400, stretch=True)
+    table.action("Add", lambda iid: None)
+    table.body.configure(width=360)
+    table.pack()
+    root.deiconify()
+    root.update()
+    try:
+        room = table.body.winfo_width() - table._action_width()
+        spans = table._spans()
+        assert spans[-1][1] + spans[-1][2] <= room          # the text column ends where the button begins
+        assert spans[-1][2] < 400                            # (narrower than asked for: its text is shortened)
+    finally:
+        root.withdraw()
+
+
+def test_a_shortened_cell_knows_its_whole_text_for_the_pointer(root):  # noqa: F811
+    table = CardTable(root, ["Name", "Why"], height=2)
+    table.column("Name", width=120)
+    table.column("Why", width=140)
+    long = "14 people signed in from this machine, up to 9 at the same time"
+    table.insert("", "end", iid="r", values=["AVD-POOL-0", long])
+    assert table.cut_text("r", "Why") == long          # shown with an ellipsis: the pointer gets the whole text
+    assert table.cut_text("r", "Name") == ""           # fits: nothing to add

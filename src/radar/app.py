@@ -1,6 +1,7 @@
 """Application wiring: Tk main thread + tray thread + scheduler thread."""
 from __future__ import annotations
 
+from . import timefmt
 import logging
 import os
 import queue
@@ -47,6 +48,11 @@ class App:
             log.warning("Responses could not be linked to the stored alerts", exc_info=True)
         try:  # what an earlier version stored differently: the report was a reminder, signals kept partners that
             #   no longer count
+            if not self.cfg.get("general", "times_zoned", default=False):  # once: times written without their zone
+                zoned = self.alerts.name_zones()
+                self.cfg.set("general", "times_zoned", value=True)
+                if zoned:
+                    log.info("%d stored alert(s): time zone added to their times", zoned)
             moved = self.alerts.to_signal(self.EXPOSURE_RULE, correlation.REPORT_SIGNAL)
             self.alerts.correlate_all()
             if moved:
@@ -87,6 +93,7 @@ class App:
         self.tray.start()
         if not self.demo:
             self._background(self.settle_after_update, name="settle")  # (reads the local history only)
+            self._background(self.sign_in_quietly, name="sign-in")
             self.scheduler.start()
         self.root.after(150, self._pump)
         if self.alerts.count_active():  # at logon: only demand attention if something is unseen
@@ -139,6 +146,16 @@ class App:
             except Exception:
                 log.exception("Background task %s failed", name)
         threading.Thread(target=runner, name=name, daemon=True).start()
+
+    def sign_in_quietly(self) -> None:
+        """At start (also after an update): sign in at once, without any window - so that it is known who RADAR is
+        signed in as before the first scan has its turn. What goes wrong here is the next scan's to report."""
+        if not self.setup_done or not self.auth.configured:
+            return
+        try:
+            self.auth.get_token()
+        except Exception as exc:  # noqa: BLE001 - the scan says it, with what to do
+            log.debug("No sign-in at start: %s", exc)
 
     def quit(self) -> None:
         self.stop_event.set()
@@ -581,7 +598,7 @@ class App:
             state, text = "busy", "scanning..."
         else:
             state = "ok"
-            text = f"last scan {self.last_scan.astimezone():%H:%M}" if self.last_scan else "starting..."
+            text = f"last scan {timefmt.clock(self.last_scan)}" if self.last_scan else "starting..."
         return state, f"{APP_DISPLAY_NAME} - {text}"
 
     def status_line(self) -> str:
@@ -595,7 +612,7 @@ class App:
         if self.last_error:
             return f"Status: {self.last_error[:80]}"
         if self.last_scan:
-            return f"Status: OK, last scan {self.last_scan.astimezone():%H:%M}"
+            return f"Status: OK, last scan {timefmt.clock(self.last_scan)}"
         return "Status: waiting for first scan"
 
     def plugin_status_text(self, rt: PluginRuntime) -> str:
@@ -604,7 +621,7 @@ class App:
         if rt.last_error:
             return f"Last run failed: {rt.last_error}"[:90]
         if rt.last_success:
-            return f"Last run {rt.last_success.astimezone():%H:%M}: {rt.status_text or f'{rt.last_findings} finding(s)'}"[:90]
+            return f"Last run {timefmt.clock(rt.last_success)}: {rt.status_text or f'{rt.last_findings} finding(s)'}"[:90]
         return "Not run yet" if self.plugins.is_enabled(rt.plugin.id) else "Disabled"
 
     def entry_id_field(self, alert: Alert) -> str:
@@ -1010,7 +1027,7 @@ class App:
         from .ui.details import DetailsWindow
 
         alert = Alert.from_finding(self.ATTACK_PLUGIN, account.as_finding())
-        alert.fields = {"Status": f"{account.status} (last attempt {account.last.astimezone():%d.%m. %H:%M})",
+        alert.fields = {"Status": f"{account.status} (last attempt {timefmt.stamp(account.last)})",
                         **alert.fields}
         DetailsWindow(self.root, self, alert, on_dismiss=lambda _a: None)
 

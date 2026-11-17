@@ -1,6 +1,7 @@
 """Sign-in threat detection plugin: incremental ingestion of tenant sign-ins + detection rules."""
 from __future__ import annotations
 
+from ... import timefmt
 import json
 from datetime import datetime, timedelta
 from typing import Any
@@ -226,7 +227,7 @@ class SignInThreatsPlugin(Plugin):
         if api == "beta":
             flt += f" and signInEventTypes/any(t: t eq '{event_type}')"
         params = {"$filter": flt, "$top": "1000"}
-        ctx.set_status(f"Fetching {event_type} sign-ins since {since.astimezone():%d.%m. %H:%M}...")
+        ctx.set_status(f"Fetching {event_type} sign-ins since {timefmt.stamp(since)}...")
 
         newest = parse_time(checkpoint) if checkpoint else None
         fetched, fresh = 0, []
@@ -574,7 +575,7 @@ class SignInThreatsPlugin(Plugin):
         f = found[0]
         f.key = "mfaexposure|on-demand"
         as_of = self.data_as_of(ctx)
-        f.fields = {"Data as of": as_of.astimezone().strftime("%Y-%m-%d %H:%M") if as_of else "unknown", **f.fields}
+        f.fields = {"Data as of": timefmt.sortable(as_of) if as_of else "unknown", **f.fields}
         return f
 
     # ---------------------------------------------------------- accounts

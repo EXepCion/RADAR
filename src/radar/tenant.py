@@ -40,7 +40,7 @@ def allows(cfg: Any, tenant_id: str) -> bool:
 
 def request_fresh_start(cfg: Any, tenant_id: str, now: datetime | None = None) -> str:
     """Note that the next start archives the stored data and continues with ``tenant_id``. Returns the archive name."""
-    name = f"{known(cfg) or 'unknown'}-{(now or datetime.now()).strftime('%Y%m%d-%H%M%S')}"
+    name = f"{known(cfg) or 'unknown'}-{(now or datetime.now()).strftime('%Y%m%d-%H%M%S')}"  # not a shown time: a folder name
     cfg.set("general", "start_fresh_archive", value=name)
     cfg.set("general", "start_fresh_for", value=str(tenant_id).strip().lower())
     return name
@@ -57,7 +57,7 @@ def apply_pending(cfg: Any, data_dir: Path, config_path: Path | None = None, wai
     tenant_id = pending(cfg)
     if not tenant_id:
         return None
-    name = str(cfg.get("general", "start_fresh_archive", default="") or "") or f"unknown-{datetime.now():%Y%m%d-%H%M%S}"
+    name = str(cfg.get("general", "start_fresh_archive", default="") or "") or f"unknown-{datetime.now():%Y%m%d-%H%M%S}"  # not a shown time: a folder name
     target = Path(data_dir) / "archive" / name
     target.mkdir(parents=True, exist_ok=True)
     for item in STORED:

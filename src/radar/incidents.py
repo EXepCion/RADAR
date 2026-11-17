@@ -19,6 +19,7 @@ Pure functions over stored alerts; no UI, no Graph.
 """
 from __future__ import annotations
 
+from . import timefmt
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -133,7 +134,7 @@ class Incident:
                     f"{'a reminder' if len(still) == 1 else 'reminders'}"
                     + (f" ({snoozed} snoozed)" if snoozed else "") + ".")
         times = [a.dismissed_at for a in self.reminders if a.dismissed_at]
-        when = f", the last on {max(times).astimezone():%d.%m. %H:%M}" if times else ""
+        when = f", the last on {timefmt.stamp(max(times))}" if times else ""
         return (f"Closed: all {total} alerts were dismissed{when}. Nothing in it is a reminder any more; it opens "
                 f"again by itself if one of them gets worse or a new alert joins.")
 

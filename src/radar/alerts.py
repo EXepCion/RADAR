@@ -1,6 +1,7 @@
 """AlertCenter: turns findings into persistent reminders with de-duplication, snooze and dismiss."""
 from __future__ import annotations
 
+from . import timefmt
 import json
 import logging
 import threading
@@ -241,6 +242,26 @@ class AlertCenter:
             self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=?",
                                 (MUTED, json.dumps(fields), row["id"]))
 
+    def name_zones(self) -> int:
+        """Alerts stored before RADAR named the time zone: every clock time in their texts gets its zone (they were
+        written in this PC's local time; see timefmt.zoned_text). Returns how many alerts changed."""
+        changed = 0
+        with self._lock:
+            for row in self._store.query("SELECT id, summary, recommendation, fields, factors, evidence FROM alerts"):
+                fields = {k: timefmt.zoned_text(v) if isinstance(v, str) else v for k, v in json.loads(row["fields"]).items()}
+                factors = [[p, timefmt.zoned_text(t)] for p, t in json.loads(row["factors"] or "[]")]
+                evidence = [{**r, "Time": timefmt.zoned_text(r["Time"])} if isinstance(r.get("Time"), str) else r
+                            for r in json.loads(row["evidence"] or "[]")]
+                new = (timefmt.zoned_text(row["summary"]), timefmt.zoned_text(row["recommendation"]), json.dumps(fields),
+                       json.dumps(factors), json.dumps(evidence))
+                old = (row["summary"], row["recommendation"], json.dumps(json.loads(row["fields"])),
+                       json.dumps([list(x) for x in json.loads(row["factors"] or "[]")]), json.dumps(json.loads(row["evidence"] or "[]")))
+                if new != old:
+                    self._store.execute("UPDATE alerts SET summary=?, recommendation=?, fields=?, factors=?, evidence=? WHERE id=?",
+                                        (*new, row["id"]))
+                    changed += 1
+        return changed
+
     def to_signal(self, rule_id: str, signal: str) -> int:
         """Alerts of a rule whose findings are context signals from now on (e.g. a report that moved to RADAR >
         Reports) leave the reminders. Returns how many did."""
@@ -385,7 +406,7 @@ class AlertCenter:
         added, lines, continued = [], [], 0
         for kind, other in sorted(latest.items(), key=lambda kv: kv[1].when):
             rule = correlation.RESPONSE_SIGNALS[kind]
-            when, by = f"{other.when.astimezone():%d.%m.%Y %H:%M}", other.fields.get("Initiated by") or "unknown"
+            when, by = f"{timefmt.stamp_year(other.when)}", other.fields.get("Initiated by") or "unknown"
             ok, refused = self._since(alert, other.when)
             if ok:
                 continued += ok

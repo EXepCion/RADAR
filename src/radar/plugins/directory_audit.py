@@ -6,6 +6,7 @@ is scored (0-100) and grouped per actor, rule and day.
 """
 from __future__ import annotations
 
+from .. import timefmt
 from pathlib import Path
 import fnmatch
 import json
@@ -583,7 +584,7 @@ def consent_findings(events: list[ConsentEvent], automation: list[str], user_con
                     "For": "all users" if any(e.all_principals for e in delegated) or perms["application"] else "one user",
                     **({"Used for": " | ".join(usage)} if usage else {})},
             evidence=[{
-                "Time": parse_time(a["activityDateTime"]).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "Time": timefmt.sortable(parse_time(a["activityDateTime"]), seconds=True),
                 "Activity": a.get("activityDisplayName", ""), "Initiated by": _initiator(a), "Targets": _targets(a),
                 "Correlation ID": a.get("correlationId", ""), "Audit ID": a.get("id", ""),
             } for a in sorted(audits, key=lambda a: a["activityDateTime"], reverse=True)[:50]],
@@ -623,7 +624,7 @@ def support_access_factors(audit: dict, assist_sp_id: str | None, cases: list[di
     if opened:
         case = max(opened, key=lambda c: c["at"])
         return [(-55, f"Microsoft Support access for the support case {case['by']} opened on "
-                      f"{parse_time(case['at']).astimezone():%d.%m.%Y %H:%M} (documented flow: read-only role, ends when "
+                      f"{timefmt.stamp_year(parse_time(case['at']))} (documented flow: read-only role, ends when "
                       f"the case closes, at the latest {SUPPORT_CASE_DAYS} days later)")]
     return [(-25, "Genuine Microsoft Support assignment (Assist API, Microsoft Support tenant) but no support case was "
                   f"opened by your admins in the {SUPPORT_CASE_DAYS} days before - check who requested support")]
@@ -813,7 +814,7 @@ class DirectoryAuditPlugin(Plugin):
                 fields={"Initiated by": who, "Activities": ", ".join(activities), "Roles": ", ".join(roles) or "-"},
                 subjects=[who] + ([f"app:{n.lower()}" for n in _app_names(audits)] if rid == "app_credentials" else []),
                 evidence=[{
-                    "Time": parse_time(a["activityDateTime"]).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Time": timefmt.sortable(parse_time(a["activityDateTime"]), seconds=True),
                     "Activity": a.get("activityDisplayName", ""),
                     "Category": a.get("category", ""),
                     "Initiated by": _initiator(a),
@@ -987,7 +988,7 @@ class DirectoryAuditPlugin(Plugin):
             occurred_at=when,
             fields={"Initiated by": who, "Partner": "ALL (default setting)" if default else partner or "not identifiable",
                     "Change": changed, **({"Partner users seen (14 d)": users} if users else {})},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", ""),
                        "Audit ID": audit.get("id", "")}],
             recommendation=("Confirm the change was requested (ticket / partner agreement) and who made it. Trusting a "
@@ -1070,7 +1071,7 @@ class DirectoryAuditPlugin(Plugin):
                      f"added as cross-tenant service provider. Microsoft engineers get the read-only 'Microsoft 365 "
                      f"Support Engineer' role while they work on it (record only, no alert)."),
             occurred_at=when, fields={"Initiated by": by, "Support tenant": MS_SUPPORT_TENANT},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": by, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
             links=[("Open audit logs", AUDIT_URL),
                    ("About support case access", "https://learn.microsoft.com/microsoft-365/admin/"
@@ -1116,7 +1117,7 @@ class DirectoryAuditPlugin(Plugin):
             summary=f"{who} changed the authorization policy. {reason}. This is how illicit consent grant phishing "
                     f"gets mailbox/file access without an admin.",
             occurred_at=when, fields={"Initiated by": who},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
             recommendation="Revert unless this was a decided policy change (Entra ID > Enterprise apps > Consent and "
                            "permissions > Do not allow user consent).",
@@ -1150,7 +1151,7 @@ class DirectoryAuditPlugin(Plugin):
             summary=(f"{who} registered {device} in Entra ID. A registered device gets long-lived sign-in tokens - "
                      f"after a phished session this is how attackers stay in. Recorded as a step for attack chains."),
             occurred_at=when, fields={"User": who, "Device": device},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
         )
 
@@ -1240,7 +1241,7 @@ class DirectoryAuditPlugin(Plugin):
             summary=f"{reason}. Initiated by {who}.",
             occurred_at=when,
             fields={"Group": group, "Excluded from": policies, "Member": member, "Initiated by": who},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
             recommendation=("Confirm this exclusion was approved and is needed. Every MFA exclusion is a password-only "
                             "door into the tenant - prefer restricting the account to its networks instead."
@@ -1311,7 +1312,7 @@ class DirectoryAuditPlugin(Plugin):
             summary=f"{who} invited {email or 'an external user'} as a guest into the tenant. {reason}.",
             occurred_at=when,
             fields={"Invited by": who, "Guest": email or "-", "Assessment": reason},
-            evidence=[{"Time": when.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "Activity": audit.get("activityDisplayName", ""),
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
                        "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
             recommendation=("Check why a private mailbox needs guest access. Guests can receive shared files and Teams "
                             "content; remove the guest if not justified and review what was shared with it."

@@ -125,9 +125,9 @@ def root():
     r.destroy()
 
 
-def test_attacks_window_shows_rows_and_opens_assessment(root, history):
+def test_attacks_page_lists_each_kind_and_opens_the_assessment(root, history):
     from radar.ui import theme
-    from radar.ui.attacks import AttacksWindow
+    from radar.ui.attacks import AttacksWindow, note
 
     theme.init(root)
     opened = []
@@ -142,41 +142,53 @@ def test_attacks_window_shows_rows_and_opens_assessment(root, history):
 
     win = AttacksWindow(root, App())
     win.load()
-    rows = [win.accounts_tree.item(i, "values") for i in win.accounts_tree.get_children()]
-    assert {r[1] for r in rows} == {"priya@contoso.com", "scanner@contoso.com"}
-    assert next(r for r in rows if r[1] == "priya@contoso.com")[5] == "dismissed"
-    assert next(r for r in rows if r[1] == "scanner@contoso.com")[3] == "EXCLUDED"
-    # the figures are on the tiles (once); the line under the title says where the attacks came from
-    assert [win.tiles.text(i) for i in range(3)] == ["2", "1", "1"]
-    assert "attacking IP(s)" in win.status.cget("text") and "under password guessing" not in win.status.cget("text")
-    win.accounts_tree.selection_set(win.accounts_tree.get_children()[0])
+    # the filter names the four kinds with their counts, the most dangerous first - and opens on the first there is
+    assert [win.filter.text(k) for k in ("known", "sessions", "guessing")] == ["Password known 1", "Stolen sessions 1",
+                                                                              "Password guessing 2"]
+    assert win.filter.text("ips").startswith("Attacking IPs ") and win.section == "known"
+    assert win.status.cget("text") == ""                    # (what there is to say about the addresses: with their list)
+    # a row of the list: is it going on, who, and under the name the facts that tell how bad
+    tree = win.accounts_tree
+    rows = {tree.set(i, "Who"): i for i in tree.get_children()}
+    assert set(rows) == {"priya@contoso.com", "scanner@contoso.com"} and list(tree["columns"]) == ["Status", "Who", "Last"]
+    facts = win.facts(rows["priya@contoso.com"])
+    assert facts["Reminder"] == "dismissed" and win.facts(rows["scanner@contoso.com"])["MFA"] == "EXCLUDED"
+    assert note("guessing", facts).startswith(f"{facts['Attempts']} attempts \u00b7 {facts['IPs']} IPs")
+    # the first row is selected: everything about it on the right, an arrowhead pointing at it
+    root.update()
+    first = win.known_tree.get_children()[0]
+    assert win.known_tree.selection() == (first,) and win.pointer.shown_at is not None and win.frame._edge == "link"
+    shown = win.row_text.get("1.0", "end")
+    assert "carol@contoso.com" in shown and "Pattern" in shown and str(win.open_btn.cget("state")) == "normal"
     win.open_selected()
-    win.tabs.select(1)
-    win.known_tree.selection_set(win.known_tree.get_children()[0])
+    assert opened == ["carol@contoso.com"]
+    win.show_filter("guessing")
+    root.update()
+    assert win._current_tree() is tree and tree.selection() and "Attempts" in win.row_text.get("1.0", "end")
+    tree.selection_set(rows["priya@contoso.com"])
+    win._selection_changed()
     win.open_selected()
-    assert opened[-1] == "carol@contoso.com"
-    assert win.tabs.tab(2, "text").strip("\u2007") == "Stolen sessions (1)"
-    assert win.tabs.tab(3, "text").startswith("Attacking IPs (")
+    assert opened[-1] == "priya@contoso.com"
+    win.show_filter("ips")                                  # an address has no assessment: it is looked up
+    root.update()
+    assert "tried only once or twice" in win.status.cget("text")
+    assert win.open_btn.cget("text") == "Look up address" and win.selected_account() is None
     win.top.destroy()
 
 
 def _geometry(win):
     """Position and size of everything whose movement the user would see."""
     win.top.update()
-    widgets = {"status": win.status, "tabs": win.tabs, "table": win.accounts_tree, "row": win.row_text,
-               "button": win.open_btn, "hint": win.hint.label}
+    widgets = {"status": win.status, "filter": win.filter, "list": win.accounts_tree.outer, "panel": win.frame.outer,
+               "row": win.row_text, "button": win.open_btn, "hint": win.hint.label}
     x0, y0 = win.top.winfo_rootx(), win.top.winfo_rooty()  # inside the window: where it is on the screen is not layout
-    places = {name: (w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for name, w in widgets.items()}
-    places["sash"] = win.body.sashpos(0)
-    return places
+    return {name: (w.winfo_rootx() - x0, w.winfo_rooty() - y0, w.winfo_width(), w.winfo_height()) for name, w in widgets.items()}
 
 
 def test_attacks_window_does_not_move_when_the_data_arrives(root, history):
     """A security tool must not rearrange itself while one reads it: same layout empty, loading, loaded, failed."""
-    from tkinter import font as tkfont, ttk
-
     from radar.ui import theme
-    from radar.ui.attacks import TAB_NAMES, AttacksWindow, tab_label
+    from radar.ui.attacks import AttacksWindow
 
     theme.init(root)
     results = []
@@ -189,21 +201,43 @@ def test_attacks_window_does_not_move_when_the_data_arrives(root, history):
             pass
 
     win = AttacksWindow(root, App())
-    assert win.body.sashpos(0) > 200, "the pane split is set before the window is shown, not by a timer"
     empty = _geometry(win)
     win.load()
-    assert _geometry(win) == empty
+    assert _geometry(win) == empty and win.empty_title.cget("text") == "Reading the sign-in history..."
     result = ongoing_attacks(build(history), 72)
     win.show(result, lambda section, row: "-")
     assert _geometry(win) == empty
     win.show_error("x" * 400)  # even a very long error message stays inside the reserved lines
     assert _geometry(win) == empty
+    for key in ("known", "sessions", "guessing", "ips"):     # the counts on the filter change, its buttons stay
+        win.show_filter(key)
+        assert _geometry(win) == empty
+    win.top.destroy()
 
-    # tab titles are equally wide while loading and with any count
-    font = tkfont.nametofont(str(ttk.Style(root).lookup("TNotebook.Tab", "font") or "TkDefaultFont"), root=root)
-    for name in TAB_NAMES:
-        widths = {font.measure(tab_label(name, n)) for n in (None, 0, 7, 42, 999)}
-        assert len(widths) == 1, (name, widths)
+
+def test_a_kind_with_nothing_says_so_plainly(root, history):
+    from radar.ui import theme
+    from radar.ui.attacks import AttacksWindow
+
+    theme.init(root)
+    result = ongoing_attacks(build(history), 72)
+    result.sessions.clear()
+
+    class App:
+        def load_attacks(self, win, hours):
+            win.show(result, lambda section, row: "-")
+
+        def open_attack_details(self, account):
+            pass
+
+    win = AttacksWindow(root, App())
+    win.load()
+    win.show_filter("sessions")
+    root.update()
+    assert win.filter.text("sessions") == "Stolen sessions 0"
+    assert win.empty_title.cget("text") == "Stolen sessions: nothing in the last 72 hours"
+    assert win.pointer.shown_at is None and win.frame._edge == "window"          # the panel is nobody's
+    assert win.row_text.get("1.0", "end").strip() == "" and str(win.open_btn.cget("state")) == "disabled"
     win.top.destroy()
 
 
@@ -223,25 +257,27 @@ def test_attacks_refresh_keeps_sort_order_and_selection(root, history):
 
     win = AttacksWindow(root, App())
     win.load()
+    win.show_filter("guessing")
     tree = win.accounts_tree
-    accounts = lambda: [tree.set(i, "Account") for i in tree.get_children()]  # noqa: E731
-    win.sort_accounts("Account")
-    win.sort_accounts("Account")  # descending
+    accounts = lambda: [tree.set(i, "Who") for i in tree.get_children()]  # noqa: E731
+    win._sorts["guessing"]("Who")
+    win._sorts["guessing"]("Who")  # descending
     ordered = accounts()
     assert ordered == sorted(ordered, reverse=True) and len(ordered) > 1
     tree.selection_set(tree.get_children()[-1])
-    chosen = tree.set(tree.selection()[0], "Account")
+    chosen = tree.set(tree.selection()[0], "Who")
     win.load()  # refresh
+    assert win.section == "guessing", "the kind the user chose stays"
     assert accounts() == ordered, "the sort arrow and the rows still agree"
-    assert tree.selection() and tree.set(tree.selection()[0], "Account") == chosen
+    assert tree.selection() and tree.set(tree.selection()[0], "Who") == chosen
     assert chosen in win.row_text.get("1.0", "end")
     win.top.destroy()
 
 
-def test_switching_tabs_keeps_every_table_mapped(root, history):
-    """Tables are raised, never unmapped and re-mapped (that showed the empty pane for a moment: a flash)."""
+def test_switching_the_kind_keeps_every_list_mapped(root, history):
+    """Lists are raised, never unmapped and re-mapped (that showed the empty pane for a moment: a flash)."""
     from radar.ui import theme
-    from radar.ui.attacks import AttacksWindow
+    from radar.ui.attacks import SECTION_KEYS, AttacksWindow
 
     theme.init(root)
     result = ongoing_attacks(build(history), 72)
@@ -261,18 +297,19 @@ def test_switching_tabs_keeps_every_table_mapped(root, history):
         win.top.update()
     unmapped = []
     for tree in win._trees:
-        tree.bind("<Unmap>", lambda _e: unmapped.append(1), add="+")
+        tree.outer.bind("<Unmap>", lambda _e: unmapped.append(1), add="+")
     place = lambda w: (w.winfo_rootx() - win.top.winfo_rootx(), w.winfo_rooty() - win.top.winfo_rooty(),  # noqa: E731
                        w.winfo_width(), w.winfo_height())
-    first = place(win.accounts_tree)
-    for index, tree in list(enumerate(win._trees)) + [(0, win.accounts_tree)]:
-        win.tabs.select(index)
+    first = place(win.accounts_tree.outer)
+    for key in SECTION_KEYS + ["guessing"]:
+        win.show_filter(key)
         win.top.update()
-        assert win._current_tree() is tree and tree.winfo_ismapped()
-        assert place(tree) == first, "every table has the same place"
-        # the chosen table is the top one of the stack (asked from Windows: independent of other windows)
+        tree = win.lists[key]
+        assert win._current_tree() is tree and tree.outer.winfo_ismapped()
+        assert place(tree.outer) == first, "every list has the same place"
+        # the chosen list is the top one of the stack (asked from Windows: independent of other windows)
         import ctypes
-        assert ctypes.windll.user32.GetTopWindow(win.tabs.stack.winfo_id()) == tree.master.winfo_id()
+        assert ctypes.windll.user32.GetTopWindow(win.body.winfo_id()) == tree.outer.winfo_id()
     assert not unmapped
     win.top.destroy()
 
@@ -317,4 +354,80 @@ def test_attacks_window_shows_cached_data_then_refreshes_and_shows_the_age(root,
     win.load()  # another period: computed from the local data, no new read from Entra
     assert calls[-1] == (False, False)
     assert _geometry(win) == before
+    win.top.destroy()
+
+
+def test_the_facts_of_a_row_start_at_one_place_whatever_the_row(root, history):
+    """The longest name there is does not push its value out of the column."""
+    from radar.ui import theme
+    from radar.ui.attacks import SECTION_KEYS, AttacksWindow
+
+    theme.init(root)
+    result = ongoing_attacks(build(history), 72)
+    for n, a in enumerate(result.accounts):
+        a.past_password = "No" if n else "Yes: 2 successful sign-in(s) from unfamiliar networks"
+
+    class App:
+        def load_attacks(self, win, hours):
+            win.show(result, lambda section, row: "open")
+
+        def open_attack_details(self, account):
+            pass
+
+    win = AttacksWindow(root, App())
+    win.load()
+    starts, text, seen = set(), win.row_text, set()
+    for key in SECTION_KEYS:
+        win.show_filter(key)
+        tree = win.lists[key]
+        for iid in tree.get_children()[:3]:
+            tree.selection_set(iid)
+            win._selection_changed()
+            win.top.update()
+            for line in range(2, int(text.index("end").split(".")[0])):
+                content = text.get(f"{line}.0", f"{line}.end")
+                at = f"{line}.{content.index(chr(9)) + 1}" if chr(9) in content else ""
+                box = text.bbox(at) if at else None
+                if box and not text.dump(at, f"{at}+1c", image=True):   # (a link's icon has its own small margin)
+                    starts.add(box[0])
+                    seen.add(content.split(chr(9))[0])
+    assert "Got past password" in seen and len(starts) == 1, (starts, seen)
+    win.top.destroy()
+
+
+def test_opening_the_page_again_starts_on_the_most_dangerous_kind(root, history):
+    """The kind the user chose stays through every refresh while the page is in view - and no longer."""
+    from radar.ui import theme
+    from radar.ui.attacks import AttacksWindow
+
+    theme.init(root)
+    result = ongoing_attacks(build(history), 72)
+
+    class App:
+        def load_attacks(self, win, hours):
+            win.show(result, lambda section, row: "-")
+
+        def open_attack_details(self, account):
+            pass
+
+    win = AttacksWindow(root, App())
+    win.opened()                               # before there is data: nothing to choose from, nothing breaks
+    win.load()
+    assert win.section == "known"
+    win.show_filter("ips")
+    win.load()                                 # a refresh
+    assert win.section == "ips"
+    win.opened()                               # the page comes into view again
+    assert win.section == "known" and win._current_tree() is win.lists["known"]
+    win.load()
+    assert win.section == "known"
+    result.password_known.clear()              # nothing of the most dangerous kind any more: the next there is
+    win.load()
+    win.show_filter("ips")
+    win.opened()
+    assert win.section == "sessions"
+    result.sessions.clear(); result.accounts.clear(); result.sources.clear()
+    win.load()
+    win.opened()
+    assert win.section == "guessing"           # nothing at all: the page says so on one kind
     win.top.destroy()

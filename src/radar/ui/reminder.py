@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from PIL import ImageTk
 
+from .. import timefmt
 from ..alerts import Alert
 from ..plugin_api import Severity
 from . import icons, theme
@@ -28,7 +29,7 @@ SNOOZE_CHOICES: list[tuple[str, int]] = [
 ]
 
 
-SUMMARY_LINES = 3
+SUMMARY_LINES = 2  # (the rest is one click away: Open item)
 NEW_ROW_BG = theme.LIGHT["new_row"]  # unseen reminders: bold on light blue (like unread mail)
 ATTENTION_BG = theme.LIGHT["attention"]  # header blink colour while waiting for the user (light palette)
 FOCUS_GRACE_SECONDS = 1.5  # focus gained right after showing is not a user interaction
@@ -66,7 +67,7 @@ def fit_lines(text: str, font: tkfont.Font, width: int, max_lines: int) -> str:
         last = lines[-1]
         while last and font.measure(last + ELLIPSIS) > width:
             last = last[:-1]
-        lines[-1] = last.rstrip(" ,.;:") + ELLIPSIS
+        lines[-1] = timefmt.keep_whole(last.rstrip(" ,.;:") + ELLIPSIS)  # (never a time without its zone)
     return "\n".join(lines[:max_lines])
 
 
@@ -119,7 +120,7 @@ class ReminderWindow:
         title_h, body_h = self._f_title.metrics("linespace"), self._f_body.metrics("linespace")
         caption_h = self._f_caption.metrics("linespace")
         # Fixed height: 1 title line + 1 info line + SUMMARY_LINES summary lines (the list must not jump).
-        height = px(14) + title_h + caption_h + px(6) + SUMMARY_LINES * body_h + px(16)
+        height = px(16) + title_h + px(2) + caption_h + px(10) + SUMMARY_LINES * body_h + px(18)
         holder = ttk.Frame(top, padding=(px(12), px(12), px(12), 0))
         holder.pack(fill="x")
         card_bg = theme.color("card")
@@ -130,16 +131,16 @@ class ReminderWindow:
         # created with its image so width/height are pixels (Tk uses characters for text-only labels)
         self.h_icon = tk.Label(header, background=card_bg, image=self._img("badge", icons.badge(Severity.INFO, px(36))),
                                width=px(36), height=px(36))
-        self.h_icon.grid(row=0, column=0, rowspan=3, sticky="n", padx=(px(14), px(12)), pady=px(14))
+        self.h_icon.grid(row=0, column=0, rowspan=3, sticky="n", padx=(px(16), px(14)), pady=px(16))
         flat = dict(bd=0, padx=0, pady=0, highlightthickness=0, background=card_bg)  # measured text == drawn text
         self.h_title = tk.Label(header, font=self._f_title, foreground=theme.color("text"), anchor="w",
                                 justify="left", **flat)
-        self.h_title.grid(row=0, column=1, sticky="ew", pady=(px(14), 0), padx=(0, px(14)))
+        self.h_title.grid(row=0, column=1, sticky="ew", pady=(px(16), px(2)), padx=(0, px(16)))
         self.h_when = tk.Label(header, foreground=theme.color("muted"), font=self._f_caption, anchor="w", **flat)
-        self.h_when.grid(row=1, column=1, sticky="ew", padx=(0, px(14)))
+        self.h_when.grid(row=1, column=1, sticky="ew", padx=(0, px(16)))
         self.h_summary = tk.Label(header, font=self._f_body, foreground=theme.color("text"), anchor="nw",
                                   justify="left", **flat)
-        self.h_summary.grid(row=2, column=1, sticky="new", pady=(px(6), 0), padx=(0, px(14)))
+        self.h_summary.grid(row=2, column=1, sticky="new", pady=(px(10), 0), padx=(0, px(16)))
         header.columnconfigure(1, weight=1)
         self._text_width = px(520)
         self._header_text = ("", "", "")
@@ -200,23 +201,26 @@ class ReminderWindow:
             self._set_header_text("No reminders", "", "")
             return
         inc = self._groups.get(rows[0])
-        if inc is not None:  # an incident: what it is, how far it got, what weighs most
+        # The header says what the selected row does not: the whole title, the exact time, what happened. How bad
+        # it is, how many alerts and how far it got stand in the row (and in the icon's colour) - not here again.
+        if inc is not None:
             from .incidents import short_title
 
             members = self._members[rows[0]]
             sev = max(a.severity for a in members)
             self.h_icon.configure(image=self._img(f"badge-{sev.name}", icons.badge(sev, px(36))))
-            when = (f"{sev.label} \u00b7 risk {max(a.score for a in members)}   \u00b7   Incident, {len(members)} open "
-                    f"alert{'s' if len(members) != 1 else ''}" + (f"   \u00b7   reached: {inc.stage_name}" if inc.stage_name else ""))
-            summary = (f"{len(rows)} rows selected. " if len(rows) > 1 else "") + (f"Strongest finding: {inc.why}" if inc.why else "")
+            when = f"{timefmt.stamp(inc.first)} \u2013 {timefmt.stamp(inc.last)}"
+            strongest = inc.strongest
+            reasons = ([str(text) for points, text in sorted(strongest.factors, key=lambda f: -int(f[0])) if int(points) > 0][:2]
+                       if strongest is not None else [])
+            summary = (f"{len(rows)} rows selected. " if len(rows) > 1 else "") + (
+                f"Strongest finding: {strongest.title}" + (": " + "; ".join(reasons) if reasons else "")
+                if strongest is not None else "")
             self._set_header_text(short_title(inc), when, summary)
             return
         sev = alert.severity
         self.h_icon.configure(image=self._img(f"badge-{sev.name}", icons.badge(sev, px(36))))
-        origin = self.app.describe_origin(alert)
-        score = f" · risk {alert.score}" if alert.factors else ""
-        when = (f"{sev.label}{score}   ·   {origin}   ·   "
-                f"{theme.local_time(alert.occurred_at or alert.first_seen, '%a %d.%m. %H:%M')}")
+        when = theme.local_time(alert.occurred_at or alert.first_seen, "%a %d.%m. %H:%M")
         summary = alert.summary
         if len(rows) > 1:
             summary = f"{len(rows)} rows selected. " + summary
@@ -231,7 +235,7 @@ class ReminderWindow:
         self.h_summary.configure(text=fit_lines(summary, self._f_body, width, SUMMARY_LINES))
 
     def _on_header_resize(self, event: tk.Event) -> None:
-        width = max(px(150), event.width - px(14 + 12 + 36 + 14 + 8))  # icon column, paddings, safety margin
+        width = max(px(150), event.width - px(16 + 14 + 36 + 16 + 8))  # icon column, paddings, safety margin
         if width != self._text_width:
             self._text_width = width
             self._set_header_text(*self._header_text)

@@ -2,6 +2,7 @@
 the directory audit records of one operation (all entries with the same correlation id)."""
 from __future__ import annotations
 
+from .. import timefmt
 import json
 import re
 import tkinter as tk
@@ -37,7 +38,7 @@ def _local(value: str | None) -> str:
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        return timefmt.sortable(dt, seconds=True)
     except ValueError:
         return value
 
@@ -346,6 +347,157 @@ def pretty_value(value: Any) -> str:
     return str(v)
 
 
+# ---- what a change changed: every setting of the old and the new value, side by side
+Change = tuple[str, str, str, str]  # (setting, before, after, "changed" | "added" | "removed" | "same")
+
+
+def _plain(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _settings(value: Any, path: str, out: dict[str, list[str]]) -> None:
+    """Every single setting of a (nested) value: {path: its text(s)} - several for a list of plain values."""
+    if isinstance(value, dict):
+        if not value:
+            out.setdefault(path, [])
+        for k, v in value.items():
+            _settings(v, f"{path}.{k}" if path else str(k), out)
+    elif isinstance(value, list) and any(isinstance(v, (dict, list)) for v in value):
+        for i, v in enumerate(value):
+            # (an entry with an id is that entry wherever it stands: one put in front does not change all others)
+            label = (v.get("id") or v.get("Id")) if isinstance(v, dict) else None
+            _settings(v, f"{path}[{label if isinstance(label, (str, int)) and label != '' else i}]", out)
+    else:
+        out.setdefault(path, []).extend(t for t in map(_plain, value if isinstance(value, list) else [value]) if t)
+
+
+def _whole(value: Any) -> Any:
+    v = _decode(value)
+    return v[0] if isinstance(v, list) and len(v) == 1 else v  # audit values are mostly one-element lists
+
+
+def compare(old: Any, new: Any) -> list[Change]:
+    """The old and the new value of a modified property, setting by setting. A list is compared entry by entry:
+    what was taken out, what was put in (the order of plain values says nothing)."""
+    before: dict[str, list[str]] = {}
+    after: dict[str, list[str]] = {}
+    _settings(_whole(old), "", before)
+    _settings(_whole(new), "", after)
+    rows: list[Change] = []
+    for path in list(after) + [p for p in before if p not in after]:
+        a, b = before.get(path, []), after.get(path, [])
+        if len(a) <= 1 and len(b) <= 1:
+            x, y = (a or [""])[0], (b or [""])[0]
+            if x or y:
+                rows.append((path, x, y, "same" if x == y else "added" if not x else "removed" if not y else "changed"))
+            continue
+        rows += [(path, x, "", "removed") for x in a if x not in b]
+        rows += [(path, "", y, "added") for y in b if y not in a]
+        rows += [(path, x, x, "same") for x in a if x in b]
+    return rows
+
+
+#: what the GUIDs of a setting are, by the last part of its name (for the links)
+_SETTING_KINDS = (("user", "user id"), ("application", "app id"), ("serviceprincipal", "app id"))
+
+
+def _setting_field(path: str) -> str:
+    last = path.rsplit(".", 1)[-1].lower()
+    return next((field for part, field in _SETTING_KINDS if part in last), "")
+
+
+def set_compare_columns(text: Any) -> tuple[int, int, int]:
+    """Setting | Before | After share the width of the text. Returns the room each has for its text (px)."""
+    gap = px(16)
+    try:
+        width = max(px(560), text.winfo_width() - px(28))
+        first = px(18) + int(width * 0.34)
+        second = first + int(width * 0.33)
+        # (a line of the comparison does not wrap: write_changes breaks each column inside its own room. Not said
+        # with the tag's wrap="none": Tk then puts a link's icon on a line of its own)
+        text.tag_configure("diff", tabs=(first, second), lmargin1=px(18), lmargin2=px(18),
+                           spacing1=px(2), spacing3=px(2))
+        text.tag_configure("diff_old", background=theme.color("sev_high_bg"))
+        text.tag_configure("diff_new", background=theme.color("diff_add"))
+        return first - px(18) - gap, second - first - gap, px(18) + width - second - gap
+    except tk.TclError:
+        return px(180), px(180), px(180)
+
+
+_BREAK = re.compile(r"(\s+|(?<=[,;./_=-]))")
+
+
+def _wrap(value: str, room: int, measure: Any) -> list[str]:
+    """``value`` in lines that fit ``room`` px: broken after a space or a separator, inside a word only when the
+    word alone is too long."""
+    if not value or measure(value) <= room:
+        return [value]
+    lines, line = [], ""
+    for part in (p for p in _BREAK.split(value) if p):
+        if measure(line + part) <= room:
+            line += part
+            continue
+        if line.strip():
+            lines.append(line.rstrip())
+        line = part.lstrip()
+        while measure(line) > room and len(line) > 1:
+            n = len(line) - 1
+            while n > 1 and measure(line[:n]) > room:
+                n -= 1
+            lines.append(line[:n])
+            line = line[n:]
+    if line.strip():
+        lines.append(line.rstrip())
+    return lines or [value]
+
+
+def write_changes(text: Any, properties: list[dict], unchanged: bool = False) -> int:
+    """The modified properties of a target as one comparison: setting, before, after - what was taken out marked
+    in the Before column, what was put in marked in the After column. Returns how many settings stayed as they
+    were (shown only with ``unchanged``)."""
+    import tkinter.font as tkfont
+
+    rooms = set_compare_columns(text)
+    try:
+        measure = tkfont.nametofont(theme.FONT, root=text).measure
+    except tk.TclError:
+        measure = lambda s: px(8) * len(s)  # noqa: E731
+    icon = px(22)  # a value that is a link has the link icon in front
+    same, head = 0, False
+    for p in properties:
+        name = p.get("displayName") or "Property"
+        rows = compare(p.get("oldValue"), p.get("newValue"))
+        same += sum(1 for r in rows if r[3] == "same")
+        shown = [r for r in rows if unchanged or r[3] != "same"]
+        if not shown:
+            continue
+        if not head:
+            text.write("Setting\tBefore\tAfter\n", "muted", "diff")
+            head = True
+        if any(r[0] for r in rows):  # a whole object (a policy ...): its settings stand under its name
+            text.write(f"{name}\n", "bold", "diff")
+        for path, before, after, kind in shown:
+            field = _setting_field(path or name)
+            old_tags = ("diff", "diff_old") if kind in ("changed", "removed") else ("diff",)
+            new_tags = ("diff", "diff_new") if kind in ("changed", "added") else ("diff",)
+            columns = [_wrap(path or name, rooms[0], measure), _wrap(before, rooms[1] - icon, measure),
+                       _wrap(after, rooms[2] - icon, measure)]
+            for k in range(max(len(c) for c in columns)):  # each column wraps inside its own room, side by side
+                setting, was, now = ((c[k] if k < len(c) else "") for c in columns)
+                text.write(setting + "\t", "diff")
+                if was:
+                    text.write_value(was, field, tags=old_tags)
+                text.write("\t", "diff")
+                if now:
+                    text.write_value(now, field, tags=new_tags)
+                text.write("\n", "diff")
+    return same
+
+
 TARGET_KINDS = {"user": "user", "group": "group", "serviceprincipal": "app", "device": "device"}
 
 
@@ -369,10 +521,29 @@ def audit_summary(r: dict) -> list[str]:
     return [_local(r.get("activityDateTime")), r.get("activityDisplayName") or "", who, result, targets]
 
 
-def write_audit(text: Any, r: dict) -> None:
-    """One directory audit record into a RichText, with links for the people, apps and objects in it."""
+def write_audit(text: Any, r: dict, unchanged: bool = False) -> int:
+    """One directory audit record into a RichText, with links for the people, apps and objects in it. What was
+    modified is a comparison (see write_changes); returns how many settings of it stayed as they were."""
+    same = 0
     reason = r.get("resultReason") or ""
     text.set_key_width(["Correlation ID", "Service principal ID", "Additional details", "Operation type"])
+    # what was changed comes first: who did it and when is already in the list above
+    targets = r.get("targetResources") or []
+    text.write(f"Targets ({len(targets)})\n", "heading")
+    for t in targets:
+        name_kind, id_kind = _target_kinds(t, r)
+        name = t.get("userPrincipalName") or t.get("displayName") or ""
+        text.write(f"{t.get('type') or 'Object'}:", "bold", "field")
+        text.write("\t", "field")
+        if name and name_kind and name_kind != "user":
+            text.write_link(name, Entity(name_kind, name), tags=("field",))
+        elif name:
+            text.write_value(name, tags=("field",))
+        if t.get("id"):
+            text.write("   id ", "muted", "field")
+            text.write_link(t["id"], Entity(id_kind, t["id"]), tags=("field",))
+        text.write("\n", "field")
+        same += write_changes(text, t.get("modifiedProperties") or [], unchanged)
     text.write("Activity\n", "heading")
     for k, v, kind in (("Date", _local(r.get("activityDateTime")), None),
                        ("Activity", r.get("activityDisplayName"), None), ("Category", r.get("category"), None),
@@ -403,51 +574,30 @@ def write_audit(text: Any, r: dict) -> None:
     if not user and not app:
         text.write("(not recorded)\n", "muted")
 
-    targets = r.get("targetResources") or []
-    text.write(f"Targets ({len(targets)})\n", "heading")
-    text.tag_configure("prop", lmargin1=px(18), lmargin2=px(18))
-    text.tag_configure("propval", lmargin1=px(36), lmargin2=px(36))
-    for t in targets:
-        name_kind, id_kind = _target_kinds(t, r)
-        name = t.get("userPrincipalName") or t.get("displayName") or ""
-        text.write(f"{t.get('type') or 'Object'}:", "bold", "field")
-        text.write("\t", "field")
-        if name and name_kind and name_kind != "user":
-            text.write_link(name, Entity(name_kind, name), tags=("field",))
-        elif name:
-            text.write_value(name, tags=("field",))
-        if t.get("id"):
-            text.write("   id ", "muted", "field")
-            text.write_link(t["id"], Entity(id_kind, t["id"]), tags=("field",))
-        text.write("\n", "field")
-        for p in t.get("modifiedProperties") or []:
-            old, new = pretty_value(p.get("oldValue")), pretty_value(p.get("newValue"))
-            if not old and not new:
-                continue
-            text.write(f"{p.get('displayName') or 'Property'}\n", "bold", "prop")
-            for label, value in (("old", old), ("new", new)):
-                if value:
-                    text.write(f"{label}: ", "muted", "propval")
-                    text.write_value(value, tags=("propval",))
-                    text.write("\n", "propval")
     details = [(d.get("key"), d.get("value")) for d in r.get("additionalDetails") or [] if d.get("value")]
     if details:
         text.write("Additional details\n", "heading")
         for k, v in details:
             text.write_field(str(k), str(v), name_tag="muted")
+    return same
 
 
 AUDIT_COLS = ["Time", "Activity", "Initiated by", "Result", "Targets"]
-AUDIT_WIDTHS = {"Time": 150, "Activity": 300, "Initiated by": 210, "Result": 90, "Targets": 200}
+AUDIT_WIDTHS = {"Time": 200, "Activity": 300, "Initiated by": 210, "Result": 90, "Targets": 200}
 
 
 class AuditWindow(_LogWindow):
     def __init__(self, root: tk.Tk, app: Any, subtitle: str, highlight: str = ""):
-        super().__init__(root, "Audit log entries", subtitle, app, size=(1000, 760),
+        super().__init__(root, "Audit log entries", subtitle, app, size=(1120, 780),
                          longest_status=self._portal_hint("8888-88-88", "W" * 60))
         self.highlight = highlight
         self.records: list[dict] = []
         ttk.Button(self.buttons, text="Open audit logs in Entra", command=self.open_portal).pack(side="left")
+        # a change of a policy names all its settings, old and new: shown is what differs - the rest on demand
+        self.unchanged = tk.BooleanVar(self.top, False)
+        self.unchanged_box = ttk.Checkbutton(self.buttons, text="Show unchanged settings", variable=self.unchanged,
+                                             command=self._show_again, state="disabled")
+        self.unchanged_box.pack(side="left", padx=(px(14), 0))
         self.copy_json_btn = ttk.Button(self.buttons, text="Copy JSON", command=self.copy_json, state="disabled")
         self.copy_json_btn.pack(side="right", padx=(0, px(6)))
         self.paned = ttk.PanedWindow(self.top, orient="vertical")
@@ -455,7 +605,7 @@ class AuditWindow(_LogWindow):
         # The list is there from the start with fixed columns: nothing is inserted or resized when the entries
         # have loaded.
         frame = ttk.Frame(self.paned)
-        tree = self.list = CardTable(frame, AUDIT_COLS, selectmode="browse", height=5)
+        tree = self.list = CardTable(frame, AUDIT_COLS, selectmode="browse", height=3)
         for c in AUDIT_COLS:
             tree.heading(c, text=c, anchor="w")
             tree.column(c, width=px(AUDIT_WIDTHS[c]), stretch=c == AUDIT_COLS[-1], anchor="w")
@@ -466,6 +616,8 @@ class AuditWindow(_LogWindow):
         tree.bind("<<TreeviewSelect>>", lambda _e: self._show(int(tree.selection()[0]) if tree.selection() else 0))
         detail = ttk.Frame(self.paned, padding=(0, px(8), 0, 0))
         self.text = scrolled_text(detail, self.links, height=12)
+        self._text_width = 0
+        self.text.bind("<Configure>", self._text_resized, add="+")
         self.paned.add(detail, weight=1)
 
     def show_records(self, records: list[dict]) -> None:
@@ -487,11 +639,26 @@ class AuditWindow(_LogWindow):
             tree.see(str(first))
         self._show(first)
 
-    def _show(self, index: int) -> None:
+    def _show(self, index: int, keep_place: bool = False) -> None:
+        place = self.text.yview()[0]
         self.text.clear()
+        same = 0
         if 0 <= index < len(self.records):
-            write_audit(self.text, self.records[index])
-            self.text.yview_moveto(0)
+            same = write_audit(self.text, self.records[index], unchanged=bool(self.unchanged.get()))
+            self.text.yview_moveto(place if keep_place else 0)
+        self.unchanged_box.configure(state="normal" if same else "disabled")
+
+    def _text_resized(self, event: tk.Event) -> None:
+        """The columns of the comparison follow the width: what is shown is laid out again for it."""
+        if abs(event.width - self._text_width) < px(4):
+            return
+        self._text_width = event.width
+        if self.records:
+            self._show_again()
+
+    def _show_again(self) -> None:
+        sel = self.list.selection()
+        self._show(int(sel[0]) if sel else 0, keep_place=True)
 
     def selected(self) -> dict | None:
         if not self.records:

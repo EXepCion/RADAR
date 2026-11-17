@@ -18,7 +18,7 @@ from .. import incidents
 from ..alerts import ACTIVE, SNOOZED, Alert
 from . import icons, theme
 from .cardtable import CardTable
-from .incidents import STEP_COLS, STEP_WIDTHS, Summary, clamp, state_role, step_rows
+from .incidents import STEP_COLS, STEP_WIDTHS, Summary, clamp, short_title, state_line, state_role, step_rows
 from .parts import Hint, Pointer, card, on_card
 from .rounded import Rounded
 from .richtext import LinkHandler, StatusLine, scrolled_text, stable_label
@@ -30,10 +30,14 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..app import App
 
 WIDTH, HEIGHT, MARGIN = 1280, 900, 20
-HINT = "Select an alert to see why it is rated as it is; double-click it for its evidence, links and everything else."
-GONE = ("These alerts no longer make an incident (they were judged anew, or too few of them are left). What the "
-        "window shows is how it was.")
-ADVICE_TEMPLATE = "w " * 300
+HINT = ""  # (the line at the bottom says what was done; the arrowhead shows what belongs to what)
+GONE = "These alerts no longer make an incident. The window shows how it was."
+
+
+def window_title(incident: incidents.Incident) -> str:
+    """What the window's title bar says: how bad, open or closed, and the incident's name."""
+    level = f"{incident.severity.label} {incident.risk}" if incident.risk else incident.severity.label
+    return f"Incident  \u00b7  {level}  \u00b7  {state_line(incident)}  \u00b7  {short_title(incident)}"[:160]
 
 
 class IncidentWindow:
@@ -43,7 +47,7 @@ class IncidentWindow:
         self._snooze_minutes = snooze_minutes
         self._steps: dict[str, Alert] = {}
         top = self.top = theme.new_window(root)
-        top.title(f"Incident - {incident.title}"[:120])
+        top.title(window_title(incident))
         top.geometry(f"{px(WIDTH)}x{min(px(HEIGHT), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(1040), px(700))
         top.bind("<Escape>", lambda _e: theme.close(top))
@@ -61,7 +65,7 @@ class IncidentWindow:
         self.dismiss_btn.pack(side="right", padx=(px(8), px(8)))
         self.snooze_btn = ttk.Button(footer, text=f"Snooze {snooze_label}", command=self.snooze)
         self.snooze_btn.pack(side="right", padx=(px(12), 0))
-        hint = stable_label(footer, GONE, width=inner - px(620), max_lines=2)
+        hint = stable_label(footer, GONE, width=inner - px(620), max_lines=1)
         hint.pack(fill="x")
         self.hint = StatusLine(hint, HINT)
 
@@ -71,18 +75,8 @@ class IncidentWindow:
         box.pack(fill="x")
         about = on_card(box, padx=px(16), pady=px(12))
         about.pack(fill="x")
-        self.block = Summary(about, inner - px(2 * 16 + 6))
+        self.block = Summary(about, inner - px(2 * 16 + 6), header=False, lines=(2, 2))  # (name and state: in the title bar)
         self.block.pack(fill="x")
-
-        box = card(body)
-        box.pack(fill="x", pady=(px(10), 0))
-        advice = on_card(box, padx=px(16), pady=px(10))
-        advice.pack(fill="x")
-        tk.Label(advice, text="What to do", font=theme.FONT_CAPTION, anchor="w", bd=0, padx=0, pady=0, background=white,
-                 foreground=theme.color("muted")).pack(fill="x")
-        self.advice = stable_label(advice, ADVICE_TEMPLATE, width=inner - px(2 * 16 + 6), min_lines=3, max_lines=3,
-                                   background=white, foreground=theme.color("text"))
-        self.advice.pack(fill="x", pady=(px(1), 0))
 
         lower = ttk.Frame(body)
         lower.pack(fill="both", expand=True, pady=(px(10), 0))
@@ -114,8 +108,7 @@ class IncidentWindow:
         right.pack(fill="both", expand=True, padx=px(10), pady=px(10))
         self.why_title = tk.Label(right, font=theme.FONT_BOLD, anchor="w", bd=0, padx=0, pady=0,
                                   background=theme.color("window"), foreground=theme.color("text"))
-        self.why_title.pack(fill="x", pady=(0, px(8)))
-        self._why_full = ""
+        self._why_full = ""  # (not shown: the arrowhead points at the alert the assessment is of)
         Hint((self.why_title,), lambda: self._why_full, wrap=px(520))  # (the whole title where it is shortened)
         self.why_title.bind("<Configure>", lambda _e=None: self._fit_title(), add="+")
         holder = tk.Frame(right, background=theme.color("window"), bd=0, highlightthickness=0)
@@ -163,9 +156,8 @@ class IncidentWindow:
 
     def show(self, incident: incidents.Incident) -> None:
         self.incident = incident
+        self.top.title(window_title(incident))
         self.block.show(incident)
-        self.advice.configure(text=incident.advice or "Look at its alerts in order and decide for each whether it was the "
-                                                      "person themselves.")
         chosen = [iid for iid in self.steps.selection()]
         self.steps.delete(*self.steps.get_children(""))
         self._steps = {}
@@ -242,8 +234,7 @@ class IncidentWindow:
         self.app.alerts.dismiss(ids)  # (all of it: nothing that goes with it is left to ask about)
         self.app.on_alerts_dismissed()
         self.refresh()
-        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} of the incident dismissed. They come back by "
-                       f"themselves if something gets worse, and stay in the alert history.")
+        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} dismissed.")
 
     def snooze(self) -> None:
         ids = self._open_ids(only_active=True)
@@ -252,4 +243,4 @@ class IncidentWindow:
         self.app.alerts.snooze(ids, self._snooze_minutes)
         self.app.on_alerts_dismissed()
         self.refresh()
-        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} of the incident snoozed.")
+        self.hint.show(f"{len(ids)} reminder{'s' if len(ids) != 1 else ''} snoozed.")

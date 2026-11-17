@@ -98,7 +98,7 @@ def test_history_window_lists_filters_and_reactivates(root):
         rows = {win.tree.set(i, "Alert"): win.tree.set(i, "State") for i in win.tree.get_children("")}
         assert rows == {"Password attack: bea@contoso.com": "dismissed", "New country (BR): cy@contoso.com": "open",
                         "Device registered by dan": "logged only", "Risky sign-in: eve@contoso.com": "open"}
-        assert "4 alerts kept (4 shown): 2 open, 0 snoozed, 1 dismissed, 1 logged only" in win.summary.cget("text")
+        assert "4 of 4 alerts: 2 open, 0 snoozed, 1 dismissed, 1 logged only" in win.summary.cget("text")
         assert str(win.reactivate_btn.cget("state")) == "disabled"            # nothing selected yet
         win.show_var.set("Dismissed")
         win.refresh()

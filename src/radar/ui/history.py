@@ -4,6 +4,7 @@ A reminder dismissed by accident is found here and reactivated: it returns to th
 """
 from __future__ import annotations
 
+from .. import timefmt
 import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
@@ -24,19 +25,19 @@ if TYPE_CHECKING:  # pragma: no cover
 
 WIDTH, MARGIN = 1180, 20
 COLS = ["Last seen", "First seen", "Severity", "State", "Source", "Alert"]
-WIDTHS = {"Last seen": 165, "First seen": 165, "Severity": 96, "State": 118, "Source": 210, "Alert": 400}
+WIDTHS = {"Last seen": 176, "First seen": 176, "Severity": 96, "State": 118, "Source": 210, "Alert": 400}
 STATE = {ACTIVE: "open", SNOOZED: "snoozed", DISMISSED: "dismissed", MUTED: "logged only"}
 STATE_ROLE = {ACTIVE: "text", SNOOZED: "text", DISMISSED: "muted", MUTED: "muted"}  # palette roles: what is over is grey
 SHOW = [("All alerts", None), ("Dismissed", {DISMISSED}), ("Open and snoozed", {ACTIVE, SNOOZED}), ("Logged only", {MUTED})]
 LEVELS = [("Any severity", Severity.INFO), ("Low and above", Severity.LOW), ("Medium and above", Severity.MEDIUM),
           ("High and above", Severity.HIGH)]
-HINT = "Double-click an alert for its details. Reactivate puts a dismissed or logged-only alert back among the reminders."
+HINT = ""  # (the line at the bottom says what was done)
 SUMMARY_TEMPLATE = "0000 alerts kept (0000 shown): 000 open, 000 snoozed, 0000 dismissed, 0000 logged only. Alerts are kept for 00 days."
 LIMIT = 5000
 
 
 def _t(when: Any) -> str:
-    return when.astimezone().strftime("%Y-%m-%d %H:%M") if when else ""
+    return timefmt.sortable(when) if when else ""
 
 
 def matches(alert: Alert, states: set[str] | None, level: Severity, words: list[str]) -> bool:
@@ -103,7 +104,7 @@ class HistoryWindow:
         footer.pack(side="bottom", fill="x")
         if not theme.is_panel(top):
             ttk.Button(footer, text="Close", command=top.destroy).pack(side="right", padx=(px(12), 0))
-        hint = stable_label(footer, HINT, width=inner)
+        hint = stable_label(footer, "w" * 60, width=inner, max_lines=1)
         hint.pack(fill="x")
         self.hint = StatusLine(hint, HINT)
 
@@ -168,8 +169,8 @@ class HistoryWindow:
         count = {s: sum(1 for a in everything if a.status == s) for s in STATE}
         days = self.app.cfg.get("general", "alert_retention_days", default=90)
         self.summary.configure(text=(
-            f"{len(everything)} alerts kept ({len(shown)} shown): {count[ACTIVE]} open, {count[SNOOZED]} snoozed, "
-            f"{count[DISMISSED]} dismissed, {count[MUTED]} logged only. Alerts are kept for {days} days."))
+            f"{len(shown)} of {len(everything)} alerts: {count[ACTIVE]} open, {count[SNOOZED]} snoozed, "
+            f"{count[DISMISSED]} dismissed, {count[MUTED]} logged only. Kept for {days} days."))
         self._selection_changed()
 
     def _selected(self) -> list[Alert]:
@@ -194,4 +195,4 @@ class HistoryWindow:
         self.app.alerts.reactivate(ids)
         self.app.on_alerts_reactivated()
         self.refresh()
-        self.hint.show(f"{len(ids)} alert{'s' if len(ids) != 1 else ''} reactivated: back among the reminders, marked as new.")
+        self.hint.show(f"{len(ids)} alert{'s' if len(ids) != 1 else ''} reactivated.")

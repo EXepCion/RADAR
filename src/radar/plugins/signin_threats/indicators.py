@@ -12,6 +12,7 @@ gateway). An indicator does not count against the sign-ins it was derived from.
 """
 from __future__ import annotations
 
+from ... import timefmt
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -60,7 +61,7 @@ class Indicator:
         return cls(**data)
 
     def describe(self) -> str:
-        return f"{self.reason} ({self.upn or 'an account'}, {self.when.astimezone():%d.%m. %H:%M})"
+        return f"{self.reason} ({self.upn or 'an account'}, {timefmt.stamp(self.when)})"
 
 
 def settings(rc: Any) -> tuple[bool, float]:

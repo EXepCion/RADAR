@@ -20,6 +20,7 @@ from . import icons, theme
 from .richtext import (LinkHandler, StatusLine, attach_table_menu, card, card_label, fit_columns, pill,
                        stable_label,
                        scrolled_text)
+from .parts import Hint
 from .riskcard import RiskCard
 from .tables import make_sortable
 from .cardtable import CardTable
@@ -29,8 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..app import App
 
 ENTRA_SIGNIN_LOGS = linkify.SIGNIN_LOGS_URL
-DEFAULT_HINT = ("Text with the link icon is a link: click it to open it, right-click for more options. Text can be "
-                "selected and copied.")
+DEFAULT_HINT = ""  # (the line at the bottom says what a link under the pointer does, and what was done)
 WIDTH, HEIGHT = 1120, 1040
 WIDTH_ROOMY = 1500   # opening width for an alert with details and a risk assessment (when the screen has it)
 WIDE_FROM = 1700      # from this window width the evidence stands beside the cards instead of below them
@@ -231,9 +231,15 @@ class DetailsWindow:
         meta = ttk.Frame(header)
         meta.grid(row=1, column=1, sticky="ew", pady=(px(6), 0))
         bg_role, fg_role = theme.severity_roles(a.severity)
-        score = f" · risk {a.score} / 100" if a.factors else ""
-        pill(meta, f"{a.severity.label}{score}", bg_role, fg_role).pack(side="left")
-        ttk.Label(meta, text=f"{origin}   ·   {self._when()}", style="Muted.TLabel").pack(side="left", padx=(px(10), 0))
+        # Under the title only what one asks first: how bad, and when. The score is on the Risk assessment card;
+        # which rule found it and when it was detected / updated appear when the pointer rests on the line.
+        level = pill(meta, a.severity.label, bg_role, fg_role)
+        level.pack(side="left")
+        when = ttk.Label(meta, text=theme.local_time(a.occurred_at or a.first_seen, "%a %d.%m.%Y %H:%M"),
+                         style="Muted.TLabel")
+        when.pack(side="left", padx=(px(10), 0))
+        self.header_when = when
+        self._header_note = Hint([level, when], lambda: self.header_note(origin))
         header.columnconfigure(1, weight=1)
         header.bind("<Configure>", lambda e: title.configure(wraplength=max(px(200), e.width - px(110))))
 
@@ -306,7 +312,8 @@ class DetailsWindow:
         box.columnconfigure(0, weight=11)
         text = self.info = scrolled_text(main, self.links, height=8)
         pad = text.card_blocks(padding=20)
-        rows = list(a.fields.items())
+        # (the risk score is on the Risk assessment card and under the title: not a third time among the details)
+        rows = [(k, v) for k, v in a.fields.items() if not (k == "Risk score" and a.factors)]
         text.set_key_width([k for k, _ in rows] or ["Details"], cap=280, indent=pad)
         self._two_columns: bool | None = None
         self.facts = None
@@ -391,6 +398,11 @@ class DetailsWindow:
         except Exception:  # noqa: BLE001 - the details must open whatever the grouping does
             return None
 
+    def header_note(self, origin: str) -> str:
+        """What the header leaves out, for the pointer resting on it: detected, updated, found by which rule."""
+        lines = [part[:1].upper() + part[1:] for part in self._when().split("   ·   ")[1:]]
+        return "\n".join(lines + [origin])
+
     def _when(self) -> str:
         """'occurred Tue 10.11.2026 11:02 · detected 11:58 · updated 12:40' (dates only where they differ)."""
         a = self.alert
@@ -440,8 +452,6 @@ class DetailsWindow:
         head = tk.Frame(frame, background=theme.color("card"))
         head.pack(fill="x", pady=(0, px(8)))
         card_label(head, f"Evidence ({len(a.evidence)})", font=theme.FONT_BOLD).pack(side="left")
-        card_label(head, "Double-click a row to open its log entry · right-click for more · click a header to sort",
-                   role="muted", font=theme.FONT_CAPTION).pack(side="left", padx=(px(12), 0))
         self.view_btn = ttk.Button(head, text="View log entry", command=self._view_selected, state="disabled")
         self.view_btn.pack(side="right")
         split = self.evidence_split = ttk.PanedWindow(frame, orient="vertical", style="Card.TPanedwindow")

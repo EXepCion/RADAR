@@ -39,6 +39,7 @@ CORE_DEFAULTS: dict[str, Any] = {
         "alert_retention_days": 90,
         "auto_close_low_days": 7,   # Low alerts that were seen and did not change for this long close themselves (0: never)
         "rules_settled_for": "",    # the version whose rules the open reminders were last judged with (after an update)
+        "times_zoned": False,       # the alerts stored before times named their zone were brought up to date
         "report_seen": "",          # the figures of the MFA exposure report when RADAR > Reports was last opened
         "open_main_at_start": False,  # open the main window when RADAR starts (off: only the tray icon)
         "check_for_updates": True,   # once a day: is there a newer release on GitHub? (tells, never downloads)
@@ -101,7 +102,7 @@ class ConfigManager:
                     self._mtime = self._stat()
                     if self._data:
                         return False  # keep running with the last good configuration
-                    backup = self.path.with_name(f"config.invalid-{time.strftime('%Y%m%d-%H%M%S')}.json")
+                    backup = self.path.with_name(f"config.invalid-{time.strftime('%Y%m%d-%H%M%S')}.json")  # not a shown time: a file name
                     try:
                         os.replace(self.path, backup)
                         log.error("Moved invalid configuration to %s and recreated defaults", backup)

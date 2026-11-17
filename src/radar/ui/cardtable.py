@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from tkinter import ttk
 from typing import Any, Callable
 
+from .. import timefmt
 from . import theme
 from .rounded import Rounded, rounded_image
 from .theme import px
@@ -23,17 +24,20 @@ ELLIPSIS = "…"
 
 
 def friendly_time(value: str, now: datetime | None = None) -> str:
-    """'2026-11-12 17:28' as one reads it: 'Today 17:28', 'Yesterday 17:28', '10.11. 17:28' ('10.11.2025 17:28')."""
+    """'2026-11-12 17:28 UTC+1' (timefmt.sortable) as one reads it: 'Today 17:28 UTC+1', 'Yesterday 17:28 UTC+1',
+    '10.11. 17:28 UTC+1' ('10.11.2025 17:28 UTC+1'). A value without its zone gets the local one of that day."""
     try:
-        when = datetime.strptime(value, "%Y-%m-%d %H:%M")
+        when = datetime.strptime(str(value)[:16], timefmt.SORTABLE)
     except (TypeError, ValueError):
         return value
+    zone = str(value)[16:].strip() or timefmt.zone(when.astimezone())
     today = (now or datetime.now()).date()
+    clock = f"{when.hour:02d}:{when.minute:02d} {zone}"
     if when.date() == today:
-        return f"Today {when:%H:%M}"
+        return f"Today {clock}"
     if when.date() == today - timedelta(days=1):
-        return f"Yesterday {when:%H:%M}"
-    return f"{when:%d.%m. %H:%M}" if when.year == today.year else f"{when:%d.%m.%Y %H:%M}"
+        return f"Yesterday {clock}"
+    return f"{when.day:02d}.{when.month:02d}." + (" " if when.year == today.year else f"{when.year} ") + clock
 
 
 def severity_pill(value: str) -> tuple[str, str] | None:
@@ -63,6 +67,9 @@ class CardTable(Rounded):
         self._row_h, self._head_h, self._pad = px(row_height), px(HEAD), px(PAD)
         self._notes: dict[str, Callable[[str], str]] = {}  # column -> a second, smaller line under its text
         self._drawn: Callable[[], None] | None = None      # told whenever the rows were drawn (scrolled, selected ...)
+        self._tip: tk.Toplevel | None = None               # the whole text of a shortened cell, under the pointer
+        self._tip_job: str | None = None
+        self._tip_cell: tuple[str, str] = ("", "")
         self._x = self._y = 0          # how far the rows are scrolled, in pixels
         self._auto = 0                 # ids given to rows inserted without one
         self._backs: dict[str, int] = {}   # visible row -> its background rectangle
@@ -95,7 +102,8 @@ class CardTable(Rounded):
         body.bind("<Configure>", lambda _e=None: self._redraw())
         body.bind("<Button-1>", self._click)
         body.bind("<Motion>", self._motion)
-        body.bind("<Leave>", lambda _e=None: (self._set_hover(""), self._leave_action()))
+        body.bind("<Leave>", lambda _e=None: (self._set_hover(""), self._leave_action(), self._hide_tip()))
+        body.bind("<ButtonPress>", lambda _e=None: self._hide_tip(), add="+")
         body.bind("<MouseWheel>", lambda e: self.yview("scroll", -1 if e.delta > 0 else 1, "wheel"))
         body.bind("<Shift-MouseWheel>", lambda e: self.xview("scroll", -1 if e.delta > 0 else 1, "wheel"))
         for key, step in (("<Up>", -1), ("<Down>", 1), ("<Prior>", -10), ("<Next>", 10), ("<Home>", -10 ** 9),
@@ -185,9 +193,56 @@ class CardTable(Rounded):
     def _action_width(self) -> int:
         return self._plain.measure(self._action[0]) + px(26) + 2 * self._pad if self._action else 0
 
+    TIP_DELAY = 600  # ms the pointer rests on a shortened cell before its whole text appears
+
+    def cut_text(self, iid: str, column: str) -> str:
+        """The whole text of a cell when the table shows it shortened (with an ellipsis), else ''."""
+        if iid not in self._rows or column not in self._cols or column in self._pills:
+            return ""
+        text = self.shown_text(iid, column)
+        width = next((w for name, _left, w in self._spans() if name == column), 0)
+        bold = any(self._tags.get(t, {}).get("font") for t in self._rows[iid]["tags"])
+        return text if text and self._fit(text, width - 2 * self._pad, bold) != text else ""
+
+    def _hide_tip(self) -> None:
+        try:
+            if self._tip_job is not None:
+                self.after_cancel(self._tip_job)
+            if self._tip is not None:
+                self._tip.destroy()
+        except tk.TclError:
+            pass
+        self._tip_job = self._tip = None
+        self._tip_cell = ("", "")
+
+    def _show_tip(self, text: str) -> None:
+        self._tip_job = None
+        try:
+            tip = self._tip = tk.Toplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tip.configure(background=theme.color("border"))
+            tk.Label(tip, text=text, font=theme.FONT_CAPTION, background=theme.color("card"), foreground=theme.color("text"),
+                     padx=px(8), pady=px(4), bd=0, justify="left", wraplength=px(460)).pack(padx=1, pady=1)
+            tip.update_idletasks()
+            x = min(self.winfo_pointerx() + px(12), self.winfo_vrootx() + self.winfo_vrootwidth() - tip.winfo_reqwidth())
+            tip.geometry(f"+{max(0, x)}+{self.winfo_pointery() + px(18)}")
+            tip.deiconify()
+        except tk.TclError:
+            self._tip = None
+
     def _motion(self, event: tk.Event) -> None:
         iid = self.identify_row(event.y)
         self._set_hover(iid)
+        cell = (iid, self.identify_column(event.x) if iid else "")
+        if cell != self._tip_cell:  # another cell: what was shown goes, and the wait starts anew
+            self._hide_tip()
+            self._tip_cell = cell
+            column = self.columns[int(cell[1][1:]) - 1] if cell[1].startswith("#") and cell[1][1:].isdigit() else cell[1]
+            whole = self.cut_text(iid, column) if iid and column in self._cols else ""
+            if whole:
+                self._tip_job = self.after(self.TIP_DELAY, lambda: self._show_tip(whole))
         over = bool(iid and self._action and event.x >= self.body.winfo_width() - self._action_width())
         on = iid if over else ""
         if on != self._over_action:  # the button under the pointer is tinted, like any button
@@ -385,6 +440,10 @@ class CardTable(Rounded):
         stretch = [c for c in self.columns if self._cols[c]["stretch"]]
         if spare > 0 and stretch:
             widths[stretch[-1]] += spare
+        elif spare < 0 and stretch and self.xbar is None:
+            # too narrow for the widths asked for (and nothing to scroll sideways): the stretching column gives way,
+            # its text ends in an ellipsis - it never runs under the row's button or out of the card
+            widths[stretch[-1]] = max(px(60), widths[stretch[-1]] + spare)
         spans, x = [], 0
         for c in self.columns:
             spans.append((c, x, widths[c]))
@@ -485,7 +544,7 @@ class CardTable(Rounded):
                     lo = mid
                 else:
                     hi = mid - 1
-            out = text[:lo].rstrip() + ELLIPSIS if lo else ""
+            out = timefmt.keep_whole(text[:lo].rstrip() + ELLIPSIS) if lo else ""  # (never a time without its zone)
         if len(self._cut) > 20000:
             self._cut.clear()
         self._cut[key] = out
@@ -498,7 +557,7 @@ class CardTable(Rounded):
             return text
         while text and small.measure(text + "\u2026") > width:
             text = text[:-1]
-        return text.rstrip() + "\u2026"
+        return timefmt.keep_whole(text.rstrip() + "\u2026")
 
     def _back(self, iid: str) -> str:
         if iid in self._sel:
@@ -575,6 +634,10 @@ class CardTable(Rounded):
                 if not text:
                     continue
                 pill = self._pills[name](value) if name in self._pills else None
+                if pill:  # a tag may give its rows' pills other colours (tag_configure(tag, pill="background|text"))
+                    other = next((self._tags[t]["pill"] for t in row["tags"] if self._tags.get(t, {}).get("pill")), "")
+                    if "|" in other:
+                        pill = tuple(other.split("|", 1))
                 if pill:
                     label = self._fit(text, w - 2 * pad - px(16), True)
                     tw, ph = self._bold.measure(label) + px(16), px(22)

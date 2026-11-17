@@ -1,5 +1,29 @@
 RADAR - Risky Activity Data Analyzer and Reporter, for Microsoft Entra ID.
 
+**New in 1.0.8** (cleaner screens, one layout for incidents and attacks)
+
+- *Ongoing attacks* is laid out like *Incidents*: one row of buttons with counts (password known, stolen
+  sessions, password guessing, attacking IPs), a list with a status pill and the key facts under each name, and
+  all facts of the selected row on the right. It opens on the most dangerous kind that has entries. The four
+  figure tiles, the tabs and the wide scrolling tables are gone.
+- *Incidents* always opens on what is open. With nothing open it says so, with a link to the closed incidents
+  and a note when single alerts are still open. Closed incidents look closed: a grey pill and the closing date.
+- An incident's summary no longer repeats itself: title and state are in the title bar or the list, an
+  arrowhead shows which row the panel on the right belongs to, and the facts are an aligned list. In an
+  incident's window the strongest finding is shown, and what was only logged is marked as context instead of
+  carrying the name of a stage.
+- Audit log entries compare instead of listing: a change is shown setting by setting in the columns *Setting*,
+  *Before* and *After*, with what was taken out and what was put in highlighted. Only what differs is shown
+  (the rest on demand), lists are compared entry by entry, and the entry starts with what was changed.
+- Every time shown names its time zone ("14:32 UTC+1"), in all windows and on the live map. Alerts stored
+  before get theirs once.
+- The reminders' header and an alert's header say less: the full title, when it happened and what happened.
+  Severity, score and the rule are where they already were (the row, the risk assessment, *Copy details*).
+- After a start or an update the lower left corner knows at once who is signed in: RADAR signs in quietly when
+  it starts instead of waiting for the first scan.
+- Less text on every page, and several layout fixes (virtual desktops: the *Add* button no longer covers the
+  text beside it; values in the facts lists start at one place).
+
 **New in 1.0.7** (one window)
 
 - Incidents, ongoing attacks, alert history, reports and all settings are now in one RADAR window with a

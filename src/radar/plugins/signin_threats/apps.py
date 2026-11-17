@@ -13,6 +13,7 @@ The raw rows are not stored (12,000 a day); only a baseline per app and a weekly
 """
 from __future__ import annotations
 
+from ... import timefmt
 import ipaddress
 import json
 import sqlite3
@@ -93,7 +94,7 @@ class AppSignIn:
         return self.error_code == 0
 
     def evidence(self) -> dict[str, str]:
-        return {"Time": self.created.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "App": self.app,
+        return {"Time": timefmt.sortable(self.created, seconds=True), "App": self.app,
                 "IP address": self.ip, "Country": self.country or "?", "Network": network(self.ip),
                 "Result": "Success" if self.success else f"Failure {self.error_code}: {self.failure_reason[:80]}",
                 "Credential": f"{self.credential} {self.key_id[:8]}".strip(), "Resource": self.resource}

@@ -6,6 +6,8 @@ counting while the window is open. A finished refresh is confirmed by a check ma
 """
 from __future__ import annotations
 
+from .. import timefmt
+
 import tkinter as tk
 from datetime import datetime, timezone
 from tkinter import ttk
@@ -41,7 +43,7 @@ def age_text(as_of: datetime | None, now: datetime | None = None) -> str:
 def stamp(as_of: datetime, now: datetime | None = None) -> str:
     """Local time of the data; with the date unless it is today."""
     local, today = as_of.astimezone(), (now or datetime.now(timezone.utc)).astimezone().date()
-    return local.strftime("%H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
+    return timefmt.clock(local) if local.date() == today else timefmt.sortable(local)
 
 
 def describe(as_of: datetime | None, busy: bool, error: str = "", now: datetime | None = None) -> str:

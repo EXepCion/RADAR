@@ -1,6 +1,7 @@
 """Normalised, compact representation of a Graph signIn record."""
 from __future__ import annotations
 
+from ... import timefmt
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -21,7 +22,7 @@ def parse_time(value: str) -> datetime:
 
 
 def graph_time(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # not a shown time: for Microsoft Graph (UTC, "Z")
 
 
 def os_family(os_name: str) -> str:
@@ -269,7 +270,7 @@ class SignIn:
 
     def evidence(self) -> dict[str, str]:
         return {
-            "Time": self.created.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "Time": timefmt.sortable(self.created, seconds=True),
             "User": self.who,
             "Application": self.app,
             "IP address": self.ip,
@@ -411,10 +412,10 @@ class AccountChange:
 
     def describe(self) -> str:
         who = f" by {self.actor}" if self.by_admin else ""
-        return f"{self.created.astimezone():%d.%m. %H:%M} {self.detail}{who}"
+        return f"{timefmt.stamp(self.created)} {self.detail}{who}"
 
     def evidence(self) -> dict[str, str]:
-        return {"Time": self.created.astimezone().strftime("%Y-%m-%d %H:%M:%S"), "User": self.upn,
+        return {"Time": timefmt.sortable(self.created, seconds=True), "User": self.upn,
                 "Application": self.app, "IP address": self.actor_ip, "Result": self.detail,
                 "Type": f"Audit: change by {self.actor}" if self.by_admin else "Audit: change by the user",
                 "Audit ID": self.id}

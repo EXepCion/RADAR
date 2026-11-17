@@ -1,6 +1,7 @@
 """Weak context signals (guest invites, account disables) only alert in combination with other activity."""
 from datetime import datetime, timedelta, timezone
 
+from radar import timefmt
 from radar import correlation
 from radar.alerts import AlertCenter
 from radar.plugin_api import Finding, Severity
@@ -265,7 +266,7 @@ def test_password_reset_answers_password_alerts_only():
     c.ingest("directory_audit", [reset(T + timedelta(hours=2))])
     got = {a.title.split(":")[0]: a for a in c.recent(20) if not a.signal}
     assert got["Correct password used, sign-in not completed"].score == 45
-    assert got["Correct password used, sign-in not completed"].fields["Response"] ==         f"Password reset {(T + timedelta(hours=2)).astimezone():%d.%m.%Y %H:%M} by helpdesk@contoso.com"
+    assert got["Correct password used, sign-in not completed"].fields["Response"] ==         f"Password reset {timefmt.stamp_year(T + timedelta(hours=2))} by helpdesk@contoso.com"
     assert got["Possible session token theft"].score == 60 and "Response" not in got["Possible session token theft"].fields
     assert got["Password attack from rotating IPs"].score == 60          # guessing that got nowhere: a reset changes nothing
     assert got["Password attack got past the password"].score == 45       # the password was known: it is not any more

@@ -423,6 +423,10 @@ def test_a_window_that_opens_over_one_raised_above_the_reminders_is_raised_too(r
     child.geometry("300x200+600+400")
     away = tk.Toplevel(root)        # touches neither
     away.geometry("200x150+1200+800")
+    end = time.monotonic() + 3            # (on a slow machine one update does not show four windows yet)
+    while time.monotonic() < end and not all(w.winfo_viewable() and w.winfo_width() > 150 for w in (front, main, child, away)):
+        root.update()
+        time.sleep(0.02)
     root.update()
     theme.keep_clear_of(lambda: front)
     try:

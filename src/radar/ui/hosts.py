@@ -26,7 +26,7 @@ if TYPE_CHECKING:  # pragma: no cover
 COLS = ["Device name, pattern or IP range", "What it is"]
 WIDTHS = {COLS[0]: 300, COLS[1]: 240}
 SUGGEST_COLS = ["Machine", "Accounts", "At once", "Runs in", "Looks like", "Why"]
-SUGGEST_WIDTHS = {"Machine": 160, "Accounts": 90, "At once": 80, "Runs in": 230, "Looks like": 190, "Why": 260}
+SUGGEST_WIDTHS = {"Machine": 150, "Accounts": 84, "At once": 74, "Runs in": 140, "Looks like": 160, "Why": 240}
 WIDTH = 1080
 HELP = ("Machines people work on from somewhere else: Citrix, Azure Virtual Desktop, terminal servers. A sign-in from one "
         "tells where the machine runs, not where the person is - so it is not used to place people on the map or to "
