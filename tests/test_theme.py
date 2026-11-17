@@ -430,7 +430,8 @@ def test_a_window_that_opens_over_one_raised_above_the_reminders_is_raised_too(r
     root.update()
     theme.keep_clear_of(lambda: front)
     try:
-        assert theme.stay_in_front(main) and theme.is_raised(main)
+        seen = [(w.winfo_viewable(), w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height()) for w in (front, main)]
+        assert theme.stay_in_front(main) and theme.is_raised(main), (seen, theme._front_rect(main), theme._rect(main))
         assert theme.stay_in_front(child) and theme.is_raised(child)       # never behind the window it came from
         assert not theme.stay_in_front(away) and not theme.is_raised(away)
         theme.release_raised()
