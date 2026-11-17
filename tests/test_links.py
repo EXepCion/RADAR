@@ -440,7 +440,8 @@ def test_audit_window_compares_before_and_after_and_marks_what_changed(root):
     assert len(starts) == 2, starts
     assert str(win.unchanged_box.cget("state")) == "normal"
     win.unchanged_box.invoke()                                                    # the rest on demand
-    assert "conditions.applications.includeApplications\tAll\tAll" in text.get("1.0", "end")
+    everything = text.get("1.0", "end")                                           # (a long name may wrap)
+    assert "includeApplications" in everything and "\tAll\tAll" in everything
     win.top.destroy()
 
 
@@ -451,6 +452,8 @@ def test_a_long_value_wraps_inside_its_own_column(root):
 
     assert _wrap("one two three", 60, lambda t: 10 * len(t)) == ["one", "two", "three"]
     assert _wrap("abcdefghij", 40, lambda t: 10 * len(t)) == ["abcd", "efgh", "ij"] and _wrap("", 40, len) == [""]
+    guid = "00000000-0000-4000-8000-000000000022"                     # a link is never broken in two
+    assert _wrap(f"added {guid} today", 100, lambda t: 10 * len(t)) == ["added", guid, "today"]
     long_old = "Applies to every sign-in from outside the offices, " * 4
     long_new = "Applies to sign-ins of administrators only; everybody else is exempt, " * 4
     rec = {"id": "Directory_1", "correlationId": "c1", "activityDateTime": "2026-11-10T10:02:20Z",

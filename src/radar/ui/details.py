@@ -127,7 +127,7 @@ class DetailsWindow:
         height = min(px(HEIGHT), int(top.winfo_screenheight() * 0.9))
         roomy = bool(alert.fields) and bool(alert.factors)  # story | details | risk side by side
         width = max(px(WIDTH), min(px(WIDTH_ROOMY), int(top.winfo_screenwidth() * 0.94))) if roomy else px(WIDTH)
-        top.geometry(f"{width}x{height}")
+        top.geometry(f"{theme.fit_width(top, width)}x{height}")
         top.minsize(px(680), px(480))
         self._icon = ImageTk.PhotoImage(icons.badge(alert.severity, px(44)), master=root)
         self._small = ImageTk.PhotoImage(icons.bell(32), master=root)

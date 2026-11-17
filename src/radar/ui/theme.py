@@ -582,6 +582,15 @@ def close(top: tk.Misc) -> None:
         pass
 
 
+def fit_width(top: tk.Misc, width: int) -> int:
+    """The width a window opens with: what it asks for, but never more than the screen has (Windows would cut it
+    to the screen after it was laid out - and everything in it would move)."""
+    try:
+        return min(int(width), int(top.winfo_screenwidth() * 0.96))
+    except tk.TclError:
+        return int(width)
+
+
 def new_window(root: tk.Misc, parent: tk.Misc | None = None, on_close: Callable[[], None] | None = None,
                **kw: Any) -> tk.Toplevel:
     """A window that is invisible from the very first moment; ``style_window`` reveals it when it is complete.

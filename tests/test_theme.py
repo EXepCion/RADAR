@@ -440,3 +440,10 @@ def test_a_window_that_opens_over_one_raised_above_the_reminders_is_raised_too(r
         theme.release_raised()
         for w in (front, main, child, away):
             w.destroy()
+
+
+
+def test_no_window_asks_for_more_width_than_the_screen_has(root, monkeypatch):  # noqa: F811
+    """Windows cuts a window that is wider than the screen after it was laid out: everything in it would move."""
+    monkeypatch.setattr(tk.Misc, "winfo_screenwidth", lambda self: 1024)
+    assert theme.fit_width(root, 1180) == 983 and theme.fit_width(root, 900) == 900

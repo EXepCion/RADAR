@@ -249,7 +249,7 @@ class IncidentsWindow:
         self._steps: dict[str, Alert] = {}
         top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
         top.title("Incidents")
-        top.geometry(f"{px(WIDTH)}x{min(px(780), int(top.winfo_screenheight() * 0.88))}")
+        top.geometry(f"{theme.fit_width(top, px(WIDTH))}x{min(px(780), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(1000), px(680))
         top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)

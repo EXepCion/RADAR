@@ -155,7 +155,7 @@ class _LogWindow:
         self.app = app
         top = self.top = theme.new_window(root)
         top.title(title)
-        top.geometry(f"{px(size[0])}x{min(px(size[1]), int(top.winfo_screenheight() * 0.88))}")
+        top.geometry(f"{theme.fit_width(top, px(size[0]))}x{min(px(size[1]), int(top.winfo_screenheight() * 0.88))}")
         top.minsize(px(560), px(380))
         top.bind("<Escape>", lambda _e: top.destroy())
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
@@ -415,8 +415,8 @@ def set_compare_columns(text: Any) -> tuple[int, int, int]:
     gap = px(16)
     try:
         width = max(px(560), text.winfo_width() - px(28))
-        first = px(18) + int(width * 0.34)
-        second = first + int(width * 0.33)
+        first = px(18) + int(width * 0.28)   # (the values need the room: an ID is 36 characters)
+        second = first + int(width * 0.36)
         # (a line of the comparison does not wrap: write_changes breaks each column inside its own room. Not said
         # with the tag's wrap="none": Tk then puts a link's icon on a line of its own)
         text.tag_configure("diff", tabs=(first, second), lmargin1=px(18), lmargin2=px(18),
@@ -436,15 +436,23 @@ def _wrap(value: str, room: int, measure: Any) -> list[str]:
     word alone is too long."""
     if not value or measure(value) <= room:
         return [value]
+    # what is a link (an ID, an address ...) stays in one piece: broken in two it would be no link any more
+    parts, whole, at = [], set(), 0
+    for e in linkify.find_entities(value):
+        parts += [p for p in _BREAK.split(value[at:e.start]) if p]
+        whole.add(len(parts))
+        parts.append(value[e.start:e.end])
+        at = e.end
+    parts += [p for p in _BREAK.split(value[at:]) if p]
     lines, line = [], ""
-    for part in (p for p in _BREAK.split(value) if p):
+    for n, part in enumerate(parts):
         if measure(line + part) <= room:
             line += part
             continue
         if line.strip():
             lines.append(line.rstrip())
         line = part.lstrip()
-        while measure(line) > room and len(line) > 1:
+        while n not in whole and measure(line) > room and len(line) > 1:
             n = len(line) - 1
             while n > 1 and measure(line[:n]) > room:
                 n -= 1
