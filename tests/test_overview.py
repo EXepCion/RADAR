@@ -178,7 +178,14 @@ def test_attacks_page_lists_each_kind_and_opens_the_assessment(root, history):
 
 def _geometry(win):
     """Position and size of everything whose movement the user would see."""
-    win.top.update()
+    import time
+
+    width, same, end = -1, 0, time.monotonic() + 3
+    while same < 5 and time.monotonic() < end:   # (a slow machine gives a new window its size a moment later)
+        win.top.update()
+        time.sleep(0.02)
+        same = same + 1 if win.top.winfo_width() == width else 0
+        width = win.top.winfo_width()
     widgets = {"status": win.status, "filter": win.filter, "list": win.accounts_tree.outer, "panel": win.frame.outer,
                "row": win.row_text, "button": win.open_btn, "hint": win.hint.label}
     x0, y0 = win.top.winfo_rootx(), win.top.winfo_rooty()  # inside the window: where it is on the screen is not layout
