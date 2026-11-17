@@ -171,7 +171,7 @@ def test_attacks_page_lists_each_kind_and_opens_the_assessment(root, history):
     assert opened[-1] == "priya@contoso.com"
     win.show_filter("ips")                                  # an address has no assessment: it is looked up
     root.update()
-    assert "tried only once or twice" in win.status.cget("text")
+    assert "tried only once" in win.status.cget("text")       # (cut with an ellipsis where the window is narrow)
     assert win.open_btn.cget("text") == "Look up address" and win.selected_account() is None
     win.top.destroy()
 

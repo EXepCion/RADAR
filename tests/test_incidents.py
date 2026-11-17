@@ -505,3 +505,12 @@ def test_what_was_only_logged_is_context_and_not_a_stop_of_the_line():
     kinds = {a.rule_id: row[2] for a, row in step_rows(inc)}
     assert set(inc.stages) == {3, 5}                                  # Persistence (4): nothing that counts
     assert kinds == {"new_country": "Suspicious access", "sensitive_app": "Context", "role_assignment": "Escalation"}
+
+
+def test_a_time_and_its_zone_are_never_put_on_two_lines(root):
+    from radar.ui.incidents import clamp
+
+    text = "From 14.11. 14:14 UTC+1 to 17.11. 14:14 UTC+1"
+    for width in range(60, 400, 7):
+        for line in clamp(text, theme.FONT, width, 3, root).split(chr(10)):
+            assert not line.startswith("UTC"), (width, line)

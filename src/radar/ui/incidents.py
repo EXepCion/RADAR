@@ -130,7 +130,12 @@ def clamp(text: str, font: str, width: int, lines: int, widget: tk.Misc) -> str:
     """``text`` as it fits ``lines`` lines of ``width`` pixels; what does not fit ends in an ellipsis."""
     measure = tkfont.nametofont(font, root=widget).measure
     out: list[str] = []
-    words = " ".join(str(text).split()).split(" ")
+    words: list[str] = []
+    for word in " ".join(str(text).split()).split(" "):
+        if words and word.startswith("UTC"):  # a time and its zone are one word: never on two lines
+            words[-1] += " " + word
+        else:
+            words.append(word)
     line = ""
     for k, word in enumerate(words):
         trial = f"{line} {word}".strip()
@@ -250,7 +255,7 @@ class IncidentsWindow:
         top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
         top.title("Incidents")
         top.geometry(f"{theme.fit_width(top, px(WIDTH))}x{min(px(780), int(top.winfo_screenheight() * 0.88))}")
-        top.minsize(px(1000), px(680))
+        top.minsize(theme.fit_width(top, px(1000)), px(680))
         top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
         top.iconphoto(False, self._icon)

@@ -429,6 +429,12 @@ def test_a_window_that_opens_over_one_raised_above_the_reminders_is_raised_too(r
         time.sleep(0.02)
     root.update()
     theme.keep_clear_of(lambda: front)
+
+    class Gone:                           # a window raised earlier whose application has been closed since
+        def winfo_exists(self):
+            raise tk.TclError("application has been destroyed")
+
+    theme._raised.append(Gone())
     try:
         seen = [(w.winfo_viewable(), w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height()) for w in (front, main)]
         assert theme.stay_in_front(main) and theme.is_raised(main), (seen, theme._front_rect(main), theme._rect(main))

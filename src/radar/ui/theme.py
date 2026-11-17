@@ -673,7 +673,12 @@ def stay_in_front(top: tk.Misc) -> bool:
     from. True when it was raised."""
     try:
         over = [r for r in [_front_rect(top)] if r is not None]
-        over += [_rect(w) for w in _raised if w is not top and w.winfo_exists() and w.winfo_viewable()]
+        for w in list(_raised):
+            try:
+                if w is not top and w.winfo_exists() and w.winfo_viewable():
+                    over.append(_rect(w))
+            except tk.TclError:  # a window that is gone for good: it is in nobody's way
+                _raised.remove(w)
         if not over:
             return False
         mine = _rect(top)
