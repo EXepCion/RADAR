@@ -29,7 +29,8 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
   by Entra, accounts excluded from MFA, break-glass and disabled accounts, apps signing in with their own secrets.
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
   Conditional Access and federation changes, cross-tenant trust, members added to groups that are excluded from
-  Conditional Access, BitLocker and local-admin password reads.
+  Conditional Access or can hold admin roles, trusted networks (named locations), the sign-in methods policy,
+  new domains and application reply addresses, BitLocker and local-admin password reads.
 - **Scores every finding** from 0 to 100 and explains the score: the network (hosting, VPN, the person's usual
   one), the device (managed, known, never seen), the kind of MFA, the account (admin, excluded from MFA, disabled).
   Low scores are only logged; from *Low* on a reminder pops up.
@@ -154,7 +155,10 @@ as. The reminders, the details of an alert and the live map are windows of their
 - **Reminders** - comes up when a new alert arrives, flashes until you touch it, plays a sound on the default
   playback device unless that device is muted. *Open item* shows the details: what happened, the risk assessment
   factor by factor, the evidence rows, the recommended action and links into the Entra admin center. *Dismiss* and
-  *Snooze* hide a reminder; it returns by itself if it gets worse. Alerts that belong to one incident are one
+  *Snooze* hide a reminder; it returns by itself if it gets worse. *Don't remind again* switches the reminders of
+  that kind off for the account or application the alert is about, for 30 days, 90 days or a year: what matches is
+  still judged and kept in the alert history, anything worse than the alert it was made from still comes, and
+  *Settings > Reminders* lists what is switched off, with *Remind me again*. Alerts that belong to one incident are one
   row there: opened, snoozed and dismissed as one.
 - **Incidents** - alerts that belong to one story (the same account or the same attacker address, within days),
   the most urgent first. For the chosen one: how far along an attack it is and when each stage was reached, which
@@ -247,6 +251,15 @@ is shown in the menu and does not stop the others. That is all the separation th
 It runs inside RADAR with your rights and RADAR's sign-in, so only allow plugins you wrote or have read.
 In the packaged program a plugin can use the Python standard library modules and the packages that ship with RADAR
 (`requests`, `msal`, `Pillow`); for anything else run RADAR from source.
+
+## When the PC was off
+
+RADAR only reads while it runs. After a night or a weekend the first scan reads the sign-ins made by hand of the
+whole time and the background sign-ins of the last 6 hours, so that it is quick; the scans after it read the
+background sign-ins of the time before, newest first, up to 7 days back (`non_interactive_backlog_days`,
+`backlog_pages_per_run`). What is found then is reported then - hours after it happened. A PC that stays on, or a
+small always-on machine, is the way to hear of it at the time. While there is no connection to Microsoft, RADAR
+says so and tries again.
 
 ## Diagnostics
 

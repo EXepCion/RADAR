@@ -360,3 +360,43 @@ def test_after_a_start_it_is_known_at_once_who_is_signed_in(app, root):  # noqa:
         app.auth.get_token = lambda force_refresh=False: calls.append(2)
         app.sign_in_quietly()                                    # not set up yet: the set-up signs in, with a window
         assert calls == [1]
+
+
+def test_the_attacks_page_opens_with_what_the_figure_was_counted_from(app, root):  # noqa: F811
+    """The figure on the navigation and the page are one computation: the page does not start empty, and when it
+    has loaded the figure is the one of what it shows."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    def overview(hours, active):
+        row = lambda name, status: SimpleNamespace(account=name, status=status)  # noqa: E731
+        return SimpleNamespace(hours=hours, attacked_now=active, accounts=[row("a@contoso.com", "Active")] * active)
+
+    shown, computed = [], []
+
+    class Plugin:
+        def ongoing(self, ctx, hours):
+            computed.append(hours)
+            return overview(hours, 2 if len(computed) == 1 else 3)
+
+    app.plugins.get = lambda plugin_id: SimpleNamespace(plugin=Plugin())
+    app.plugins.build_context = lambda plugin_id: None
+    app.threat_data_as_of = lambda: datetime.now(timezone.utc)
+    app._background = lambda fn, *a, name="": fn(*a)
+    app.ui_call = lambda fn, *a: fn(*a)
+    win = app._open_main()
+    settle(root)
+    assert computed == [72] and win.nav.badge("attacks") == "2" and app.kept_attacks(72)[0].attacked_now == 2
+    assert app.kept_attacks(24) is None
+
+    page = SimpleNamespace(hours=72, show=lambda result, reminder, as_of=None, busy=False, error="": shown.append(
+        (result.attacked_now, busy)), show_error=lambda message: shown.append(message))
+    app.load_attacks(page, 72)
+    # at once what was counted (marked as still being brought up to date), then the fresh result - and its figure
+    assert shown == [(2, True), (3, False)]
+    assert win.nav.badge("attacks") == "3"
+    shown.clear()
+    page.hours = 24
+    app.load_attacks(page, 24)                              # another period: nothing kept for it - and the figure on
+    assert shown == [(3, False)] and win.nav.badge("attacks") == "3" and computed[2:] == [24]   # the navigation follows
+    assert app.count_attacked_accounts() == 3 and computed[2:] == [24, 24]   # the page: counted for the period it shows

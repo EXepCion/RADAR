@@ -58,12 +58,15 @@ RULE_STAGES = {
     "password_not_completed": 2, "mfa_fatigue": 2, "mfa_report": 2,
     # 3 - a sign-in that may not be the user
     "risky_signin": 3, "new_country": 3, "new_country_background": 3, "impossible_travel": 3, "session_theft": 3, "aitm_replay": 3, "signin_wave": 3,
+    "unfamiliar_signin": 3,
     "device_code": 3, "new_shared_ip": 3, "account_state": 3, "pinned_accounts": 3, "legacy_auth": 3,
     # 4 - staying in / getting data out
     "mfa_change": 4, "sensitive_app": 4, "consent_grant": 4, "app_credentials": 4, "guest_invites": 4,
     "mfa_exclusion_change": 4, "device_registration": 4, "app_owner_change": 4,
     # 5 - more power / weaker defences / lateral movement
     "role_assignment": 5, "conditional_access": 5, "domain_federation": 5, "elevate_access": 5, "sensitive_reads": 5,
+    "role_activation": 5, "named_locations": 5, "auth_methods_policy": 5, "privileged_group": 5,
+    "tenant_changes": 4,  # a new domain, an inbound connector, an app's reply address: ways to stay
 }
 # signals that are reactions / records, not attacker steps
 OWN_PROMPT_MARK = "(probably their own sign-in)"  # set by the mfa_report rule

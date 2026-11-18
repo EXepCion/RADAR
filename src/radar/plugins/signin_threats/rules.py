@@ -18,7 +18,8 @@ from ...correlation import REPORT_SIGNAL
 from ...plugin_api import Finding, Rule, Severity
 from . import indicators, netintel
 from .history import SignInHistory
-from .models import CHANGE_KINDS, REPORT_KIND, AccountChange, SignIn, os_family, parse_time  # noqa: F401  (os_family re-exported)
+from .models import (CHANGE_KINDS, NOT_ACCOUNT_CHANGES, REPORT_KIND, ROLE_KIND, AccountChange, SignIn,  # noqa: F401
+                     os_family, parse_time)  # (os_family re-exported)
 from .accounts import AccountDirectory  # noqa: F401  (type of RuleContext.accounts)
 from .scoring import LABEL_HABITUAL_VPN, Assessment, Assessor, Factor, severity_for
 
@@ -106,6 +107,7 @@ class RuleContext:
     _assessor: Assessor | None = None
     _computer_nets: dict = field(default_factory=dict)  # user id -> networks the user's computers sign in from
     _hostile: dict | None = None  # address -> [Indicator] (see hostile_index)
+    _hostile_nets: dict | None = None  # AS number -> Indicator (see hostile_network)
 
     @classmethod
     def build(cls, new: list[SignIn], history: SignInHistory, settings: dict, now: datetime,
@@ -167,6 +169,17 @@ class RuleContext:
             return None
         hits = [i for i in self.hostile_index().get(s.ip, ()) if i.user_id != s.user_id or s.created > i.when]
         return max(hits, key=lambda i: (i.points, i.when), default=None)
+
+    def hostile_network(self, s: SignIn) -> "indicators.Indicator | None":
+        """The mark of a network that only guesses passwords here (indicators.derive_networks), if this sign-in
+        came from one."""
+        if self._hostile_nets is None:
+            self._hostile_nets = {}
+            if indicators.settings(self)[0]:
+                for ind in self.history.indicators(self.now):
+                    if ind.kind == indicators.NETWORK:
+                        self._hostile_nets[ind.value] = ind
+        return self._hostile_nets.get(str(s.asn)) if s.asn and not self.trusted(s) else None
 
     def rule_on(self, rule_id: str) -> bool:
         return self.enabled_rules is None or rule_id in self.enabled_rules
@@ -734,18 +747,32 @@ def mfa_fatigue(rc: RuleContext) -> list[Finding]:
         count, window_rows = _max_in_window(rows, window)
         if count < minimum:
             continue
-        first = window_rows[0]
+        first, last = window_rows[0], window_rows[-1]
         matches = sorted({m for s in window_rows for m in s.number_match.split(",") if m})
-        out.append(Finding(
-            key=f"mfa-fatigue|{user_id}|{_day(first.created)}", rule_id="mfa_fatigue", severity=Severity.HIGH, score=75,
-            title=f"Repeated MFA denials for {first.who}",
-            summary=(f"{count} MFA requests denied or unanswered within {int(window.total_seconds() // 60)} minutes "
-                     f"from {', '.join(sorted({s.ip for s in window_rows}))}. Typical of MFA fatigue / push bombing."
-                     + (" The user DENIED the request in the Authenticator (number match)."
-                        if any("Deny" in m for m in matches) else "")),
+        minutes = int(window.total_seconds() // 60)
+        # Who caused the prompts is told by where they came from: the person's own computer on their own network is
+        # a person not getting through (phone out of reach, a prompt that timed out) - a network and device the
+        # account never used is somebody who has the password and hopes for a tap on "Approve".
+        extra = []
+        if any("Deny" in m for m in matches):
+            extra.append(Factor(15, "The user DENIED a request in the Authenticator (number match)"))
+        if rc.history.query(first.created, last.created + timedelta(minutes=30), user_id=user_id, ip=last.ip,
+                            success=True, limit=1):
+            extra.append(Factor(-15, "The sign-in was completed from the same address afterwards"))
+        s, a = _best([(x, rc.assessor.assess(x, 60, f"{count} MFA requests denied or unanswered within {minutes} "
+                                                    f"minutes", extra)) for x in window_rows])
+        own = not any(_foreign_to_user(rc, x) for x in window_rows)
+        out.append(_scored(
+            a, key=f"mfa-fatigue|{user_id}|{_day(first.created)}", rule_id="mfa_fatigue",
+            title=f"Repeated MFA denials for {first.who}" + (f" ({a.label})" if a.label else ""),
+            summary=(f"{count} MFA requests denied or unanswered within {minutes} minutes "
+                     f"from {', '.join(sorted({x.ip for x in window_rows}))}. "
+                     + ("They all came from the account's own surroundings: most likely the person's own attempts. "
+                        if own else "Typical of MFA fatigue / push bombing: somebody who has the password keeps asking. ")
+                     + f"Assessment: {a.top_reasons()}."),
             occurred_at=first.created,
             fields={"User": first.who, "Denials": str(count),
-                    "Locations": ", ".join(sorted({s.location for s in window_rows})),
+                    "Locations": ", ".join(sorted({x.location for x in window_rows})),
                     **({"Number match": ", ".join(matches)} if matches else {})},
             evidence=_evidence(window_rows),
             recommendation="Contact the user. If they did not try to sign in, their password is known to an attacker: "
@@ -867,6 +894,7 @@ def new_country(rc: RuleContext) -> list[Finding]:
 
 
 OWN_DEVICE = "Known device of the user"
+APP_SERVER_NETWORKS = ("cloud", "hosting")  # where applications run that act for the people who use them
 OWN_NETWORKS = ("User's usual network", "Habitual network of the user")
 
 
@@ -874,6 +902,17 @@ def _background_assessment(rc: RuleContext, s: SignIn, why: str) -> Assessment:
     """Background activity abroad stays at least Low - except on a device the person has long used AND a network
     they use anyway: that is their phone or laptop, wherever the address is counted to. It is logged only."""
     a = rc.assessor.assess(s, 25, why)
+    net = rc.assessor.network(s)
+    if net and net[1] in APP_SERVER_NETWORKS and s.app_id and s.asn and s.app_owner_tenant not in netintel.MICROSOFT_TENANTS:
+        minimum = int(rc.cfg("new_country_background").get("app_server_min_accounts", 3))
+        served = rc.history.app_network_users(s.app_id, s.asn, rc.now - timedelta(days=30))
+        if 0 < minimum <= served:
+            # the application runs there and fetches its tokens from there, for everybody who uses it
+            a.factors.append(Factor(min(0, 20 - a.score), f"{s.app or 'The application'} signs in for {served} accounts "
+                                    f"from this network: the application's own server, not a device of the person - "
+                                    f"logged only"))
+            a.score = min(a.score, 20)
+            return a
     texts = [f.text for f in a.factors]
     own = any(t.startswith(OWN_DEVICE) for t in texts) and any(t.startswith(OWN_NETWORKS) for t in texts)
     if own:
@@ -1112,17 +1151,26 @@ def session_theft(rc: RuleContext) -> list[Finding]:
     return out
 
 
+def password_proven(s: SignIn) -> bool:
+    """The password was right although the sign-in did not complete. Either the result says so (the list of results
+    that only come after the password), or the entry's own steps do: a "Password" step that succeeded - whatever the
+    result is called (a device was required, an app was not allowed, a registration was asked for ...). Entra has
+    hundreds of results and adds more; the steps are what it checked."""
+    if s.error_code in PASSWORD_ACCEPTED_CODES:
+        return not (s.auth_methods and not s.password_ok)  # steps are listed and the password is not among them
+    return s.password_ok and s.error_code not in (0, MFA_DENIED_CODE) and s.error_code not in FAILED_PASSWORD_CODES
+
+
 def password_not_completed(rc: RuleContext) -> list[Finding]:
     """Password accepted but MFA/Conditional Access stopped the sign-in, in an unfamiliar context."""
     cfg = rc.cfg("password_not_completed")
     settle = timedelta(minutes=float(cfg.get("settle_minutes", 15)))
     window = timedelta(hours=float(cfg.get("window_hours", 3)))
     # Re-evaluate a settled window every run (dedup by key): the user may still finish MFA a bit later.
-    candidates = rc.keep(rc.history.query(rc.now - window, rc.now - settle, codes=PASSWORD_ACCEPTED_CODES,
-                                          interactive_only=True))
+    candidates = rc.keep(rc.history.query(rc.now - window, rc.now - settle, success=False, interactive_only=True))
     groups: dict[tuple, list[tuple[SignIn, Assessment]]] = defaultdict(list)
     for s in candidates:
-        if not s.user_id or rc.trusted(s) or (s.auth_methods and not s.password_ok):
+        if not s.user_id or rc.trusted(s) or not password_proven(s):
             continue
         if rc.history.query(s.created - timedelta(minutes=5), s.created + timedelta(minutes=30),
                             user_id=s.user_id, ip=s.ip, success=True, limit=1):
@@ -1660,7 +1708,7 @@ def mfa_change(rc: RuleContext) -> list[Finding]:
     lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
     groups: dict[str, list[AccountChange]] = defaultdict(list)
     for c in rc.history.changes(rc.now - lookback, rc.now):
-        if (c.guest and not cfg.get("include_guests", False)) or c.upn in rc.ignore_users or c.kind == REPORT_KIND:
+        if (c.guest and not cfg.get("include_guests", False)) or c.upn in rc.ignore_users or c.kind in NOT_ACCOUNT_CHANGES:
             continue
         groups[c.user_id].append(c)
     out = []
@@ -1850,6 +1898,117 @@ def aitm_replay(rc: RuleContext) -> list[Finding]:
                            "methods (attackers register their own), inbox rules and recent mail/file access.",
             links=_user_links(r),
         ))
+    return out
+
+
+def unfamiliar_signin(rc: RuleContext) -> list[Finding]:
+    """A sign-in by hand, authenticated then and there, from outside everything the account used before: network,
+    address, device and kind of client - in a country the account is known in (a new country is new_country's
+    alert). This is what a phishing proxy on a household address in the victim's own country looks like: no other
+    rule has anything to hold on to. It is also a person with a new private device somewhere new, which is why it
+    is rated by the usual evidence and often stays low."""
+    cfg = rc.cfg("unfamiliar_signin")
+    min_days = timedelta(days=float(cfg.get("min_history_days", 7)))
+    h = rc.history
+    groups: dict[tuple, list[tuple[SignIn, Assessment]]] = defaultdict(list)
+    for s in rc.new:
+        if not (s.success and s.interactive and s.user_id) or s.device_id or rc.trusted(s) or rc.on_virtual_host(s):
+            continue
+        if s.resource_id == netintel.DEVICE_REGISTRATION_RESOURCE:
+            continue  # a device being registered: the sensitive_app rule
+        if not any(m.lower() != "previously satisfied" for m in s.auth_methods):
+            continue  # carried by an earlier session: what session_theft / aitm_replay look at
+        first = h.user_first_seen(s.user_id)
+        if first is None or s.created - first < min_days:
+            continue  # nothing to compare a new account with
+        if not _foreign_to_user(rc, s):
+            continue
+        if s.client and s.client in h.user_clients(s.user_id, s.created - timedelta(hours=1)):
+            continue
+        if s.country and s.country not in (set(h.user_countries(s.user_id, s.created, True))
+                                           | h.user_profile(s.user_id, "country", s.created)):
+            continue
+        a = rc.assessor.assess(s, 30, "Signed in by hand from a network, address, device and client the account never "
+                                      "used before")
+        groups[(s.user_id, _day(s.created))].append((s, a))
+    out = []
+    for (user, day), items in groups.items():
+        s, a = _best(items)
+        signins = [x for x, _ in items]
+        out.append(_scored(
+            a, key=f"unfamiliar|{user}|{day}", rule_id="unfamiliar_signin",
+            title=f"Sign-in from unfamiliar surroundings: {s.who}" + (f" ({a.label})" if a.label else ""),
+            summary=(f"{s.who} signed in from {s.location} ({s.ip}) with "
+                     f"{', '.join(m for m in s.auth_methods if m.lower() != 'previously satisfied') or 'a password'} - "
+                     f"nothing about it is known for the account: not the network, the address, the device or the "
+                     f"kind of client. Assessment: {a.top_reasons()}."),
+            occurred_at=min(x.created for x in signins),
+            fields={"User": s.who, "IP address": ", ".join(sorted({x.ip for x in signins})), "Application": s.app,
+                    "Client": s.client.replace("|", ", ") or "-"},
+            evidence=_evidence(signins),
+            recommendation="Ask the person whether that was them (a new private device, a place they do not usually "
+                           "work from). If not: a phishing page passed their sign-in on - revoke the sessions, reset "
+                           "the password and look at what the session did.",
+            links=_user_links(s),
+        ))
+    return out
+
+
+def role_activation(rc: RuleContext) -> list[Finding]:
+    """An eligible admin role was switched on (PIM). Routine for an admin at their desk - and the first thing done
+    with a stolen admin session. So it is judged by where the account signed in from at that moment: only from
+    outside its surroundings is an alert; anything else is recorded quietly, a step that counts only inside a chain
+    that other findings already make."""
+    cfg = rc.cfg("role_activation")
+    lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
+    before, after = timedelta(minutes=float(cfg.get("minutes_before", 90))), timedelta(minutes=10)
+    groups: dict[tuple, list[AccountChange]] = defaultdict(list)
+    for c in rc.history.changes(rc.now - lookback, rc.now):
+        if c.kind == ROLE_KIND and c.upn not in rc.ignore_users:
+            groups[(c.user_id, _day(c.created))].append(c)
+    out = []
+    for (user_id, day), acts in groups.items():
+        upn = acts[0].upn or user_id
+        roles = sorted({c.detail for c in acts})
+        foreign: list[SignIn] = []
+        judged = False
+        for c in acts:
+            rows = rc.keep(rc.history.query(c.created - before, c.created + after, user_id=user_id, success=True))
+            rows += [x for x, _b, _e, _n in rc.history.activity(c.created - before, c.created + after, user_id)]
+            pool = [s for s in rows if c.actor_ip and s.ip == c.actor_ip] or rows
+            if not pool:
+                continue
+            judged = True
+            if any(rc.trusted(s) or (s.device_id and s.corp_device) or not _foreign_to_user(rc, s) for s in pool):
+                foreign = []
+                break  # the account was (also) at home: its own session
+            foreign += pool
+        common = dict(occurred_at=min(c.created for c in acts), links=[("User in Entra", user_url(user_id))])
+        if foreign:
+            s, a = _best([(x, rc.assessor.assess(
+                x, 45, f"Admin role activated ({', '.join(roles)}) while the account signed in only from outside its "
+                       f"surroundings")) for x in foreign])
+            out.append(_scored(
+                a, key=f"roleact-foreign|{user_id}|{day}", rule_id="role_activation",
+                title=f"Admin role activated from unfamiliar surroundings: {upn} ({', '.join(roles[:3])})",
+                summary=(f"{upn} activated {', '.join(roles)}. Around that time the account signed in only from "
+                         f"{', '.join(sorted({x.location for x in foreign}))}, on no device and no network it used "
+                         f"before. Assessment: {a.top_reasons()}."),
+                fields={"User": upn, "Roles": ", ".join(roles), "IP address": ", ".join(sorted({x.ip for x in foreign}))},
+                evidence=[c.evidence() for c in acts] + _evidence(foreign[:20]), subjects=[upn],
+                recommendation="Reach the admin on another channel now. If it was not them: revoke the sessions, "
+                               "take the role away and go through the audit log from the activation on.",
+                **common))
+            continue
+        why = ("from the account's own surroundings" if judged
+               else "no sign-in of the account is on record around it")
+        out.append(Finding(
+            key=f"roleact|{user_id}|{day}", rule_id="role_activation", severity=Severity.INFO, score=15,
+            signal="role_activated", subjects=[upn], factors=[(15, f"Admin role activated, {why}")],
+            title=f"Admin role activated: {upn} ({', '.join(roles[:3])})",
+            summary=(f"{upn} activated {', '.join(roles)}, {why} (record only: a step for attack chains, no alert on "
+                     f"its own)."),
+            fields={"User": upn, "Roles": ", ".join(roles)}, evidence=[c.evidence() for c in acts], **common))
     return out
 
 
@@ -2101,6 +2260,12 @@ RULES: list[RuleDef] = [
                  "An address proven to be an attacker's by another finding is used on other accounts"), hostile_reuse),
     RuleDef(Rule("password_not_completed", "Correct password, MFA not completed",
                  "Password accepted from an unfamiliar place but MFA/CA stopped it"), password_not_completed),
+    RuleDef(Rule("unfamiliar_signin", "Sign-in from unfamiliar surroundings",
+                 "Signed in by hand from a network, address, device and client the account never used"),
+            unfamiliar_signin),
+    RuleDef(Rule("role_activation", "Admin role activations (PIM)",
+                 "An admin role switched on while the account signs in only from unfamiliar surroundings"),
+            role_activation),
     RuleDef(Rule("session_theft", "Session token theft",
                  "Same session used from another country on another device"), session_theft),
     RuleDef(Rule("aitm_replay", "AiTM phishing / session replay",

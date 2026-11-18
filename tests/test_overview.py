@@ -143,8 +143,14 @@ def test_attacks_page_lists_each_kind_and_opens_the_assessment(root, history):
     win = AttacksWindow(root, App())
     win.load()
     # the filter names the four kinds with their counts, the most dangerous first - and opens on the first there is
-    assert [win.filter.text(k) for k in ("known", "sessions", "guessing")] == ["Password known 1", "Stolen sessions 1",
-                                                                              "Password guessing 2"]
+    # ... each figure is what is going on NOW (the list under it also has what went quiet or ended), and together
+    # they are the figure on the navigation: the two can be checked against each other at a glance
+    shown = {k: int(win.filter.text(k).rsplit(" ", 1)[1]) for k in ("known", "sessions", "guessing", "ips")}
+    rows = {"known": win.result.password_known, "sessions": win.result.sessions, "guessing": win.result.accounts,
+            "ips": win.result.sources}
+    assert shown == {k: sum(1 for r in v if r.status == "Active") for k, v in rows.items()}
+    assert shown["known"] + shown["sessions"] + shown["guessing"] == win.result.attacked_now > 0
+    assert win.filter.text("known").startswith("Password known ") and len(win.lists["guessing"].get_children()) == 2
     assert win.filter.text("ips").startswith("Attacking IPs ") and win.section == "known"
     assert win.status.cget("text") == ""                    # (what there is to say about the addresses: with their list)
     # a row of the list: is it going on, who, and under the name the facts that tell how bad
@@ -438,3 +444,18 @@ def test_opening_the_page_again_starts_on_the_most_dangerous_kind(root, history)
     win.opened()
     assert win.section == "guessing"           # nothing at all: the page says so on one kind
     win.top.destroy()
+
+
+def test_the_figure_on_the_navigation_counts_who_is_under_attack_now(history):
+    """What is going on now in the three lists about accounts - the sum of their figures on the page - and not
+    what has ended."""
+    result = ongoing_attacks(build(history), 72)
+    active = lambda rows: sum(1 for r in rows if r.status == "Active")  # noqa: E731
+    assert result.attacked_now == active(result.accounts) + active(result.password_known) + active(result.sessions) > 0
+    assert result.active_now == {"known": active(result.password_known), "sessions": active(result.sessions),
+                                 "guessing": active(result.accounts), "ips": active(result.sources)}
+    for row in result.accounts + result.password_known + result.sessions:
+        row.status = "Ended"
+    assert result.attacked_now == 0                         # all over: listed on the page, nobody under attack
+    result.accounts[0].status = result.sessions[0].status = "Active"
+    assert result.attacked_now == 2                         # two rows on the page, two on the navigation

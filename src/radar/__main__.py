@@ -233,7 +233,9 @@ def main(argv: list[str] | None = None) -> int:
             shutil.copy(real_config, os.path.join(temp_home, "config.json"))
     setup_logging(console=bool(args.scan_once or args.check_auth or args.rescore))
     log = logging.getLogger("radar")
-    log.info("%s %s starting (%s)", APP_DISPLAY_NAME, __version__, " ".join(sys.argv[1:]) or "tray")
+    from . import buildinfo
+
+    log.info("%s %s starting (%s)", APP_DISPLAY_NAME, buildinfo.full_version(), " ".join(sys.argv[1:]) or "tray")
 
     if args.check_auth:
         return cmd_check_auth()

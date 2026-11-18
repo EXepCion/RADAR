@@ -304,8 +304,11 @@ CHANGE_KINDS: dict[str, tuple[int, str]] = {
     "password_reset_self": (10, "Self-service password reset"),
     "device_credential_added": (5, "Windows Hello for Business set up (device-bound)"),
     "mfa_prompt_reported": (0, "MFA prompt reported as not theirs"),  # not a change: see the mfa_report rule
+    "role_activated": (0, "Admin role activated"),  # not a change of the account: see the role_activation rule
 }
 REPORT_KIND = "mfa_prompt_reported"
+ROLE_KIND = "role_activated"
+NOT_ACCOUNT_CHANGES = (REPORT_KIND, ROLE_KIND)
 
 
 def _change_kind(activity: str, reason: str) -> str | None:
@@ -329,6 +332,8 @@ def _change_kind(activity: str, reason: str) -> str | None:
         "add passkey (device-bound)": "method_added",
         "add windows hello for business credential": "device_credential_added",
         "delete passwordless phone sign-in credential": "method_deleted",
+        # an eligible admin role switched on for a few hours (Privileged Identity Management)
+        "add member to role completed (pim activation)": "role_activated",
     }.get(a)
 
 
@@ -373,9 +378,13 @@ class AccountChange:
             else activity
         if method and method.lower() not in text.lower():
             text += f" ({method})"
+        if kind == ROLE_KIND:  # the detail is the role's name
+            text = next((str(t.get("displayName")) for t in a.get("targetResources") or []
+                         if (t.get("type") or "").lower() == "role" and t.get("displayName")), "") or "an admin role"
         return cls(id=a["id"], created=parse_time(a["activityDateTime"]), user_id=target["id"], upn=upn, kind=kind,
                    detail=text, actor=actor_upn or app.get("displayName") or "", by_admin=by_admin,
-                   actor_ip=user.get("ipAddress") or "", app_id=app.get("appId") or "", app=app.get("displayName") or "")
+                   actor_ip=user.get("ipAddress") or details.get("ipaddr") or "", app_id=app.get("appId") or "",
+                   app=app.get("displayName") or "")
 
     @classmethod
     def from_report(cls, a: dict[str, Any]) -> "AccountChange | None":

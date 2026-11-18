@@ -13,17 +13,19 @@ them into a local history and runs these rules:
 | Password attack from rotating IPs | per account in 72 h: ≥ 8 failed passwords from ≥ 6 IPs on networks the user never used (residential-proxy botnets: ~1 attempt per IP). Escalates to High if an attempt gets past the password or a device-less sign-in succeeds from an unfamiliar network; one campaign that guesses at several accounts and got nowhere is **one alert** naming them all; a disabled account among them is a line in it (alone it is only logged); an account where something happened keeps an alert of its own | 40–50, escalates |
 | Password spray | one IP, failed password for ≥ 5 accounts in 60 min (skipped if the IP is mostly successful traffic) | 80 (90 if an account then succeeded) |
 | Brute force | ≥ 10 failed passwords for one account in 60 min; escalates if a success from the same IP follows | 55 → 85 |
-| MFA fatigue | ≥ 3 MFA denials (500121) in 60 min | 75 |
+| MFA fatigue | ≥ 3 MFA requests denied or not answered (500121) in 60 min, judged by **where they came from**: from the account's own computer and network it is the person not getting through (logged); from a network and device the account never used it is somebody who has the password (High). A request denied in the Authenticator +15; the sign-in completed from the same address afterwards -15. A reported fraud stays 90 | base 60, scored |
 | MFA prompt reported by the user | The user reported an MFA prompt as not theirs (Authenticator: *No, it's not me* > report; phone: the reporting code). Entra writes the audit entry `Suspicious activity reported`; a prompt is only sent after the right password, so a true report means the password is known. The sign-in that caused the prompt is a separate row in the sign-in log (failed MFA step, same account, seconds before the report) that Entra delivers **up to 1-2 hours later**. Until it arrives: Medium. With it, the alert is judged by where that sign-in came from: the account's own managed device and usual network → Low ("probably their own sign-in", reported by mistake); an unfamiliar network or device → High. No such row after `wait_minutes` (120) → High. A password reset or disabling the account answers it. **Needs the tenant setting *Report suspicious activity*** (Entra ID > Authentication methods > Settings; "Microsoft managed" means off): while it is off the rule is inactive and the menu says so; when the setting cannot be read with the sign-in used (it needs `Policy.Read.All`) the rule stays active. The connection check shows the state. When the reported prompt did not come from the user's own surroundings, its address is remembered as an attacker's (see *Known attacker addresses* below). Settings: `mfa_report` (`activities`: the audit entry names, `match_seconds_before/after`, `wait_minutes`). | 50 → 25-100 |
 | Wave of unusual sign-ins | Within `window_hours` (6), at least `min_accounts` (4) accounts each have a sign-in that got past the password from outside their own surroundings (no office; no device, network or address the account used before) - and all share where it came from: one network nobody in the tenant used before or a hosting/VPN network, or one client (user agent) nobody used before. Each alone stays below every rule; together they are a phishing wave or one attacker working through stolen passwords. A team abroad on their own known laptops is not counted. Settings: `signin_wave`. | 45 +10 new network, +15 hosting/VPN, +5 per further account, +15 completed sign-ins |
 | Known attacker address reused | An address another finding proved to be an attacker's (see below) is used on other accounts, or somebody signs in from it afterwards. Sign-ins from a device the account already used are left out. | 45, +20 password right, +35 successful sign-in |
-| Correct password, MFA not completed | password accepted, then MFA/CA stopped the sign-in and the user never finished it, from a network/country unusual for the user (settled for 15 min) | scored |
+| Correct password, MFA not completed | password accepted, then MFA/CA stopped the sign-in and the user never finished it, from a network/country unusual for the user (settled for 15 min). That the password was right is taken from the result (the results that only come after the password) **or from the entry's own steps**: a "Password" step that succeeded, whatever the result is called (a device was required, an app was not allowed ...) | scored |
+| Sign-in from unfamiliar surroundings | a sign-in by hand, authenticated then and there (not carried by an earlier session), from a network, address, device and kind of client the account never used - in a country it is known in (a new country is the next rule's alert). What a phishing proxy on a household address in the victim's own country looks like; also a person on a new private device somewhere new, so it is rated by the usual evidence. Accounts with less than `min_history_days` (7) of history are left out. Settings: `unfamiliar_signin` | base 30, scored |
+| Admin role activations (PIM) | an eligible admin role is switched on (`Add member to role completed (PIM activation)`). Judged by where the account signed in from in the `minutes_before` (90) before - when the audit entry names the address, by the sign-ins from that address: only from outside the account's surroundings (no office, no managed or known device, no known network) it is an alert; otherwise it is recorded quietly (15) and counts only as a step of an attack chain that other findings already make. Settings: `role_activation` | base 45, scored |
 | Session token theft | the same session used from another country **and** another device (AiTM / cookie theft). Sign-ins of Microsoft back-end services acting for the user (Microsoft-owned app + server credential + no user agent, e.g. "Olympus", the Office policy service) never count as the second device: they log whichever network path the device used (eSIM breakout, roaming, VPN) and often lack a device id | scored |
 | AiTM phishing / session replay | (1) a **fresh** MFA (not "previously satisfied") completed through a hosting/datacenter network without device identity, not the user's habitual network - phishing proxies must do the MFA themselves; (2) the session of a fresh MFA sign-in used from another network within 3 h (also same country, also when neither side has a device id - the gaps of session theft). Both usual networks of the user (Wi-Fi/mobile switch) or alternating use: discounted | base 35 / 40, scored |
 | MFA changes + new device | MFA method registered/deleted, MFA reset or TAP by an admin, password reset (directory audit, `Authentication Methods` + SSPR). Judged by **where** the user made the change (his sign-in at that moment - the audit IP is a Microsoft gateway for IPv6) and **what signed in afterwards** from a device/network not used before (baseline ends 12 h before the change). Admin resets/TAPs weigh more (social-engineered help desk). Guests skipped; new accounts (< 7 days) -20 | 10–30 by change, scored |
 | Impossible travel | consecutive successful interactive sign-ins ≥ 500 km apart at > 900 km/h | scored |
 | New country | success from a country not in the user's baseline (or not in `allowed_countries`) | scored |
-| Background activity from a new country | background sign-ins (none by hand) from a country the account was not seen in. On a device the person has long used AND a network they use anyway it is only logged (their phone or laptop, wherever the address is counted to); networks that hide where someone is (VPN, hosting) count as for any sign-in | scored, otherwise never below Low |
+| Background activity from a new country | background sign-ins (none by hand) from a country the account was not seen in. On a device the person has long used AND a network they use anyway it is only logged (their phone or laptop, wherever the address is counted to); networks that hide where someone is (VPN, hosting) count as for any sign-in. An application that is not Microsoft's own and signs in for at least `app_server_min_accounts` (3) accounts from one cloud / hosting network is that application's own server (a connector, an assistant, a sync service), not a device abroad: logged only | scored, otherwise never below Low |
 | New IP shared by several accounts | a never-seen IP used by ≥ 2 accounts within 24 h (AiTM phishing proxy) | scored |
 | Attack tools / scripted sign-ins | interactive sign-ins from HTTP libraries/attack tools (`Go-http-client`, `python-requests`, `axios`, …) | scored |
 | Legacy authentication | successful IMAP/POP/SMTP AUTH/EAS/… sign-in | scored, never below Low |
@@ -139,6 +141,11 @@ Noise controls (in `config.json → plugins.signin_threats.settings`):
 - Thresholds and windows per rule, `notify_min_severity` (general) for what pops up.
 
 First run: imports a 30-day interactive baseline (Entra's full retention) and evaluates the last 24 h (≈ 4 minutes). Raising `baseline_days` later fetches the missing older days once.
+After a time in which RADAR was not running, the non-interactive sign-ins of the last
+`non_interactive_max_catchup_hours` (6) are read at once and those before in the following scans, newest first
+(`backlog_pages_per_run` pages of 1000 per scan, up to `non_interactive_backlog_days` = 7 back; 0 = skipped). They
+feed the profile (devices, networks, countries) and the rules that judge each new sign-in; rules that compare
+within the last minutes or hours (session replay right after a fresh MFA) see only what is still stored.
 Non-interactive sign-ins (thousands per hour in a mid-size tenant) are kept for 3 h only
 (`non_interactive_retention_hours`; raise it to ~26 if you turn on `include_non_interactive` for the geo rules).
 
@@ -150,13 +157,26 @@ person and week Medium; a LAPS read Low), owners added to apps, a Global Adminis
 (High), and optionally admin password/MFA resets. Device registrations (silent links for attack chains) and
 session revocations (remediation context: a chain followed by a revocation is marked "handled?") are recorded.
 
+**What switches other protections off** is watched too:
+
+| Change | Why | Score |
+|---|---|---|
+| Named location added / changed / deleted (`named_locations`) | Conditional Access policies that leave out trusted locations stop applying to sign-ins from it - and RADAR itself counts a trusted location as the organisation's own network (`trust_named_locations`) | 45 (deleted 40), **marked trusted +20** |
+| Authentication methods policy, an authentication strength, security defaults (`auth_methods_policy`) | which sign-in methods the tenant allows and what counts as strong, for everybody | 50 / 45 / 60 |
+| Member or owner added to a group that can hold admin roles (`privileged_group`) | the group's roles are the member's at once, and no role assignment is logged for the person - only "Add member to group". The role-assignable groups are read from Entra (cached 6 h); activations through PIM are left out | 60 (owner 55) |
+| Rare changes of the tenant itself (`tenant_changes`, one reminder per person and week) | a domain added or verified (it can be federated) 25-35; a private network connector registered 35; on an **existing** application a new reply address (where its sign-in tokens go) 20, +20 unencrypted to another machine, +20 wildcard; public client flows switched on 30 | 20-70 |
+
+Your automation (`automation_initiators`) gets -30 here as everywhere. In attack chains the first three are
+escalation (stage 5), the last one persistence (stage 4).
+
 **Attack chains** (`radar/chains.py`, after every scan, `general.attack_chains`). Each alert - also dismissed
 ones, silent signals and "logged only" findings - is a possible step of an account takeover: 1 targeted (password
 guessing, attack tools) -> 2 password known (MFA stopped it, MFA denials) -> 3 suspicious access (risky sign-in,
 new country, session theft, device code ...) -> 4 persistence (MFA method change, consent, app credentials, guest
 invite ...) -> 5 escalation (admin role, CA / federation change). Steps about the same account whose stages rise
 in time order, each within 3 days of the previous one's last activity (a running campaign counts until its last
-attempt), form a chain. It becomes a reminder ("Possible attack chain: ...") if it starts with stage 1/2 and
+attempt), form a chain. An admin role activated from the account's own surroundings is such a step only in hindsight
+(see below); activated from unfamiliar surroundings it is an alert and a full step. It becomes a reminder ("Possible attack chain: ...") if it starts with stage 1/2 and
 reaches 3+, or covers three stages - so "abroad, then a new passkey" stays quiet. A chain must combine at least
 two different detections; a step must be at least Low on its own (score >= 25); an "access" step whose sign-ins
 all failed counts as targeting. Score = strongest step + 10 per further step (+10 if the password was known and
@@ -184,6 +204,14 @@ from (a hotel, a mobile carrier). The mark then counts in **every rule's assessm
 address - to any account, or to the same account later - as "Known attacker address: used in ...", except for
 sign-ins from a device the account already used. It never counts against the sign-ins it was derived from. Alerts
 whose evidence contains such an address get the field *Known attacker address*.
+
+*Networks that only guess.* A guessing campaign changes its address with every attempt, so its addresses say
+nothing about the next one - the networks it rents them in stay the same for weeks. A network (AS) from which the
+passwords of at least `network_min_accounts` (3) accounts were guessed at within `days`, and from which nobody in
+the tenant has ever signed in, is remembered as well. It adds +15 to the assessment of whatever gets past a password
+from it (a successful sign-in, a right password that was stopped), on no device and no network the account knows -
+never to the guessing itself, and no longer once anybody signs in from that network (a mobile carrier or a home
+provider stops being one with the first person on it).
 
 **Attacks across accounts** (`chains.spread_findings`). Accounts are taken together when their alerts name the
 same known attacker address, or when an account that was already under real suspicion (its password is known, or

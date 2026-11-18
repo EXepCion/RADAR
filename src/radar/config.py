@@ -121,7 +121,14 @@ class ConfigManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                break
+            except PermissionError:  # Windows: a scanner or an editor has the file open for a moment
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         self._mtime = self._stat()
 
     def save(self) -> None:

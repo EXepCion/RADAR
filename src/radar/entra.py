@@ -52,6 +52,15 @@ def ca_exclusion_groups(graph) -> dict[str, dict[str, Any]]:
     return out
 
 
+def role_groups(graph) -> dict[str, str]:
+    """{group id: name} of the groups that can be given admin roles (role-assignable groups). Being a member of one
+    is holding its roles - now, or as soon as somebody assigns it one - and no role assignment is logged for the
+    person: the audit log only says "Add member to group"."""
+    return {g["id"]: g.get("displayName") or g["id"]
+            for g in graph.get_all("/v1.0/groups", {"$filter": "isAssignableToRole eq true", "$select": "id,displayName"})
+            if g.get("id")}
+
+
 def group_name(graph, group_id: str) -> str:
     try:
         return graph.get(f"/v1.0/groups/{group_id}", {"$select": "displayName"}).get("displayName") or group_id

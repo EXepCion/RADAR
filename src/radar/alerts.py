@@ -7,9 +7,10 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from . import correlation
+from . import quiet as quiet_rules
 from .plugin_api import Finding, Severity
 from .store import Store
 
@@ -157,9 +158,12 @@ class AlertCenter:
 
     # ------------------------------------------------------------ ingest
     def ingest(self, plugin_id: str, findings: Iterable[Finding],
-               min_severity: Severity = Severity.LOW, now: datetime | None = None) -> list[Alert]:
-        """Persist findings. Returns alerts that just became active and should pop up."""
+               min_severity: Severity = Severity.LOW, now: datetime | None = None,
+               quiet: Iterable[Any] = ()) -> list[Alert]:
+        """Persist findings. Returns alerts that just became active and should pop up. ``quiet``: what the user
+        switched off (radar.quiet) - a finding it covers is kept and logged, but does not come up."""
         now = now or utcnow()
+        quiet = list(quiet or ())
         popped: list[int] = []
         touched: list[int] = []
         with self._lock:
@@ -168,8 +172,11 @@ class AlertCenter:
                 row = self._store.query_one("SELECT * FROM alerts WHERE key=?", (f.key,))
                 score = _score(f)
                 subjects = correlation.subjects_from(f.fields, f.subjects)
+                off = None if f.signal or not quiet else quiet_rules.match(quiet, f.rule_id, subjects, sev, now)
+                if off is not None and sev >= min_severity:
+                    f.fields = {**f.fields, quiet_rules.NOTE_FIELD: off.note()}
                 if row is None:
-                    status = ACTIVE if sev >= min_severity and not f.signal else MUTED
+                    status = ACTIVE if sev >= min_severity and not f.signal and off is None else MUTED
                     new_id = self._store.execute(
                         "INSERT INTO alerts(key, plugin_id, rule_id, severity, title, summary, recommendation,"
                         " fields, evidence, links, occurred_at, first_seen, last_seen, status, score, factors,"
@@ -197,7 +204,8 @@ class AlertCenter:
                         self._store.execute("UPDATE alerts SET signal=? WHERE id=?", (f.signal, old.id))
                         if old.status in (ACTIVE, SNOOZED):
                             status, snooze_until = MUTED, None
-                elif (old.status in (DISMISSED, SNOOZED, ACTIVE) and escalated) or (old.status == MUTED and sev >= min_severity):
+                elif off is None and ((old.status in (DISMISSED, SNOOZED, ACTIVE) and escalated)
+                                      or (old.status == MUTED and sev >= min_severity)):
                     # got worse (or crossed the notification threshold): back on screen with attention - a snooze
                     # ends early, a dismissed reminder returns, an open one is shown again (it may be hidden)
                     status, snooze_until = ACTIVE, None
@@ -205,6 +213,8 @@ class AlertCenter:
                     self._store.execute("UPDATE alerts SET seen_at=NULL WHERE id=?", (old.id,))
                 fields = dict(old.fields)
                 fields.update(f.fields)
+                if off is None:
+                    fields.pop(quiet_rules.NOTE_FIELD, None)  # no longer switched off (or worse than what was)
                 merged_subjects = sorted(set(old.subjects) | set(correlation.subjects_from(fields, f.subjects)))
                 if merged_subjects != sorted(old.subjects):  # e.g. alerts created before a field was renamed
                     self._store.execute("UPDATE alerts SET subjects=? WHERE id=?", (json.dumps(merged_subjects), old.id))

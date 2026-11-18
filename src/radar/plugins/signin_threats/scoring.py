@@ -192,6 +192,15 @@ class Assessor:
         if mark and not trusted and not (s.device_id and s.device_id in self._cached(
                 ("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))):
             f.append(Factor(mark.points, f"Known attacker address: used in {mark.describe()}"))
+        elif not mark and not trusted and s.asn and hasattr(rc, "hostile_network"):
+            # a network that only ever guesses passwords here (indicators.derive_networks) - counted for what got
+            # past the password from it, on no device and no network the account knows
+            net_mark = rc.hostile_network(s)
+            if net_mark and self._past_password(s) and not (s.device_id and s.device_id in self._cached(
+                    ("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))) \
+                    and s.asn not in self._cached(("uasn", s.user_id, s.created), lambda: h.user_asns(s.user_id, s.created)) \
+                    and not h.asn_user_count(s.asn, s.created, s.user_id):
+                f.append(Factor(net_mark.points, f"Network that only guesses passwords here: {net_mark.describe()}"))
 
         # --- device
         if s.device_id:
@@ -257,6 +266,12 @@ class Assessor:
             score = floor
         return Assessment(score=score, factors=f, label=self._label(s, f, net, trusted),
                           context=acct.context(rc.now) if acct else "")
+
+    @staticmethod
+    def _past_password(s: SignIn) -> bool:
+        from . import rules  # (rules imports this module)
+
+        return s.success or s.error_code == rules.MFA_DENIED_CODE or rules.password_proven(s)
 
     @staticmethod
     def account_factors(acct, s: SignIn) -> list[Factor]:

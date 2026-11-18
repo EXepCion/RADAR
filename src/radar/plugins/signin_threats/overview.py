@@ -171,6 +171,21 @@ class AttackOverview:
         return sum(1 for a in self.accounts if a.status == "Active")
 
     @property
+    def attacked_now(self) -> int:
+        """What is going on with accounts right now: passwords being guessed, known passwords being used, stolen
+        sessions in use. It is the figure on the navigation AND the sum of the three figures on the page
+        (``active_now``), so that the two can be checked against each other. What went quiet or ended (see
+        status_of) is listed on the page, but nobody is under attack by it any more."""
+        now = self.active_now
+        return now["known"] + now["sessions"] + now["guessing"]
+
+    @property
+    def active_now(self) -> dict[str, int]:
+        """Per list of the page (by its key): how many of its rows are active right now."""
+        lists = {"known": self.password_known, "sessions": self.sessions, "guessing": self.accounts, "ips": self.sources}
+        return {key: sum(1 for x in rows if x.status == "Active") for key, rows in lists.items()}
+
+    @property
     def active_all(self) -> int:
         return self.active + sum(1 for x in self.password_known + self.sessions if x.status == "Active")
 

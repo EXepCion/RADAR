@@ -42,7 +42,12 @@ class SignInThreatsPlugin(Plugin):
         "baseline_days": 30,  # Entra keeps sign-in logs for 30 days
         "initial_lookback_hours": 24,
         "non_interactive_initial_hours": 2,
+        # After the PC was off: the first scan reads the last hours at once (non_interactive_max_catchup_hours), the
+        # scans after it read what lies before, newest first, backlog_pages_per_run pages (of 1000) each time - up
+        # to non_interactive_backlog_days back (0 = what is older than the catch-up hours is skipped).
         "non_interactive_max_catchup_hours": 6,
+        "non_interactive_backlog_days": 7,
+        "backlog_pages_per_run": 30,
         "overlap_minutes": 20,
         "interactive_overlap_minutes": 60,
         "retention_days": 30,
@@ -64,7 +69,13 @@ class SignInThreatsPlugin(Plugin):
                               "ignore_same_device": True, "ignore_same_country": True,
                               "include_non_interactive": False},
         "new_country": {"min_baseline_signins": 5, "allowed_countries": [], "include_non_interactive": False},
-        "new_country_background": {"min_baseline_signins": 5},
+        # app_server_min_accounts: an application (not Microsoft's own) that signs in for this many accounts from
+        # one cloud / hosting network is its own server there, not a device abroad (0 = never assume that)
+        "new_country_background": {"min_baseline_signins": 5, "app_server_min_accounts": 3},
+        # a sign-in by hand from a network, address, device and client the account never used, in a known country
+        "unfamiliar_signin": {"min_history_days": 7},
+        # an admin role switched on (PIM), judged by where the account signed in from in the minutes before
+        "role_activation": {"lookback_hours": 24, "minutes_before": 90},
         # a disabled account refused this often within the window is reported once a week
         "account_state": {"disabled_attempts_window_hours": 3, "disabled_attempts_min": 10},
         "legacy_auth": {"allowed_users": []},
@@ -86,7 +97,9 @@ class SignInThreatsPlugin(Plugin):
         "aitm_replay": {"window_minutes": 180},
         # addresses another finding proved to be an attacker's count against every sign-in from them, to any
         # account, for this many days (indicators.py)
-        "hostile_indicators": {"enabled": True, "days": 7},
+        # network_min_accounts: a network from which the passwords of this many accounts were guessed at and nobody
+        # ever signed in counts against what gets past a password from it (0 = off)
+        "hostile_indicators": {"enabled": True, "days": 7, "network_min_accounts": 3},
         # several accounts with an odd sign-in (past the password, outside their usual surroundings) within the
         # window, all from one network new to the tenant / a hosting or VPN network, or with one never-seen client
         "signin_wave": {"window_hours": 6, "min_accounts": 4},
@@ -127,8 +140,13 @@ class SignInThreatsPlugin(Plugin):
             accounts = self._accounts(ctx, now, max_age=timedelta(0) if full else None)
             learning = self._seed_patterns(ctx, history, accounts, now)
             fetched, new = 0, []
+            owed = {t for t in self._event_types(s) if ctx.state.get(f"backlog:{t}")}  # from scans before this one
             for event_type in self._event_types(s):
                 n, fresh = self._ingest(ctx, history, event_type, now)
+                fetched += n
+                new.extend(fresh)
+            for event_type in sorted(owed):
+                n, fresh = self._work_backlog(ctx, history, event_type, now)
                 fetched += n
                 new.extend(fresh)
             self._refresh_incomplete(ctx, history, now)
@@ -163,6 +181,7 @@ class SignInThreatsPlugin(Plugin):
             if ctx.rule_enabled("app_signins"):
                 findings.extend(self._app_signins(ctx, history, now))
             ctx.state.set(DATA_AS_OF, now.isoformat())  # the sign-in history is complete up to here
+            self._compact(ctx, history, now)
             status = f"{fetched:,} sign-ins fetched, {len(new):,} new, {len(findings)} finding(s)"
             ctx.log.info(status + f" (history {history.count():,})")
             ctx.set_status(status)
@@ -220,7 +239,7 @@ class SignInThreatsPlugin(Plugin):
             if not interactive:
                 floor = now - timedelta(hours=float(s.get("non_interactive_max_catchup_hours", 6)))
                 if since < floor:
-                    ctx.log.warning("Skipping %s sign-ins older than %s (catch-up limit)", event_type, floor)
+                    self._note_backlog(ctx, event_type, since, floor, now)
                     since = floor
 
         flt = f"createdDateTime ge {graph_time(since)}"
@@ -246,6 +265,81 @@ class SignInThreatsPlugin(Plugin):
         ctx.state.set(key, (newest or now).isoformat())
         ctx.log.info("%s: fetched %d since %s, %d new", event_type, fetched, graph_time(since), len(fresh))
         return fetched, fresh
+
+    # ------------------------------------------------------- the hours RADAR was not running
+    def _note_backlog(self, ctx: PluginContext, event_type: str, start: datetime, end: datetime, now: datetime) -> None:
+        """RADAR was not running for longer than it reads at once: remember the time before as owed. The scans after
+        this one read it (``_work_backlog``), so the first scan after a night or a weekend stays quick."""
+        days = float(ctx.settings.get("non_interactive_backlog_days", 7))
+        start = max(start, now - timedelta(days=days))
+        if days <= 0 or start >= end:
+            ctx.log.warning("Skipping %s sign-ins older than %s (catch-up limit)", event_type, end)
+            return
+        key = f"backlog:{event_type}"
+        ctx.state.set(key, list(ctx.state.get(key) or []) + [[start.isoformat(), end.isoformat()]])
+        ctx.log.info("%s sign-ins from %s to %s (while RADAR was not running) are read in the scans after this one",
+                     event_type, graph_time(start), graph_time(end))
+
+    def _work_backlog(self, ctx: PluginContext, history: SignInHistory, event_type: str,
+                      now: datetime) -> tuple[int, list[SignIn]]:
+        """Read a portion of the sign-ins owed from the time RADAR was not running: the newest gap first, within it
+        from its end backwards. What is read is kept and judged like any other new sign-in."""
+        s = ctx.settings
+        key = f"backlog:{event_type}"
+        pending = [list(p) for p in ctx.state.get(key) or [] if isinstance(p, (list, tuple)) and len(p) == 2]
+        budget = max(1, int(s.get("backlog_pages_per_run", 30)))
+        oldest_wanted = now - timedelta(days=float(s.get("non_interactive_backlog_days", 7)))
+        fetched, fresh = 0, []
+        while pending and budget > 0:
+            start, end = max(parse_time(pending[-1][0]), oldest_wanted), parse_time(pending[-1][1])
+            if start >= end:
+                pending.pop()
+                continue
+            ctx.set_status(f"Reading {event_type} sign-ins from while RADAR was not running "
+                           f"({timefmt.stamp(start)} - {timefmt.stamp(end)})...")
+            flt = (f"createdDateTime ge {graph_time(start)} and createdDateTime le {graph_time(end)}"
+                   f" and signInEventTypes/any(t: t eq '{event_type}')")
+            pages, oldest = 0, None
+            for page in ctx.graph.get_pages("/beta/auditLogs/signIns",
+                                            {"$filter": flt, "$top": "1000", "$orderby": "createdDateTime desc"}):
+                ctx.check_cancelled()
+                rows = [SignIn.from_graph(r, event_type) for r in page]
+                pages += 1
+                fetched += len(rows)
+                fresh.extend(history.add(rows))
+                for r in rows:
+                    if oldest is None or r.created < oldest:
+                        oldest = r.created
+                if pages >= budget:
+                    break  # this scan's portion; the rest is read by the next one
+            # the portion was used up: there may be more before the oldest one read (the second it lies in is
+            # asked for again; what is already stored is not counted twice)
+            more = pages >= budget and oldest is not None
+            budget -= max(1, pages)
+            new_end = (oldest + timedelta(seconds=1)) if more else start
+            if more and start < new_end < end:
+                pending[-1] = [start.isoformat(), new_end.isoformat()]
+                break
+            pending.pop()
+        ctx.state.set(key, pending)
+        ctx.log.info("%s: %d sign-in(s) read from while RADAR was not running, %d new%s", event_type, fetched, len(fresh),
+                     f"; still owed: {len(pending)} period(s)" if pending else "; nothing owed any more")
+        return fetched, fresh
+
+    def _compact(self, ctx: PluginContext, history: Any, now: datetime) -> None:
+        """Once a week: let the history give back the room of what it purged (background sign-ins are stored by the
+        thousand and deleted hours later; the file never shrinks by itself)."""
+        last = ctx.state.get("compacted_at")
+        if last and now - parse_time(last) < timedelta(days=7):
+            return
+        ctx.state.set("compacted_at", now.isoformat())
+        try:
+            freed = history.compact()
+        except Exception:  # noqa: BLE001 - housekeeping must never cost a scan
+            ctx.log.warning("The sign-in history could not be compacted", exc_info=True)
+            return
+        if freed:
+            ctx.log.info("Sign-in history compacted: %.0f MB given back", freed / 1e6)
 
     # ------------------------------------------------------- log entries
     def fetch_entry(self, ctx: PluginContext, evidence_row: dict[str, str]) -> dict[str, Any] | None:
@@ -326,6 +420,9 @@ class SignInThreatsPlugin(Plugin):
                       "activityDisplayName eq 'Add Windows Hello for Business credential' or "
                       "activityDisplayName eq 'Delete passwordless phone sign-in credential')")
 
+    # An eligible admin role switched on (see the role_activation rule).
+    ROLE_FILTER = "activityDisplayName eq 'Add member to role completed (PIM activation)'"
+
     def _report_setting(self, ctx: PluginContext, now: datetime, force: bool = False) -> str:
         """Is 'Report suspicious activity' on in the tenant? (enabled / off / unknown; asked once a day.) While it
         is off nobody can report a prompt: the mfa_report rule is left out and the menu says why. When the setting
@@ -368,7 +465,8 @@ class SignInThreatsPlugin(Plugin):
         """Fetch MFA-method and password changes for the mfa_change rule (first run: the whole baseline), and the
         reports of MFA prompts for the mfa_report rule."""
         changes_wanted = ctx.rule_enabled("mfa_change")
-        if not changes_wanted and not reports:
+        roles_wanted = ctx.rule_enabled("role_activation")
+        if not changes_wanted and not reports and not roles_wanted:
             return
         cfg = ctx.settings.get("mfa_report") if isinstance(ctx.settings.get("mfa_report"), dict) else {}
         names = [str(n) for n in (cfg.get("activities") or ["Suspicious activity reported"]) if "'" not in str(n)]
@@ -377,6 +475,12 @@ class SignInThreatsPlugin(Plugin):
         since = (parse_time(checkpoint) - timedelta(minutes=60) if checkpoint
                  else now - timedelta(days=min(30.0, float(ctx.settings.get("baseline_days", 30)))))
         wanted = [(flt, since) for flt in (self.CHANGE_FILTERS if changes_wanted else ())]
+        if roles_wanted:
+            # the first time (also after an update): what the rule looks back on, not the whole baseline
+            cfg_roles = ctx.settings.get("role_activation") if isinstance(ctx.settings.get("role_activation"), dict) else {}
+            first = not ctx.state.get("checkpoint:roles")
+            wanted.append((self.ROLE_FILTER, max(now - timedelta(hours=float(cfg_roles.get("lookback_hours", 24))),
+                                                 now - timedelta(days=30)) if first else since))
         if report_names:
             # the first time this is read (also after an update): what was reported within the rule's window
             first = not ctx.state.get("checkpoint:reports")
@@ -395,6 +499,8 @@ class SignInThreatsPlugin(Plugin):
             return
         if report_names:
             ctx.state.set("checkpoint:reports", now.isoformat())
+        if roles_wanted:
+            ctx.state.set("checkpoint:roles", now.isoformat())
         audits.sort(key=lambda a: a.get("activityDateTime") or "")
         # "User registered security info" does not name the method; the preceding "started" event does
         started: dict[str, tuple[datetime, str]] = {}
@@ -420,7 +526,7 @@ class SignInThreatsPlugin(Plugin):
         added = history.add_changes(changes)  # duplicates from the overlap are ignored
         ctx.state.set("checkpoint:changes", now.isoformat())
         if added:
-            ctx.log.info("%d MFA-method / password change(s) recorded", added)
+            ctx.log.info("%d account event(s) recorded (MFA methods, passwords, reported prompts, role activations)", added)
 
     def _refresh_incomplete(self, ctx: PluginContext, history: SignInHistory, now: datetime) -> None:
         """Re-read preliminary records (no UPN/network yet) until Entra has completed them.

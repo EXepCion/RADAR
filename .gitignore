@@ -18,6 +18,7 @@ private/
 *.log
 
 # packaging output
+src/radar/_build.py
 packaging/build/
 *.spec.bak
 Output/

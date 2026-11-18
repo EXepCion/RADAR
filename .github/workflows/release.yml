@@ -38,6 +38,11 @@ jobs:
       - name: Build the program, the zip and the installer
         shell: pwsh
         run: ./packaging/build.ps1 -Python python
+      - name: The build must be the release, not a marked development build
+        shell: pwsh
+        run: |
+          $mark = python -c "import sys; sys.path.insert(0, 'src'); from radar import buildinfo; print(buildinfo.BUILD)"
+          if ($mark) { throw "this build is marked '$mark': the tag does not point at a clean checkout" }
       - name: Show the checksums and what the build used
         shell: pwsh
         run: |
@@ -79,5 +84,5 @@ jobs:
             release/RADAR-*.zip
       - name: Publish the release
         run: |
-          mv release/RELEASE_NOTES.md notes.md
+          mv release/RELEASE_NOTES.md notes.md   # (this version's part only; the history is CHANGELOG.md)
           gh release create "$TAG" release/* --title "RADAR $TAG" --notes-file notes.md --verify-tag

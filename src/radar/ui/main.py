@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from PIL import ImageTk
 
-from .. import APP_DISPLAY_NAME, __version__, audio, incidents, paths, startup
+from .. import APP_DISPLAY_NAME, __version__, audio, buildinfo, incidents, paths, startup  # noqa: F401
+from .. import quiet as quiet_rules
+from ..plugin_api import Severity
 from . import icons, theme
 from .cardtable import CardTable
 from .reminder import SNOOZE_CHOICES
@@ -524,7 +526,7 @@ class MainWindow:
         side = ttk.Frame(body, width=px(SUB))
         side.pack(side="left", fill="y", padx=(0, px(14)))
         side.pack_propagate(False)
-        self.version_label = stable_label(side, f"{APP_DISPLAY_NAME} {__version__}\nw", width=px(SUB - 20), min_lines=2)
+        self.version_label = stable_label(side, f"{APP_DISPLAY_NAME} {buildinfo.full_version()}\nw", width=px(SUB - 20), min_lines=2)
         self.version_label.pack(side="bottom", fill="x", padx=px(12))
         self.sub_nav = NavList(side, self.show_settings, row=34)
         for key, label in SETTINGS_PAGES:
@@ -639,6 +641,16 @@ class MainWindow:
                     lambda label: cfg.set("general", "auto_close_low_days", value=dict(AUTO_CLOSE).get(label, days)), width=14)
         rows.switch("Weekly MFA exposure report", "For Reports; a mark there tells when its figures have changed",
                     lambda: app.exposure_reminder, app.toggle_exposure_reminder)
+        entries = app.quiet_entries() if hasattr(app, "quiet_entries") else []
+        if entries:  # what "Don't remind again" in an alert switched off
+            rows.group("Switched off")
+            for q in entries:
+                controls, _n, _h = rows.row(
+                    f"{app.rule_name(q.rule_id)}: {quiet_rules.label(q.subject)}",
+                    f"No reminders up to {Severity(q.severity).label} until {timefmt.stamp_year(q.until)}. Still judged "
+                    f"and kept in the alert history.")
+                rows.button(controls, "Remind me again", lambda q=q: (
+                    app.unquiet(q.rule_id, q.subject), self.root.after_idle(self._rebuild_sub, "reminders")))
         rows.group("Sound")
         controls, _n, self.device_label = rows.row("Reminder sound", self._device_text())
         var = tk.BooleanVar(value=app.sound_enabled)
@@ -671,7 +683,7 @@ class MainWindow:
         rows.group("New versions")
         rows.switch("Check for new versions", "Once a day RADAR asks GitHub for the latest release. Nothing is downloaded or "
                     "installed by itself.", lambda: app.check_updates, app.toggle_check_updates)
-        controls, _n, self.version_row = rows.row(f"{APP_DISPLAY_NAME} {__version__}", self._version_text())
+        controls, _n, self.version_row = rows.row(f"{APP_DISPLAY_NAME} {buildinfo.full_version()}", self._version_text())
         rows.button(controls, "Open the releases page", app.open_update_page)
         rows.button(controls, "Look now", app.look_for_update)
 
@@ -682,7 +694,7 @@ class MainWindow:
     def _update_version(self) -> None:
         try:
             newer = getattr(self.app.updates, "available", None)
-            self.version_label.configure(text=f"{APP_DISPLAY_NAME} {__version__}"
+            self.version_label.configure(text=f"{APP_DISPLAY_NAME} {buildinfo.full_version()}"
                                          + (f"\n{newer.version} is available" if newer is not None else ""))
             if getattr(self, "version_row", None) is not None and self.version_row.winfo_exists():
                 self.version_row.configure(text=self._version_text())
@@ -806,6 +818,8 @@ class MainWindow:
             return "link", "Scanning", ", ".join(names)
         if app.auth.state == "required":
             return "error", "Sign-in required", "Settings > Account and connection"
+        if app.last_error and getattr(app, "offline", False):
+            return "warn", "No connection", "Microsoft is not reachable - trying again"
         if app.last_error:
             return "error", "Last scan failed", app.last_error[:60]
         if app.last_scan:

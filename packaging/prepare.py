@@ -34,4 +34,22 @@ numbers = tuple(parts + [0] * (4 - len(parts)))
   ]
 )
 """, encoding="utf-8")
+
+def _git(*args: str) -> str:
+    import subprocess
+
+    try:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=20, check=True).stdout.strip()
+    except Exception:  # noqa: BLE001 - no git, no repository: the build claims nothing
+        return ""
+
+
+# What this build is made from (see radar/buildinfo.py): nothing for the release, else the commit.
+from radar import buildinfo  # noqa: E402
+
+tag = f"v{radar.__version__}"
+build = buildinfo.mark(radar.__version__, tag if tag in _git("tag", "--points-at", "HEAD").split() else "",
+                       _git("rev-parse", "--short", "HEAD"), bool(_git("status", "--porcelain", "--untracked-files=no")))
+(ROOT / "src" / "radar" / "_build.py").write_text(
+    f'"""Written by packaging/prepare.py at build time (not in the repository)."""\nBUILD = {build!r}\n', encoding="utf-8")
 print(radar.__version__)

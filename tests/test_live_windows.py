@@ -90,7 +90,8 @@ def test_every_change_reaches_every_open_window():
     app = SimpleNamespace(_history=win, _incidents=win, tray=None, ui_call=lambda fn, *a: fn(*a),
                           reminders=SimpleNamespace(visible=False, refresh_details=lambda: calls.append("details"),
                                                     show=lambda attention: calls.append("reminders")),
-                          alerts=SimpleNamespace(ingest=lambda plugin, findings, level: findings),
+                          alerts=SimpleNamespace(ingest=lambda plugin, findings, level, quiet=(): findings),
+                              quiet_entries=lambda: [],
                           min_severity=lambda: Severity.LOW, _update_chains=lambda: [])
     for name in ("_refresh_open_windows", "_refresh_history_if_open", "_refresh_reminders_if_visible", "_refresh_tray"):
         setattr(app, name, getattr(App, name).__get__(app))

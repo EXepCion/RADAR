@@ -17,6 +17,7 @@ from .. import linkify
 from ..alerts import Alert
 from ..linkify import Entity
 from . import icons, theme
+from .. import quiet as quiet_rules
 from .richtext import (LinkHandler, StatusLine, attach_table_menu, card, card_label, fit_columns, pill,
                        stable_label,
                        scrolled_text)
@@ -255,11 +256,12 @@ class DetailsWindow:
         bar.pack(fill="x")
 
         def button(text: str, command: Callable[[], None], icon: str, role: str = "text", style: str = "TButton",
-                   side: str = "right") -> None:
+                   side: str = "right") -> ttk.Button:
             image = theme.icon(top, icon, role)
             b = ttk.Button(bar, text=f" {text}" if image else text, command=command, style=style,
                            **({"image": image, "compound": "left"} if image else {}))
             b.pack(side=side, padx=(0, px(4)) if side == "left" else (px(6), 0))
+            return b
 
         for label, url in a.links:
             cmd = self._open_signin_logs if url == ENTRA_SIGNIN_LOGS else (lambda u=url: self.app.open_link(u))
@@ -269,6 +271,12 @@ class DetailsWindow:
             if self._on_snooze:
                 button(f"Snooze {self._snooze_label}".strip(), self._snooze, "clock")
         button("Copy details", self._copy, "copy")
+        # the same routine thing every day: switch its reminders off for the account / application it is about
+        self.quiet_button: ttk.Button | None = None
+        self._quiet_for = (quiet_rules.choices(a) if a.status in ("active", "snoozed") and hasattr(self.app, "quiet_alert")
+                           else [])
+        if self._quiet_for:
+            self.quiet_button = button("Don't remind again...", self.quiet_menu, "clock")
         if self._on_refresh:
             from .freshness import DataAge
 
@@ -657,6 +665,23 @@ class DetailsWindow:
 
     def _dismiss(self) -> None:
         self._on_dismiss(self.alert)
+        self.top.destroy()
+
+    def quiet_menu(self):
+        """For how long - and, when the alert is about several accounts / applications, for which of them."""
+        from .menu import ContextMenu
+
+        one = len(self._quiet_for) == 1
+        items = [(period if one else f"{quiet_rules.label(subject)} - {period}",
+                  lambda s=subject, d=days: self._quiet(s, d))
+                 for subject in self._quiet_for for period, days in quiet_rules.PERIODS]
+        title = "No reminders of this kind about " + (quiet_rules.label(self._quiet_for[0]) if one else "...")
+        b = self.quiet_button
+        self._menu = ContextMenu(self.top, [(title, items)], b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+        return self._menu
+
+    def _quiet(self, subject: str, days: int) -> None:
+        self.app.quiet_alert(self.alert, subject, days)
         self.top.destroy()
 
     def _snooze(self) -> None:

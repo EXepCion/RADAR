@@ -19,8 +19,16 @@ def profile_values(s: SignIn) -> list[tuple[str, str]]:
     """(kind, value) pairs remembered per user for successful sign-ins (30 days, all sign-in types)."""
     pairs = [("asn", str(s.asn) if s.asn else ""), ("device", s.device_id), ("client", s.client),
              ("anonday", anon_day(s)), ("ip", s.ip), ("app", s.app), ("proto", (s.client_app or "").lower()),
-             ("country", s.country), ("mfadev", s.mfa_device_id)]
+             ("country", s.country), ("mfadev", s.mfa_device_id), ("appnet", app_network(s))]
     return [(k, v) for k, v in pairs if v]
+
+
+def app_network(s: SignIn) -> str:
+    """'application|network' for applications that are not Microsoft's own: an application that signs in for several
+    accounts from one cloud network is its own server, not anybody's device (see SignInHistory.app_network_users)."""
+    if not (s.app_id and s.asn and s.app_owner_tenant) or s.app_owner_tenant in netintel.MICROSOFT_TENANTS:
+        return ""
+    return f"{s.app_id}|{s.asn}"
 
 
 def anon_day(s: SignIn) -> str:
@@ -358,6 +366,27 @@ class SignInHistory:
         self._conn.commit()
         return cur.rowcount
 
+    def free_bytes(self) -> int:
+        """Room in the file that holds nothing any more (pages of deleted rows)."""
+        return (self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+                * self._conn.execute("PRAGMA page_size").fetchone()[0])
+
+    def compact(self, min_free_bytes: int = 16_000_000, min_free_ratio: float = 0.25) -> int:
+        """Give the room of deleted rows back to the disk when it is worth it: at least ``min_free_bytes`` and
+        that share of the file. Returns the bytes given back (0: not worth it, or somebody else is reading)."""
+        free = self.free_bytes()
+        total = (self._conn.execute("PRAGMA page_count").fetchone()[0]
+                 * self._conn.execute("PRAGMA page_size").fetchone()[0])
+        if free <= 0 or free < min_free_bytes or free < total * min_free_ratio:
+            return 0
+        try:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:  # a window is reading the history right now: next week
+            return 0
+        return max(0, free - self.free_bytes())
+
     # --------------------------------------------------------------- read
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM signins").fetchone()[0]
@@ -434,6 +463,17 @@ class SignInHistory:
     def user_clients(self, user_id: str, before: datetime) -> set[str]:
         sql = "SELECT value FROM profile WHERE user_id=? AND kind='client' AND first_ts<?"
         return {r[0] for r in self._conn.execute(sql, (user_id, before.timestamp()))}
+
+    def app_network_users(self, app_id: str, asn: int, since: datetime) -> int:
+        """For how many accounts an application signed in from one network since ``since`` (see app_network)."""
+        return self._conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM profile WHERE kind='appnet' AND value=? AND last_ts>=?",
+            (f"{app_id}|{asn}", since.timestamp())).fetchone()[0]
+
+    def user_first_seen(self, user_id: str) -> datetime | None:
+        """The earliest successful sign-in the profile knows of an account (None: none yet)."""
+        row = self._conn.execute("SELECT MIN(first_ts) FROM profile WHERE user_id=?", (user_id,)).fetchone()
+        return datetime.fromtimestamp(row[0]).astimezone() if row and row[0] is not None else None
 
     def user_anon_days(self, user_id: str, before: datetime) -> int:
         """Distinct earlier days on which the user signed in successfully through a VPN/anonymizer."""

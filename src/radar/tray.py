@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import pystray
 from pystray._util import win32 as _w32
 
-from . import APP_DISPLAY_NAME, APP_NAME, __version__
+from . import APP_DISPLAY_NAME, APP_NAME, __version__, buildinfo  # noqa: F401
 from .ui import icons
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -127,7 +127,7 @@ class Tray:
         """The menu, top to bottom: what is going on, the windows, the two everyday switches, Exit. Everything that
         is set once - detection, offices, sound, account, files - is in the main window's Settings."""
         a = self.app
-        yield Item(f"{APP_DISPLAY_NAME} {__version__}", None, enabled=False)
+        yield Item(f"{APP_DISPLAY_NAME} {buildinfo.full_version()}", None, enabled=False)
         yield Item(a.status_line(), None, enabled=False)
         yield SEP
         n, unseen = a.alerts.count_active(), a.alerts.count_unseen()

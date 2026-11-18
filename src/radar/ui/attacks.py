@@ -397,7 +397,9 @@ class AttacksWindow:
                 values = dict(zip(cols, VALUES[key](row, "" if key == "ips" else reminder(key, row))))
                 self._rows[iid], self._full[iid] = row, values
                 tree.insert("", "end", iid=iid, values=[values["Status"], values[who], values[when]], tags=(row.status,))
-            self.filter.set_text(key, f"{name} {len(data[key])}")
+            # the figure: what is going on NOW (the list also has what went quiet or ended, by its Status). The
+            # figures of the three kinds about accounts add up to the one on the navigation.
+            self.filter.set_text(key, f"{name} {sum(1 for row in data[key] if getattr(row, 'status', '') == 'Active')}")
         self._failed = False
         if not self._chosen_by_user:  # it opens on the most dangerous kind there is something of
             self.filter.choose(self._most_dangerous(), tell=False)

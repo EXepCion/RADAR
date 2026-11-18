@@ -32,7 +32,7 @@ PASSWORD_RESET_ACTIVITIES = {
 AUDIT_URL = "https://portal.azure.com/#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/Audit"
 CATEGORIES = ("RoleManagement", "ApplicationManagement", "UserManagement", "Policy", "PolicyManagement",
               "DirectoryManagement", "GroupManagement", "CrossTenantAccessSettings", "KeyManagement", "Device",
-              "AzureRBACRoleManagementElevateAccess")
+              "AzureRBACRoleManagementElevateAccess", "ResourceManagement")
 
 # ---- Microsoft 365 support cases (learn.microsoft.com/microsoft-365/admin/support-diagnostic-information-collection)
 # Opening a case in the admin center adds the Microsoft Support tenant as cross-tenant service provider (actor: the
@@ -53,7 +53,7 @@ SYSTEM_INITIATORS = [
     "azure credential configuration endpoint service", "intune *", "microsoft intune*",
 ]
 PIM_LIFECYCLE = ("pim activation", "activation expired")
-WEEKLY_RULES = {"app_credentials", "admin_credential_reset", "sensitive_reads", "app_owner_change"}
+WEEKLY_RULES = {"app_credentials", "admin_credential_reset", "sensitive_reads", "app_owner_change", "tenant_changes"}
 
 # ---- application consent: judged by WHAT is granted, not by who clicked "Accept" ----
 CONSENT_ACTIVITIES = ("consent to application", "add delegated permission grant",
@@ -120,7 +120,78 @@ WATCHLIST: dict[str, list[tuple[str, int, str]]] = {
         ("elevated their access", 80, "A Global Administrator elevated to User Access Administrator over ALL Azure "
                                       "subscriptions"),
     ],
+    # the networks Conditional Access - and RADAR - take for the organisation's own
+    "named_locations": [
+        ("delete named location", 40, "Deleted a named location (policies that name it apply differently now)"),
+        ("add named location", 45, "Added a named location"),
+        ("update named location", 45, "Changed a named location"),
+    ],
+    # what counts as a sign-in method / as strong enough, for everybody
+    "auth_methods_policy": [
+        ("authentication methods policy", 50, "Changed which sign-in methods the tenant allows (authentication "
+                                              "methods policy)"),
+        ("authentication strength", 45, "Changed an authentication strength (what Conditional Access accepts as a "
+                                        "strong sign-in)"),
+        ("update security defaults", 60, "Changed the security defaults (the tenant's basic MFA protection)"),
+    ],
 }
+TRUSTED_LOCATION_REASON = ("Marked as trusted: Conditional Access policies that leave out trusted locations no longer "
+                           "apply to sign-ins from it, and they count as coming from the organisation's own network")
+
+# ---- rare changes of the tenant itself: each is ordinary work once in a while, and a way to stay for an intruder ----
+DOMAIN_ACTIVITIES = {
+    "add unverified domain": (25, "Started adding a domain to the tenant"),
+    "add verified domain": (35, "Added a verified domain (a domain can be federated: sign-ins for it are then decided "
+                                "by whoever runs its identity provider)"),
+    "verify domain": (35, "Verified a domain of the tenant (a domain can be federated: sign-ins for it are then decided "
+                          "by whoever runs its identity provider)"),
+    "promote sub domain to root domain": (35, "Made a sub-domain a domain of its own (it can then be federated "
+                                              "separately)"),
+}
+CONNECTOR_ACTIVITIES = {
+    "register connector": (35, "Registered a private network connector: a path from the internet to the network it "
+                               "runs in"),
+}
+_ADDRESS = re.compile(r'"Address"\s*:\s*"([^"]+)"')
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+
+
+def _reply_addresses(value) -> set[str]:
+    return set(_ADDRESS.findall(str(value or "")))
+
+
+def tenant_change_factors(audit: dict) -> list[tuple[int, str]] | None:
+    """Score factors of a rare change of the tenant itself, or None when the entry is none: a domain added or
+    verified, a private network connector registered, and on an application that exists already: a new reply
+    address (where its sign-in tokens are sent) or public client flows switched on (sign-in with a password or a
+    device code, without the application's secret)."""
+    activity = (audit.get("activityDisplayName") or "").strip().lower()
+    for table in (DOMAIN_ACTIVITIES, CONNECTOR_ACTIVITIES):
+        if activity in table:
+            return [table[activity]]
+    if activity != "update application":  # ("Update service principal" repeats the same change)
+        return None
+    factors: list[tuple[int, str]] = []
+    for t in audit.get("targetResources") or []:
+        for p in t.get("modifiedProperties") or []:
+            name = p.get("displayName")
+            if name == "AppAddress":
+                added = sorted(_reply_addresses(p.get("newValue")) - _reply_addresses(p.get("oldValue")))
+                if not added:
+                    continue
+                factors.append((20, "Added reply address(es) to an existing application - where its sign-in tokens "
+                                    "are sent: " + ", ".join(added[:4]) + (" ..." if len(added) > 4 else "")))
+                plain = [a for a in added if a.lower().startswith("http://")
+                         and not a.lower().split("//", 1)[1].startswith(_LOCAL_HOSTS)]
+                if plain:
+                    factors.append((20, "Not encrypted (http://) to another machine: " + ", ".join(plain[:3])))
+                if any("*" in a for a in added):
+                    factors.append((20, "Wildcard address: any host that matches receives the tokens"))
+            elif name == "PublicClient" and "true" in str(p.get("newValue") or "").lower() \
+                    and "true" not in str(p.get("oldValue") or "").lower():
+                factors.append((30, "Allowed public client flows for an existing application: sign-in with a password "
+                                    "or a device code, without the application's secret"))
+    return factors or None
 SENSITIVE_READS_BULK = 5  # secrets read by one person in a week from this count on: +25 (calibrated: IT reads 1-4/week)
 
 # ---- cross-tenant access settings: whose MFA / devices / users this tenant trusts ----
@@ -231,6 +302,9 @@ def score_audit(rid: str, audit: dict, automation: list[str]) -> tuple[int, list
     else:
         return None
     factors = [(base, reason)]
+    if rid == "named_locations" and any('"istrusted":true' in str(v).lower().replace(" ", "")
+                                        for v in _props(audit).values()):
+        factors.append((20, TRUSTED_LOCATION_REASON))
     role = _role(audit)
     if rid == "role_assignment" and role:
         if role.lower() in TOP_ROLES:
@@ -664,6 +738,10 @@ class DirectoryAuditPlugin(Plugin):
         Rule("device_registration", "Device registrations (only as part of an attack chain)"),
         Rule("session_revocations", "Session revocations (context: attack handled)"),
         Rule("cross_tenant_access", "Cross-tenant trust / B2B access settings changed"),
+        Rule("named_locations", "Named locations (trusted networks) changed"),
+        Rule("auth_methods_policy", "Sign-in methods policy, authentication strengths, security defaults changed"),
+        Rule("privileged_group", "Members / owners added to groups that can hold admin roles"),
+        Rule("tenant_changes", "Rare tenant changes: domains, network connectors, app reply addresses"),
     ]
     default_settings = {
         "initial_lookback_hours": 24,
@@ -691,6 +769,8 @@ class DirectoryAuditPlugin(Plugin):
         groups: dict[tuple, list[tuple[dict, int, list]]] = defaultdict(list)
         invites: list[dict] = []
         exclusion_changes: list[tuple[dict, str, str]] = []
+        privileged: list[tuple[dict, str]] = []
+        role_groups: dict[str, str] | None = None  # asked for when the first group change comes along
         disabled: list[dict] = []
         consents: list[dict] = []
         consent_policy: list[tuple[dict, str]] = []
@@ -746,6 +826,22 @@ class DirectoryAuditPlugin(Plugin):
             if activity == "invite external user" and ctx.rule_enabled("guest_invites"):
                 invites.append(audit)
                 continue
+            if activity in ("add member to group", "add owner to group") and ctx.rule_enabled("privileged_group"):
+                if role_groups is None:
+                    role_groups = self._role_groups(ctx, now)
+                gid = _group_id(audit)
+                if gid in role_groups:
+                    privileged.append((audit, role_groups[gid]))
+                    continue
+            if ctx.rule_enabled("tenant_changes"):
+                factors = tenant_change_factors(audit)
+                if factors:
+                    if _matches(who, automation):
+                        factors = factors + [(-30, f"Known automation of the tenant ({who})")]
+                    year, week, _ = when.astimezone().isocalendar()
+                    groups[("tenant_changes", who, f"{year}-W{week:02d}")].append(
+                        (audit, max(0, min(100, sum(p for p, _ in factors))), factors))
+                    continue
             if audit.get("category") == "CrossTenantAccessSettings" and ctx.rule_enabled("cross_tenant_access"):
                 if not support_case_opened(audit):  # opening a support case is recorded separately
                     factors = cross_tenant_factors(audit)
@@ -784,6 +880,7 @@ class DirectoryAuditPlugin(Plugin):
 
         findings = [self._invite_finding(a) for a in invites]
         findings += [self._exclusion_finding(a, gid, name) for a, gid, name in exclusion_changes]
+        findings += [self._privileged_group_finding(a, name, automation) for a, name in privileged]
         findings += [self._disabled_signal(a) for a in disabled]
         findings += [self._support_case_record(a, by) for a, by in support_cases_opened]
         findings += [self._cross_tenant_finding(ctx, a, factors) for a, factors in cross_tenant]
@@ -1137,6 +1234,50 @@ class DirectoryAuditPlugin(Plugin):
             return cached["groups"] if cached else {}
         ctx.state.set("ca_exclusion_groups", {"at": now.isoformat(), "groups": groups})
         return groups
+
+    @staticmethod
+    def _role_groups(ctx: PluginContext, now) -> dict[str, str]:
+        """{group id: name} of the groups that can hold admin roles (cached a few hours)."""
+        cached = ctx.state.get("role_groups")
+        if cached and now - parse_time(cached["at"]) < timedelta(hours=EXCLUSION_CACHE_HOURS):
+            return cached["groups"]
+        try:
+            groups = entra.role_groups(ctx.graph)
+        except Exception as exc:
+            ctx.log.warning("Could not read the groups that can hold admin roles: %s", exc)
+            return cached["groups"] if cached else {}
+        ctx.state.set("role_groups", {"at": now.isoformat(), "groups": groups})
+        return groups
+
+    @staticmethod
+    def _privileged_group_finding(audit: dict, group: str, automation: list[str]) -> Finding:
+        who, when = _initiator(audit), parse_time(audit["activityDateTime"])
+        owner = "owner" in (audit.get("activityDisplayName") or "").lower()
+        member = next((t.get("userPrincipalName") or t.get("displayName") for t in audit.get("targetResources") or []
+                       if str(t.get("type", "")).lower() in ("user", "serviceprincipal", "device")), None) or "an account"
+        if owner:
+            factors = [(55, f"{member} was made an owner of {group}, a group that can hold admin roles - an owner "
+                            f"decides who its members are")]
+        else:
+            factors = [(60, f"{member} was added to {group}, a group that can hold admin roles - its roles are now "
+                            f"this account's, and no role assignment is logged for it")]
+        if _matches(who, automation):
+            factors.append((-30, f"Known automation of the tenant ({who})"))
+        score = max(0, min(100, sum(p for p, _ in factors)))
+        subjects = [who] + ([str(member).lower()] if "@" in str(member) else [])
+        return Finding(
+            key=f"privgroup|{audit.get('id')}", rule_id="privileged_group", severity=severity_for(score), score=score,
+            factors=factors, subjects=subjects,
+            title=f"{'Owner' if owner else 'Member'} added to a group that can hold admin roles: {member} -> {group}",
+            summary=f"{factors[0][1]}. Initiated by {who}.",
+            occurred_at=when,
+            fields={"Group": group, "Owner" if owner else "Member": member, "Initiated by": who},
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
+                       "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
+            recommendation=("Confirm it was requested and approved. Look at which roles the group holds (Entra ID > "
+                            "Roles and administrators) - they apply to the new member at once."),
+            links=[("Open audit logs", AUDIT_URL)],
+        )
 
     @staticmethod
     def _device_signal(audit: dict) -> Finding:

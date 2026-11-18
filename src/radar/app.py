@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from . import APP_DISPLAY_NAME, __version__, audio, correlation, paths, startup
+from . import quiet as quiet_rules
 from .alerts import Alert, AlertCenter
 from . import tenant
 from .auth import AuthManager, AuthRequiredError, TenantChangedError
@@ -29,6 +30,23 @@ log = logging.getLogger(__name__)
 SIGN_IN_LINK = "radar://sign-in"
 IDENTITY_LINK = "radar://identity"
 FRESH_START_LINK = "radar://start-fresh"
+
+
+def _no_connection(exc: BaseException | None) -> bool:
+    """Is this failure "Microsoft could not be reached" (no network, no name resolution, a timeout) - whatever it
+    was wrapped in on its way up?"""
+    import socket
+
+    import requests
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, socket.gaierror,
+                            TimeoutError, ConnectionError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 class App:
@@ -71,6 +89,7 @@ class App:
         self._running: set[str] = set()
         self.last_scan: datetime | None = None
         self.last_error: str | None = None
+        self.offline = False  # the last scan found no connection to Microsoft (it is tried again, nothing is wrong)
         self._auth_failures = 0
         self.root: tk.Tk | None = None
         self.reminders = None
@@ -301,6 +320,7 @@ class App:
         self._refresh_tray()
         try:
             findings = self.plugins.run(plugin_id)
+            self.offline = False
         except TenantChangedError:
             self._other_tenant()
             return False
@@ -336,6 +356,13 @@ class App:
                 log.warning("Plugin %s failed: %s", plugin_id, exc)
             return False
         except Exception as exc:
+            if _no_connection(exc):
+                # the PC is offline, on a network without a way out, or just woke up: nothing is broken
+                self.offline = True
+                self.last_error = "no connection to Microsoft - trying again"
+                log.warning("No connection to Microsoft (%s): %s is tried again", type(exc).__name__, plugin_id)
+                return False
+            self.offline = False
             self.last_error = f"{rt.plugin.name}: {type(exc).__name__}: {exc}"
             log.exception("Plugin %s crashed", plugin_id)
             return False
@@ -353,8 +380,34 @@ class App:
         self.deliver(plugin_id, findings)
         return True
 
+    # ------------------------------------------------------- reminders switched off
+    def quiet_entries(self) -> list[quiet_rules.Quiet]:
+        return quiet_rules.active(self.cfg)
+
+    def quiet_alert(self, alert: Alert, subject: str, days: float) -> quiet_rules.Quiet:
+        """'Don't remind me about this again': the alert's rule, for one account or application it is about, for a
+        time. The alert itself is dismissed."""
+        entry = quiet_rules.add(self.cfg, alert, subject, days)
+        log.info("Reminders of rule %s switched off for one subject until %s", alert.rule_id, entry.until.isoformat())
+        self.alerts.dismiss([alert.id])
+        self.on_alerts_changed()
+        main = getattr(self, "_main", None)
+        if main is not None and main.exists():  # Settings > Reminders lists it
+            self.ui_call(main._rebuild_sub, "reminders")
+        return entry
+
+    def unquiet(self, rule_id: str, subject: str) -> bool:
+        return quiet_rules.remove(self.cfg, rule_id, subject)
+
+    def rule_name(self, rule_id: str) -> str:
+        for rt in self.plugins.runtimes.values():
+            for rule in rt.plugin.rules:
+                if rule.id == rule_id:
+                    return rule.name
+        return rule_id
+
     def deliver(self, plugin_id: str, findings: list[Finding]) -> list[Alert]:
-        popped = self.alerts.ingest(plugin_id, findings, self.min_severity())
+        popped = self.alerts.ingest(plugin_id, findings, self.min_severity(), quiet=self.quiet_entries())
         popped += self._update_chains()
         if popped:
             log.info("%d new alert(s) from %s: %s", len(popped), plugin_id, "; ".join(a.title for a in popped))
@@ -593,7 +646,7 @@ class App:
             unseen = self.alerts.count_unseen()
             state, text = "alert", f"{n} active alert{'s' if n != 1 else ''}" + (f", {unseen} new" if unseen else "")
         elif self.last_error:
-            state, text = "warn", "last scan failed"
+            state, text = "warn", "no connection, trying again" if self.offline else "last scan failed"
         elif self._running:
             state, text = "busy", "scanning..."
         else:
@@ -776,12 +829,36 @@ class App:
                     "sessions": ("session_theft", "aitm_replay")}
     REMINDER_STATE = {"active": "open", "snoozed": "snoozed", "dismissed": "dismissed", "muted": "logged only"}
 
-    def count_attacked_accounts(self, hours: float = 72) -> int | None:
-        """How many accounts are under a password attack right now (worker thread: it reads the sign-in history)."""
+    BADGE_HOURS = 72  # the period the figure on the navigation is counted for until the page shows another one
+
+    def count_attacked_accounts(self, hours: float | None = None) -> int | None:
+        """How many accounts are under attack right now - guessing, a known password, a stolen session - for the
+        figure on the navigation (worker thread: it reads the sign-in history). What it was counted from is kept:
+        the Ongoing attacks page opens with it instead of starting empty."""
         rt = self.plugins.get(self.ATTACK_PLUGIN)
         if rt is None or not hasattr(rt.plugin, "ongoing") or self.threat_data_as_of() is None:
             return None
-        return len(rt.plugin.ongoing(self.plugins.build_context(self.ATTACK_PLUGIN), hours).accounts)
+        if hours is None:  # the period the page shows (it opens on BADGE_HOURS): one figure, the same in both places
+            hours = self.__dict__.get("_attack_hours", self.BADGE_HOURS)
+        result = rt.plugin.ongoing(self.plugins.build_context(self.ATTACK_PLUGIN), hours)
+        self._keep_attacks(result, self.threat_data_as_of())
+        return result.attacked_now
+
+    def _keep_attacks(self, result: Any, as_of: datetime | None) -> None:
+        """The overview last computed for a period: (it, the moment its data is from)."""
+        kept = self.__dict__.setdefault("_attacks_kept", {})
+        kept[float(result.hours)] = (result, as_of)
+
+    def kept_attacks(self, hours: float) -> tuple[Any, datetime | None] | None:
+        return self.__dict__.get("_attacks_kept", {}).get(float(hours))
+
+    def _tell_attack_count(self, result: Any) -> None:
+        """The page has loaded: the figure on the navigation is the one of what it shows, whatever period that is -
+        and it is counted for that period from now on."""
+        self._attack_hours = float(result.hours)
+        main = getattr(self, "_main", None)
+        if main is not None and main.exists():
+            main.set_attack_count(result.attacked_now)
 
     def show_attacks(self) -> None:
         """Live overview of running password attacks (independent of reminders)."""
@@ -818,6 +895,10 @@ class App:
             win.show_error("sign-in threat detection is not available")
             return
 
+        kept = None if refresh else self.kept_attacks(hours)
+        if kept is not None:  # what the figure on the navigation was counted from: there at once, with its age
+            self._show_attacks_result(win, kept[0], kept[1], True)
+
         def work() -> None:
             error = self.refresh_threat_data() if refresh else ""
             try:
@@ -827,6 +908,8 @@ class App:
                 log.exception("Ongoing-attacks overview failed")
                 self.ui_call(win.show_error, str(exc))
                 return
+            self._keep_attacks(result, as_of)
+            self.ui_call(self._tell_attack_count, result)
             self.ui_call(self._show_attacks_result, win, result, as_of, then_refresh, error)
             if then_refresh:
                 self.load_attacks(win, hours, refresh=True)

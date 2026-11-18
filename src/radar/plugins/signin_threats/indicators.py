@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 HIGH, MEDIUM = 25, 15  # points an indicator adds to an assessment (proven access / attack traffic)
+NETWORK, NETWORK_SOURCE = "asn", "guessing_network"  # a whole network (AS) that only guesses, see derive_networks
 MIN_SCORE = 45         # a finding has to be at least Medium to mark anything
 SHARED_USERS = 3       # an address this many accounts regularly sign in from is nobody's "attacker address"
 OWN_PROMPT_MARK = "(probably their own sign-in)"
@@ -61,6 +62,8 @@ class Indicator:
         return cls(**data)
 
     def describe(self) -> str:
+        if self.kind == NETWORK:
+            return f"{self.reason} (last {timefmt.stamp(self.when)})"
         return f"{self.reason} ({self.upn or 'an account'}, {timefmt.stamp(self.when)})"
 
 
@@ -100,7 +103,7 @@ def derive(rc: Any, findings: Iterable[Any]) -> list[Indicator]:
             s = rc.history.get(row.get("Sign-in ID") or "") if row.get("Sign-in ID") else None
             if s is None or not s.ip or rc.trusted(s) or s.ip in rc.ignore_ips or s.upn in rc.ignore_users:
                 continue
-            if rows == "access" and not (s.success or s.error_code in rules.PASSWORD_ACCEPTED_CODES
+            if rows == "access" and not (s.success or rules.password_proven(s)
                                          or s.error_code == rules.MFA_DENIED_CODE):
                 continue
             if s.user_id and not rules._foreign_to_user(rc, s):
@@ -117,15 +120,43 @@ def derive(rc: Any, findings: Iterable[Any]) -> list[Indicator]:
     return list(found.values())
 
 
+def derive_networks(rc: Any) -> list[Indicator]:
+    """Networks that only guess: failed passwords for several accounts came from them, and nobody in the tenant has
+    ever signed in from them. A guessing campaign changes its address with every attempt, so remembering addresses
+    says nothing about its next one - the networks it rents its addresses in stay the same for weeks. The mark
+    counts only against what gets past a password from such a network (see Assessor.assess), never against a
+    network somebody signs in from: a mobile carrier or a home provider stops being one with the first person on it."""
+    from . import rules
+
+    enabled, days = settings(rc)
+    minimum = int(rc.cfg("hostile_indicators").get("network_min_accounts", 3))
+    if not enabled or minimum <= 0:
+        return []
+    by_network: dict[int, list] = {}
+    for s in rc.keep(rc.history.query(rc.now - timedelta(days=days), rc.now, codes=rules.FAILED_PASSWORD_CODES)):
+        if s.asn and s.user_id and not rc.trusted(s):
+            by_network.setdefault(s.asn, []).append(s)
+    out = []
+    for asn, rows in by_network.items():
+        accounts = {s.user_id for s in rows}
+        if len(accounts) < minimum or rc.history.asn_user_count(asn, rc.now):
+            continue
+        last = max(rows, key=lambda s: s.created)
+        out.append(Indicator(NETWORK, str(asn), NETWORK_SOURCE,
+                             f"passwords of {len(accounts)} accounts were guessed at from it, nobody signs in from it",
+                             MEDIUM, "", "", last.created, last.created + timedelta(days=days)))
+    return out
+
+
 def apply(rc: Any, findings: list, reuse: bool = True) -> list[Indicator]:
     """After the rules ran: remember what their findings prove, report what else came from those addresses, and
-    name the addresses in the findings. Returns the indicators of this run."""
+    name the addresses in the findings. Returns the address indicators of this run."""
     from . import rules
 
     marked = derive(rc, findings)
-    rc.history.add_indicators(marked)
+    rc.history.add_indicators(marked + derive_networks(rc))
     rc.history.purge_indicators(rc.now)
-    rc._hostile = None
+    rc._hostile = rc._hostile_nets = None
     if reuse and settings(rc)[0]:
         findings.extend(rules.hostile_reuse(rc))
     annotate(rc, findings)
