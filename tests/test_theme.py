@@ -283,6 +283,13 @@ def test_live_report_window_shows_data_age_and_refresh_button(root):
     old = datetime.now(timezone.utc) - timedelta(hours=5, minutes=3)
     age.set(old, busy=True)  # opened with cached data, refresh running
     first = places()
+    settle = time.monotonic() + 3         # (a new window may still be taking its size: wait until two looks agree)
+    while time.monotonic() < settle:
+        time.sleep(0.05)
+        again = places()
+        if again == first:
+            break
+        first = again
     assert not age.pressable and "Refreshing" in str(age.button.cget("text"))
     assert age.text.endswith("(5 h ago)")  # 'refreshing' is said by the button only, not twice
     age.button.invoke()

@@ -30,7 +30,8 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
   Conditional Access and federation changes, cross-tenant trust, members added to groups that are excluded from
   Conditional Access or can hold admin roles, trusted networks (named locations), the sign-in methods policy,
-  new domains and application reply addresses, BitLocker and local-admin password reads.
+  new domains and application reply addresses, outside organisations given admin access, many accounts, groups or
+  applications deleted at once, BitLocker and local-admin password reads.
 - **Scores every finding** from 0 to 100 and explains the score: the network (hosting, VPN, the person's usual
   one), the device (managed, known, never seen), the kind of MFA, the account (admin, excluded from MFA, disabled).
   Low scores are only logged; from *Low* on a reminder pops up.

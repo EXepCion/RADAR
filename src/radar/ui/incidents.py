@@ -190,7 +190,6 @@ class Summary(tk.Frame):
         grid.columnconfigure(1, weight=1)
         self.fact_labels: dict[str, tk.Label] = {}
         for row, name in enumerate(FACTS + TEXTS):
-            tall = name in TEXTS  # (several lines: its name stands at the top of them)
             caption = tk.Label(grid, text=name, font=theme.FONT, anchor="nw", bd=0, padx=0, pady=0, background=white,
                                foreground=theme.color("muted"))
             caption.grid(row=row, column=0, sticky="nw", padx=(0, px(20)), pady=(px(6) if name == TEXTS[0] else px(2), px(2)))

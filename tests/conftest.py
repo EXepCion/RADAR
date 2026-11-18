@@ -11,6 +11,29 @@ from radar.plugins.signin_threats.history import SignInHistory  # noqa: E402
 from radar.plugins.signin_threats.models import SignIn  # noqa: E402
 
 T0 = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def _patient_tk():
+    """Windows now and then fails to start Tk when many windows were opened and closed in one process ("Can't
+    find a usable init.tcl" / "tk.tcl"); the fixtures of the window tests would skip them for it - silently. Try again."""
+    import time
+    import tkinter
+
+    class Tk(tkinter.Tk):
+        def __init__(self, *args, **kw):
+            for attempt in range(6):
+                try:
+                    super().__init__(*args, **kw)
+                    return
+                except tkinter.TclError as exc:
+                    if "Can't find a usable" not in str(exc) or attempt == 5:  # (init.tcl or tk.tcl)
+                        raise
+                    time.sleep(0.3)
+
+    tkinter.Tk = Tk
+
+
+_patient_tk()
 _counter = [0]
 
 

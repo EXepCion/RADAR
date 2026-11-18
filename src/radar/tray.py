@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import pystray
 from pystray._util import win32 as _w32
 
-from . import APP_DISPLAY_NAME, APP_NAME, __version__, buildinfo  # noqa: F401
+from . import APP_DISPLAY_NAME, APP_NAME, buildinfo
 from .ui import icons
 
 if TYPE_CHECKING:  # pragma: no cover

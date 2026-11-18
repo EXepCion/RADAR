@@ -360,3 +360,92 @@ def test_what_a_reply_address_change_says():
     assert [p for p, _ in wild] == [20, 20] and "Wildcard" in wild[1][1]
     assert f(entry(3, "Update application", targets=changed("PublicClient", "[true]", "[true]"))) is None
     assert f(entry(4, "Update user")) is None and f(entry(5, "Verify domain"))[0][0] == 35
+
+
+# ------------------------------------------------------------------ outside organisations, what users may do, deletions
+PARTNER_TENANT = "00000000-0000-4000-8000-0000000000b2"
+GLOBAL_ADMIN, HELPDESK_ADMIN = "62e90394-69f5-4237-9190-012177145e10", "729827e3-9c14-49f7-bb1b-9608f156bbb8"
+
+
+def provider(i, tenant, roles, who="admin1@contoso.com"):
+    return entry(i, "Adding allowed assignable roles", who, category="DelegatedAdminServiceProviderConstraints", targets=[
+        {"id": tenant, "type": "DelegatedAdminServiceProviderConstraints", "modifiedProperties": [   # (as Entra logs it)
+            {"displayName": "tenantId", "oldValue": None, "newValue": None},
+            {"displayName": "allowedRoleTemplateIds", "oldValue": None, "newValue": json.dumps(roles)}]}])
+
+
+def test_an_outside_organisation_that_can_be_given_admin_roles(tmp_path):
+    out, _graph = audit_run(tmp_path, [
+        provider(1, PARTNER_TENANT, [GLOBAL_ADMIN, HELPDESK_ADMIN]),
+        provider(2, PARTNER_TENANT, [HELPDESK_ADMIN], who="admin2@contoso.com"),
+        provider(3, directory_audit.MS_SUPPORT_TENANT, [directory_audit.SUPPORT_ENGINEER_ROLE], who="admin3@contoso.com"),
+        entry(4, "Add partner to company", who="admin4@contoso.com", category="DirectoryManagement"),
+    ])
+    by = {f.fields["Initiated by"]: f for f in out if f.rule_id == "partner_access"}
+    assert set(by) == {"admin1@contoso.com", "admin2@contoso.com", "admin4@contoso.com"}   # (a support case is no partner)
+    top = by["admin1@contoso.com"]
+    assert top.score == 75 and top.severity == Severity.HIGH
+    assert any("Global Administrator" in r and PARTNER_TENANT in r for _, r in top.factors)
+    assert by["admin2@contoso.com"].score == 50 and by["admin4@contoso.com"].score == 70
+    assert chains.stage_of("partner_access") == 5
+
+
+def test_the_category_of_service_providers_is_asked_for():
+    assert "DelegatedAdminServiceProviderConstraints" in directory_audit.CATEGORIES
+
+
+def test_what_every_user_may_do_is_a_tenant_change(tmp_path):
+    policy = lambda name, new, old="": [{"id": "p", "displayName": "Authorization Policy", "type": "Policy",   # noqa: E731
+                                         "modifiedProperties": [{"displayName": name, "oldValue": old, "newValue": new}]}]
+    out, _graph = audit_run(tmp_path, [
+        entry(1, "Update authorization policy", targets=policy("AllowInvitesFrom", '"everyone"', '"adminsAndGuestInviters"')),
+        entry(2, "Update authorization policy", who="admin2@contoso.com",
+              targets=policy("PermissionGrantPolicyIdsAssignedToDefaultUserRole",
+                             '["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"]', "[]")),
+    ])
+    f = next(f for f in out if f.rule_id == "tenant_changes")
+    assert f.fields["Initiated by"] == "admin1@contoso.com" and f.score == 30
+    assert any("AllowInvitesFrom" in r for _, r in f.factors)
+    assert [x.rule_id for x in out if x.fields.get("Initiated by") == "admin2@contoso.com"] == ["consent_grant"]  # said once
+
+
+def deleted(i, activity, name, who="admin1@contoso.com", app=False, day="2026-11-03", category="UserManagement"):
+    return entry(i, activity, who, app, category, [{"id": f"id-{activity}-{name}", "displayName": name,
+                                                    "modifiedProperties": []}], day=day)
+
+
+def test_many_objects_deleted_by_one_actor_in_a_day(tmp_path):
+    events = [deleted(i, "Delete user", f"user{i}") for i in range(5)]                                 # five accounts
+    events += [deleted(10 + i, "Delete user", f"user{i}", who="admin2@contoso.com") for i in range(4)]  # four: routine
+    events += [deleted(20 + i, "Delete group", f"group{i}", who="admin3@contoso.com", category="GroupManagement")
+               for i in range(30)]
+    events += [deleted(60 + i, "Hard delete group", f"group{i}", who="admin3@contoso.com", category="GroupManagement")
+               for i in range(30)]
+    # an application and its enterprise application are one thing deleted, not two
+    for i in range(3):
+        events += [deleted(100 + 2 * i, "Delete application", f"app{i}", who="admin4@contoso.com", category="ApplicationManagement"),
+                   deleted(101 + 2 * i, "Remove service principal", f"app{i}", who="admin4@contoso.com", category="ApplicationManagement")]
+    events += [deleted(120 + i, "Remove service principal", f"tool{i}", who="Ops Automation", app=True,
+                       category="ApplicationManagement") for i in range(8)]
+    events += [deleted(140 + i, "Delete user", f"user{i}", who="admin5@contoso.com", day=f"2026-11-{3 + i:02d}")
+               for i in range(6)]                                                                       # one a day
+    events += [deleted(150 + i, "Delete group", f"old{i}", who="Microsoft Approval Management", app=True,
+                       category="GroupManagement") for i in range(40)]                                  # Microsoft's own
+    out, _graph = audit_run(tmp_path, events)
+    by = {f.fields["Initiated by"]: f for f in out if f.rule_id == "mass_deletion"}
+    assert set(by) == {"admin1@contoso.com", "admin3@contoso.com", "Ops Automation"}
+    assert by["admin1@contoso.com"].score == 50 and "5 users" in by["admin1@contoso.com"].title
+    wiped = by["admin3@contoso.com"]
+    assert wiped.score == 80 and wiped.severity == Severity.HIGH and "30 groups" in wiped.title
+    assert any("cannot be restored" in r for _, r in wiped.factors)
+    assert by["Ops Automation"].score == 20 and by["Ops Automation"].severity == Severity.INFO
+    assert chains.stage_of("mass_deletion") == 5
+
+
+def test_how_many_deletions_are_many_is_a_setting(tmp_path):
+    cfg = ConfigManager(tmp_path / "config.json")
+    cfg.set("plugins", "directory_audit", "settings", "mass_deletion", value={"users": 2, "groups": 0, "applications": 5})
+    events = [deleted(i, "Delete user", f"user{i}") for i in range(2)]
+    events += [deleted(10 + i, "Delete group", f"group{i}", who="admin2@contoso.com", category="GroupManagement") for i in range(50)]
+    out, _graph = audit_run(tmp_path, events)
+    assert [f.fields["Initiated by"] for f in out if f.rule_id == "mass_deletion"] == ["admin1@contoso.com"]   # (0 = not watched)

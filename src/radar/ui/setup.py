@@ -52,7 +52,6 @@ class SetupWindow:
         top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.app_icon(32), master=root)
         top.iconphoto(False, self._icon)
-        wrap = px(WIDTH - 40 - 28)
         full = px(WIDTH - 40)
 
         header = ttk.Frame(top, padding=(px(20), px(16), px(20), px(4)))

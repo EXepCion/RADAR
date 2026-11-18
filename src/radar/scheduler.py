@@ -7,6 +7,8 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
+    from datetime import datetime
+
     from .app import App
 
 log = logging.getLogger(__name__)

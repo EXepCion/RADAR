@@ -66,6 +66,8 @@ RULE_STAGES = {
     # 5 - more power / weaker defences / lateral movement
     "role_assignment": 5, "conditional_access": 5, "domain_federation": 5, "elevate_access": 5, "sensitive_reads": 5,
     "role_activation": 5, "named_locations": 5, "auth_methods_policy": 5, "privileged_group": 5,
+    "partner_access": 5,
+    "mass_deletion": 5,  # (what is done with the power: destroying what the account can reach)
     "tenant_changes": 4,  # a new domain, an inbound connector, an app's reply address: ways to stay
 }
 # signals that are reactions / records, not attacker steps

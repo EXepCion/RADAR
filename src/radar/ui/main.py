@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from PIL import ImageTk
 
-from .. import APP_DISPLAY_NAME, __version__, audio, buildinfo, incidents, paths, startup  # noqa: F401
+from .. import APP_DISPLAY_NAME, audio, buildinfo, incidents, paths, startup
 from .. import quiet as quiet_rules
 from ..plugin_api import Severity
 from . import icons, theme

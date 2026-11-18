@@ -32,7 +32,8 @@ PASSWORD_RESET_ACTIVITIES = {
 AUDIT_URL = "https://portal.azure.com/#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/Audit"
 CATEGORIES = ("RoleManagement", "ApplicationManagement", "UserManagement", "Policy", "PolicyManagement",
               "DirectoryManagement", "GroupManagement", "CrossTenantAccessSettings", "KeyManagement", "Device",
-              "AzureRBACRoleManagementElevateAccess", "ResourceManagement")
+              "AzureRBACRoleManagementElevateAccess", "ResourceManagement",
+              "DelegatedAdminServiceProviderConstraints")
 
 # ---- Microsoft 365 support cases (learn.microsoft.com/microsoft-365/admin/support-diagnostic-information-collection)
 # Opening a case in the admin center adds the Microsoft Support tenant as cross-tenant service provider (actor: the
@@ -169,6 +170,15 @@ def tenant_change_factors(audit: dict) -> list[tuple[int, str]] | None:
     for table in (DOMAIN_ACTIVITIES, CONNECTOR_ACTIVITIES):
         if activity in table:
             return [table[activity]]
+    if "authorization policy" in activity:
+        if user_consent_enabled(audit):  # said by the consent watch, in its own words
+            return None
+        names = sorted({str(p.get("displayName")) for t in audit.get("targetResources") or []
+                        for p in t.get("modifiedProperties") or []
+                        if p.get("displayName") and not str(p.get("displayName")).startswith(_NOISE_PROPS)})
+        return [(30, "Changed what every user may do without an admin (authorization policy: inviting guests, "
+                     "registering applications, consenting to applications)"
+                     + (": " + ", ".join(names[:5]) if names else ""))]
     if activity != "update application":  # ("Update service principal" repeats the same change)
         return None
     factors: list[tuple[int, str]] = []
@@ -192,6 +202,119 @@ def tenant_change_factors(audit: dict) -> list[tuple[int, str]] | None:
                 factors.append((30, "Allowed public client flows for an existing application: sign-in with a password "
                                     "or a device code, without the application's secret"))
     return factors or None
+
+
+# ---- outside organisations that can act as administrators here (partners, service providers) ----
+# template ids of built-in roles: the same in every tenant
+ROLE_TEMPLATES = {
+    "62e90394-69f5-4237-9190-012177145e10": "Global Administrator",
+    "e8611ab8-c189-46e8-94e1-60213ab1f814": "Privileged Role Administrator",
+    "7be44c8a-adaf-4e2a-84d6-ab2649e08a13": "Privileged Authentication Administrator",
+    "194ae4cb-b126-40b2-bd5b-6091b380977d": "Security Administrator",
+    "b1be1c3e-b65d-4f19-8427-f6fa0d97feb9": "Conditional Access Administrator",
+    "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3": "Application Administrator",
+    "158c047a-c907-4556-b7ef-446551a6b5f7": "Cloud Application Administrator",
+    "fe930be7-5e62-47db-91af-98c3a49a38b1": "User Administrator",
+    "29232cdf-9323-42fd-ade2-1d097af3e4de": "Exchange Administrator",
+    "729827e3-9c14-49f7-bb1b-9608f156bbb8": "Helpdesk Administrator",
+    SUPPORT_ENGINEER_ROLE: "Microsoft 365 Support Engineer",
+}
+_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def partner_access_factors(audit: dict) -> list[tuple[int, str]] | None:
+    """Score factors when an outside organisation is given a way to act as administrator of this tenant, or None:
+    a partner with delegated administration, or a service provider and the admin roles it may be given. Microsoft
+    Support during a support case is not one (that is recorded with the case)."""
+    activity = (audit.get("activityDisplayName") or "").strip().lower()
+    if activity == "add partner to company":
+        return [(70, "Gave a partner organisation delegated administration: its staff can act as administrators of "
+                     "this tenant")]
+    if (audit.get("category") or "").lower() != "delegatedadminserviceproviderconstraints":
+        return None
+    new: set[str] = set()
+    tenant = ""
+    for t in audit.get("targetResources") or []:
+        for p in t.get("modifiedProperties") or []:
+            name = (p.get("displayName") or "").lower()
+            if name == "allowedroletemplateids":
+                new |= ({g.lower() for g in _GUID.findall(str(p.get("newValue") or ""))}
+                        - {g.lower() for g in _GUID.findall(str(p.get("oldValue") or ""))})
+            elif name == "tenantid":
+                tenant = "".join(_GUID.findall(str(p.get("newValue") or ""))[:1]).lower() or tenant
+        if not tenant and _GUID.fullmatch(str(t.get("id") or "")):  # (the entry names the organisation as its target)
+            tenant = str(t["id"]).lower()
+    if not new or tenant == MS_SUPPORT_TENANT:
+        return None
+    roles = sorted(ROLE_TEMPLATES.get(r, r) for r in new)
+    factors = [(50, f"An outside organisation ({tenant or 'tenant not named'}) can now be given admin roles in this "
+                    f"tenant as a service provider: {', '.join(roles[:6])}" + (" ..." if len(roles) > 6 else ""))]
+    top = [r for r in roles if r.lower() in TOP_ROLES]
+    if top:
+        factors.append((25, f"Highly privileged: {', '.join(top)}"))
+    return factors
+
+
+# ---- many objects deleted at once: a clean-up, or someone destroying what they can reach ----
+# activity -> (kind, deleted for good)
+DELETIONS = {
+    "delete user": ("users", False), "delete external user": ("users", False), "hard delete user": ("users", True),
+    "delete group": ("groups", False), "hard delete group": ("groups", True),
+    "delete application": ("applications", False), "hard delete application": ("applications", True),
+    "remove service principal": ("applications", False), "hard delete service principal": ("applications", True),
+}
+MASS_DELETION = {"users": 5, "groups": 10, "applications": 5}  # by one actor in a day, from this count on (0 = off)
+
+
+def mass_deletion_findings(deleted: dict[tuple[str, str], list[dict]], limits: dict,
+                           automation: list[str]) -> list[Finding]:
+    """One finding per actor and day that deleted many accounts, groups or applications. An application and its
+    enterprise application, and an object deleted and then deleted for good, are one thing."""
+    out: list[Finding] = []
+    for (who, day), audits in deleted.items():
+        things: dict[str, set[str]] = defaultdict(set)
+        for_good: set[str] = set()
+        for a in audits:
+            kind, hard = DELETIONS[(a.get("activityDisplayName") or "").strip().lower()]
+            for t in (a.get("targetResources") or [])[:1]:
+                things[kind].add(str(t.get("displayName") or t.get("userPrincipalName") or t.get("id") or "").lower())
+            if hard:
+                for_good.add(kind)
+        over = {k: len(v) for k, v in things.items()
+                if int(limits.get(k, MASS_DELETION.get(k, 0)) or 0) and len(v) >= int(limits.get(k, MASS_DELETION[k]))}
+        if not over:
+            continue
+        what = ", ".join(f"{n} {k}" for k, n in sorted(over.items(), key=lambda kv: -kv[1]))
+        ratio = max(n / int(limits.get(k, MASS_DELETION[k])) for k, n in over.items())
+        factors = [(70 if ratio >= 3 else 50, f"{what} deleted by one actor in a day")]
+        if for_good & set(over):
+            factors.append((10, "Deleted for good (hard delete): cannot be restored"))
+        if len(over) > 1:
+            factors.append((10, "Several kinds of objects"))
+        if _matches(who, automation):
+            factors.append((-30, f"Known automation of the tenant ({who})"))
+        score = max(0, min(100, sum(p for p, _ in factors)))
+        activities = sorted({a.get("activityDisplayName", "") for a in audits})
+        out.append(Finding(
+            key=f"diraudit|mass_deletion|{who}|{day}", rule_id="mass_deletion", severity=severity_for(score),
+            score=score, factors=factors, subjects=[who],
+            title=f"Many objects deleted at once: {who} ({what})",
+            summary=(f"{who} deleted {what} on {day}. A planned clean-up looks like this - and so does someone "
+                     f"destroying what an account can reach."),
+            occurred_at=min(parse_time(a["activityDateTime"]) for a in audits),
+            fields={"Initiated by": who, "Deleted": what, "Activities": ", ".join(activities)},
+            evidence=[{"Time": timefmt.sortable(parse_time(a["activityDateTime"]), seconds=True),
+                       "Activity": a.get("activityDisplayName", ""), "Category": a.get("category", ""),
+                       "Initiated by": _initiator(a), "Targets": _targets(a),
+                       "Correlation ID": a.get("correlationId", "")}
+                      for a in sorted(audits, key=lambda a: a["activityDateTime"], reverse=True)[:50]],
+            recommendation=("Check that the clean-up was planned. If not: secure the account that did it, and restore "
+                            "what was deleted - accounts, Microsoft 365 groups and applications can be restored for "
+                            "30 days unless they were deleted for good."),
+            links=[("Open audit logs", AUDIT_URL)]))
+    return out
+
+
 SENSITIVE_READS_BULK = 5  # secrets read by one person in a week from this count on: +25 (calibrated: IT reads 1-4/week)
 
 # ---- cross-tenant access settings: whose MFA / devices / users this tenant trusts ----
@@ -741,7 +864,9 @@ class DirectoryAuditPlugin(Plugin):
         Rule("named_locations", "Named locations (trusted networks) changed"),
         Rule("auth_methods_policy", "Sign-in methods policy, authentication strengths, security defaults changed"),
         Rule("privileged_group", "Members / owners added to groups that can hold admin roles"),
-        Rule("tenant_changes", "Rare tenant changes: domains, network connectors, app reply addresses"),
+        Rule("tenant_changes", "Rare tenant changes: domains, network connectors, app reply addresses, what users may do"),
+        Rule("partner_access", "Outside organisations given admin access (partners, service providers)"),
+        Rule("mass_deletion", "Many accounts, groups or applications deleted at once"),
     ]
     default_settings = {
         "initial_lookback_hours": 24,
@@ -753,6 +878,8 @@ class DirectoryAuditPlugin(Plugin):
         "max_pages": 200,
         # alerts about app-only changes: look up where the app signed in, with which credential, who uses it
         "app_origin_lookup": True,
+        # accounts / groups / applications deleted by one actor in a day, from this count on (0 = not watched)
+        "mass_deletion": dict(MASS_DELETION),
     }
 
     def run(self, ctx: PluginContext) -> list[Finding]:
@@ -772,6 +899,7 @@ class DirectoryAuditPlugin(Plugin):
         privileged: list[tuple[dict, str]] = []
         role_groups: dict[str, str] | None = None  # asked for when the first group change comes along
         disabled: list[dict] = []
+        deleted: dict[tuple[str, str], list[dict]] = defaultdict(list)
         consents: list[dict] = []
         consent_policy: list[tuple[dict, str]] = []
         support_cases_opened: list[tuple[dict, str]] = []
@@ -833,6 +961,16 @@ class DirectoryAuditPlugin(Plugin):
                 if gid in role_groups:
                     privileged.append((audit, role_groups[gid]))
                     continue
+            if activity in DELETIONS and ctx.rule_enabled("mass_deletion"):
+                deleted[(who, when.astimezone().strftime("%Y-%m-%d"))].append(audit)
+            if ctx.rule_enabled("partner_access"):
+                factors = partner_access_factors(audit)
+                if factors:
+                    if _matches(who, automation):
+                        factors = factors + [(-30, f"Known automation of the tenant ({who})")]
+                    groups[("partner_access", who, when.astimezone().strftime("%Y-%m-%d"))].append(
+                        (audit, max(0, min(100, sum(p for p, _ in factors))), factors))
+                    continue
             if ctx.rule_enabled("tenant_changes"):
                 factors = tenant_change_factors(audit)
                 if factors:
@@ -882,6 +1020,7 @@ class DirectoryAuditPlugin(Plugin):
         findings += [self._exclusion_finding(a, gid, name) for a, gid, name in exclusion_changes]
         findings += [self._privileged_group_finding(a, name, automation) for a, name in privileged]
         findings += [self._disabled_signal(a) for a in disabled]
+        findings += mass_deletion_findings(deleted, dict(s.get("mass_deletion") or {}), automation)
         findings += [self._support_case_record(a, by) for a, by in support_cases_opened]
         findings += [self._cross_tenant_finding(ctx, a, factors) for a, factors in cross_tenant]
         findings += context_signals

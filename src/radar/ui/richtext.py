@@ -5,12 +5,15 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .. import linkify
 from ..linkify import Entity
 from . import theme
 from .theme import px
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .menu import ContextMenu
 
 
 class StatusLine:

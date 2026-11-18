@@ -54,7 +54,6 @@ class IncidentWindow:
         self._icon = ImageTk.PhotoImage(icons.bell(32), master=root)
         top.iconphoto(False, self._icon)
         inner = px(WIDTH - 2 * MARGIN)
-        white = theme.color("card")
 
         footer = ttk.Frame(top, padding=(px(MARGIN), px(10), px(MARGIN), px(12)))
         footer.pack(side="bottom", fill="x")
