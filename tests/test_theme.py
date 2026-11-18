@@ -193,6 +193,13 @@ def test_details_window_is_laid_out_before_it_is_shown(root):
             win.paned.sashpos(0)]
 
     first = places()
+    settle = time.monotonic() + 3         # (a slow machine with a small screen is still wrapping the long title when
+    while time.monotonic() < settle:      # the window is first asked: wait until two looks in a row agree)
+        time.sleep(0.05)
+        again = places()
+        if again == first:
+            break
+        first = again
     end = time.monotonic() + 0.6
     while time.monotonic() < end:
         root.update()
