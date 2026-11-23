@@ -259,6 +259,8 @@ def test_ip_used_by_own_phone_only_after_the_attempt_counts_too(history):
     # the phone's Wi-Fi may enter the profile only minutes after the attempt
     history.add([make_signin(-60 * 24 * 20 - i, user_id="u5", upn="ann@contoso.com", ip="203.0.113.166", asn=577,
                              country="CA", device_id="lap") for i in range(5)])
+    history.add([make_signin(-60 * 24 * 19, user_id="u5", upn="ann@contoso.com", ip="203.0.113.166", asn=577,
+                             country="CA", device_id="samsung", interactive=False)])  # (the phone is the user's own)
     # that morning the phone was already seen on the same provider from another address (no country yet)
     history.add([make_signin(-150, user_id="u5", upn="ann@contoso.com", ip="2a0c:5a80::1", asn=3352, country="",
                              device_id="samsung", interactive=False)])

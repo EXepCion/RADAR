@@ -519,3 +519,31 @@ def test_an_audit_entry_starts_with_what_was_changed_and_follows_the_width(root)
     assert lines() >= wide                                 # ... and the long value is broken again for its column
     assert "Setting" in win.text.get("1.0", "end")
     win.top.destroy()
+
+
+def test_moving_from_one_link_straight_onto_the_next_underlines_the_new_one(root):
+    """Two links side by side: the pointer never leaves "a link", so nothing but its movement says it changed."""
+    from radar.ui.richtext import RichText
+
+    top = tk.Toplevel(root)
+    text = RichText(top, None)
+    text.pack()
+    text.write_link("anna@contoso.com", Entity("user", "anna@contoso.com"))
+    text.write_link("ben@contoso.com", Entity("user", "ben@contoso.com"))  # no gap between the two
+    first, second = "target0", "target1"
+    assert "<Motion>" in text.tk.call(text._w, "tag", "bind", "link")
+
+    def under(tag):
+        text.mark_set("current", f"{text.tag_ranges(tag)[-1]}-2c")
+        return [str(i) for i in text.tag_ranges(tag)]
+
+    expected = under(first)
+    text._enter(None)
+    assert [str(i) for i in text.tag_ranges("link_hover")] == expected
+    expected = under(second)
+    text._move(None)
+    assert [str(i) for i in text.tag_ranges("link_hover")] == expected
+    assert str(text.cget("cursor")) == "hand2"
+    text._leave(None)
+    assert not text.tag_ranges("link_hover")
+    top.destroy()

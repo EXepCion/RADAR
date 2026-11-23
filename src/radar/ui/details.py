@@ -70,10 +70,15 @@ def visible_columns(evidence: list[dict[str, str]]) -> list[str]:
     return [c for c in dict.fromkeys(k for row in evidence for k in row) if not c.startswith("_")]
 
 
+def shown_fields(fields: dict) -> list[tuple[str, str]]:
+    """The fields a person reads (hidden ones only make a link exact, see linkify.HIDDEN_PREFIX)."""
+    return [(k, v) for k, v in fields.items() if not str(k).startswith(linkify.HIDDEN_PREFIX)]
+
+
 def alert_as_text(alert: Alert, origin: str = "") -> str:
     lines = [alert.title, f"Severity: {alert.severity.label}" + (f" (risk score {alert.score}/100)" if alert.score else ""),
              f"Source: {origin}", f"Occurred: {theme.local_time(alert.occurred_at)}", "", alert.summary, ""]
-    lines += [f"{k}: {v}" for k, v in alert.fields.items()]
+    lines += [f"{k}: {v}" for k, v in shown_fields(alert.fields)]
     if alert.factors:
         lines += ["", "Risk assessment:"] + [f"  {p:+d}  {t}" for p, t in alert.factors]
     if alert.recommendation:
@@ -90,10 +95,10 @@ def quick_links(alert: Alert) -> list[tuple[Entity, str, str]]:
     out: list[tuple[Entity, str, str]] = []
     seen: set[tuple[str, str]] = set()
     users = 0
-    for field, value in alert.fields.items():
+    for field, value in shown_fields(alert.fields):
         if field.strip().lower() in QUICK_SKIP_FIELDS:
             continue
-        for e in linkify.find_entities(str(value), field):
+        for e in linkify.find_entities(str(value), field, alert.fields):
             key = (e.kind, e.value.lower())
             if key in seen or (e.kind == "app" and field.strip().lower() not in QUICK_APP_FIELDS):
                 continue
@@ -321,7 +326,7 @@ class DetailsWindow:
         text = self.info = scrolled_text(main, self.links, height=8)
         pad = text.card_blocks(padding=20)
         # (the risk score is on the Risk assessment card and under the title: not a third time among the details)
-        rows = [(k, v) for k, v in a.fields.items() if not (k == "Risk score" and a.factors)]
+        rows = [(k, v) for k, v in shown_fields(a.fields) if not (k == "Risk score" and a.factors)]
         text.set_key_width([k for k, _ in rows] or ["Details"], cap=280, indent=pad)
         self._two_columns: bool | None = None
         self.facts = None
@@ -330,7 +335,7 @@ class DetailsWindow:
             facts.set_key_width([k for k, _ in rows], cap=240, indent=facts.card_blocks(padding=20))
             facts.begin_card("Details", first=True)
             for k, v in rows:
-                facts.write_field(k, v, name_tag="muted", tags=("card",))
+                facts.write_field(k, v, a.fields, name_tag="muted", tags=("card",))
             facts.end_card()
             if quick and a.factors:  # (without a risk card the links stay in the side column: shown once)
                 facts.begin_card("Open in Entra")
@@ -369,7 +374,7 @@ class DetailsWindow:
             start = text.index("end-1c")
             text.begin_card("Details", first=first)
             for k, v in rows:
-                text.write_field(k, v, name_tag="muted", tags=("card",))
+                text.write_field(k, v, a.fields, name_tag="muted", tags=("card",))
             text.end_card()
             text.tag_add("facts_card", start, "end-1c")  # hidden while the facts stand beside the story
             first = False

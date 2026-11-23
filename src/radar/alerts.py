@@ -354,7 +354,10 @@ class AlertCenter:
         if alert is None:
             return []
         if alert.signal in correlation.RESPONSE_RELATED:
-            return [o.id for o in self._alerts_about(alert.subjects, alert.id) if not o.signal and self._apply_responses(o.id)[1]]
+            rule = correlation.RESPONSE_SIGNALS.get(alert.signal)
+            same = self._alerts_naming(rule.same, str(alert.fields.get(rule.same) or ""), alert.id) if rule and rule.same else []
+            others = {o.id: o for o in [*self._alerts_about(alert.subjects, alert.id), *same]}
+            return [o.id for o in others.values() if not o.signal and self._apply_responses(o.id)[1]]
         if not alert.signal:
             return [alert_id] if self._apply_responses(alert_id)[1] else []
         return []
@@ -395,13 +398,22 @@ class AlertCenter:
         alert = Alert.from_row(row)
         began = alert.when - timedelta(minutes=correlation.RESPONSE_SLACK_MINUTES)
         about = self._alerts_about(alert.subjects, alert.id)
+        for rule in correlation.RESPONSES:  # responses about the same thing (a device), whoever it belongs to
+            value = str(alert.fields.get(rule.same) or "") if rule.same else ""
+            if value:
+                known = {o.id for o in about}
+                about += [o for o in self._alerts_naming(rule.same, value, alert.id)
+                          if o.signal == rule.signal and o.id not in known]
         latest: dict[str, Alert] = {}  # one per kind of response: the most recent
         accounts = {s for s in alert.subjects if "@" in s}
         for other in about:
             rule = correlation.RESPONSE_SIGNALS.get(other.signal)
             if rule is None or not rule.answers(alert.rule_id, alert.title):
                 continue  # this response does nothing about this kind of alert
-            if len(accounts) > 1 and not accounts <= set(other.subjects):
+            if rule.same:
+                if not alert.fields.get(rule.same) or str(other.fields.get(rule.same) or "") != str(alert.fields[rule.same]):
+                    continue  # about another device (or the alert names none)
+            elif len(accounts) > 1 and not accounts <= set(other.subjects):
                 continue  # an alert about several accounts is not answered by what was done about one of them
             if not (began <= other.when <= alert.when + timedelta(days=rule.days)):
                 continue
@@ -458,6 +470,13 @@ class AlertCenter:
             ids = [r["id"] for r in self._store.query("SELECT id FROM alerts WHERE signal<>''")]
             activated = [i for i in ids if self._correlate_signal(i)]
         return [a for a in (self.get(i) for i in activated) if a]
+
+    def _alerts_naming(self, field: str, value: str, exclude_id: int) -> list[Alert]:
+        """The alerts whose field of that name has exactly this value."""
+        if not (field and value):
+            return []
+        rows = self._store.query("SELECT * FROM alerts WHERE id<>? AND fields LIKE ?", (exclude_id, f"%{json.dumps(value)}%"))
+        return [a for a in (Alert.from_row(r) for r in rows) if str(a.fields.get(field) or "") == value]
 
     def _alerts_about(self, subjects: list[str], exclude_id: int) -> list[Alert]:
         if not subjects:

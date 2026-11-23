@@ -374,7 +374,9 @@ class AccountChange:
         details = {str(d.get("key")): str(d.get("value") or "") for d in a.get("additionalDetails") or []
                    if isinstance(d, dict)}
         method = details.get("AuthenticationMethod") or method
-        text = reason if reason and reason.lower() not in (activity.lower(), "none", "successfully completed reset.") \
+        # (the Device Registration Service writes the word "(blank)" where it has no reason)
+        text = reason if reason and reason.lower() not in (activity.lower(), "none", "(blank)",
+                                                           "successfully completed reset.") \
             else activity
         if method and method.lower() not in text.lower():
             text += f" ({method})"

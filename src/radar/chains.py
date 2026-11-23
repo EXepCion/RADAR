@@ -7,7 +7,8 @@ account whose stages strictly increase in time order, e.g.
     password guessing -> password known (MFA stopped it) -> new MFA method -> admin role
 
 It is raised only if it starts with targeting / a known password and goes further (1/2 -> 3+), or covers at
-least three stages - so "travelled abroad, then registered a passkey" (3 -> 4) stays quiet.
+least three stages - so "travelled abroad, then registered a passkey" (3 -> 4) stays quiet. Unless the sign-in
+is rated High on its own: "MFA completed through a datacenter, then a device registered" is the takeover itself.
 
 In hindsight: a finding that was judged harmless on its own ("logged only", below Low) can still be a step of a
 chain that two real steps already make - it never starts one and never makes one by itself. The same goes for
@@ -28,7 +29,7 @@ from the attacker's address" is one story, not three.
 """
 from __future__ import annotations
 
-from . import timefmt
+from . import linkify, timefmt
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -41,6 +42,7 @@ ORDER_TOLERANCE = timedelta(hours=2)  # audit / sign-in log latencies may swap n
 MAX_STEP_GAP = timedelta(days=3)      # an attack moves on within hours to days ...
 SLOW_STEP_GAP = timedelta(days=10)    # ... a patient one within this, counted only between two steps of at least Medium
 STRONG_SCORE = 45
+HIGH_SCORE = 70
 MIN_LINK_SCORE = 25                   # a step must be at least Low on its own (Info = judged harmless / recovery)
 MIN_WEAK_SCORE = 10                   # below Low but not nothing: can complete a chain in hindsight, never start one
 STEP_POINTS = 10
@@ -66,17 +68,19 @@ RULE_STAGES = {
     # 5 - more power / weaker defences / lateral movement
     "role_assignment": 5, "conditional_access": 5, "domain_federation": 5, "elevate_access": 5, "sensitive_reads": 5,
     "role_activation": 5, "named_locations": 5, "auth_methods_policy": 5, "privileged_group": 5,
-    "partner_access": 5,
+    "partner_access": 5, "cross_tenant_access": 5,
     "mass_deletion": 5,  # (what is done with the power: destroying what the account can reach)
     "tenant_changes": 4,  # a new domain, an inbound connector, an app's reply address: ways to stay
 }
 # signals that are reactions / records, not attacker steps
 OWN_PROMPT_MARK = "(probably their own sign-in)"  # set by the mfa_report rule
-NOT_LINKS = {"account_disabled", "account_enabled", "support_case", "sessions_revoked", "password_reset"}
+NOT_LINKS = {"account_disabled", "account_enabled", "support_case", "sessions_revoked", "password_reset",
+             "device_removed"}
 # what is done ABOUT an account never ties the one who did it to that account (a password reset can: an attacker
 # in an admin's account resets passwords to get into other accounts)
 NOT_ACTIONS = NOT_LINKS - {"password_reset"}
 DISMISSED = "dismissed"
+ENROLMENT_RULE = "device_enrolment"  # the sign-in checks' record of a proven corporate enrolment
 DISABLED_MARK = "Account is disabled (attempts cannot succeed)"  # written by the sign-in checks (scoring.py)
 
 
@@ -128,6 +132,11 @@ def _last_activity(alert) -> datetime:
 
 def stage_of(rule_id: str, factors: Iterable[tuple[int, str]] = ()) -> int | None:
     stage = RULE_STAGES.get(rule_id)
+    if rule_id == "app_signins":
+        # an application's own sign-ins: from a country it never used = somebody using what the application can do
+        # (5); its secrets being tried from outside = targeting (1); a new credential or a failing one = operations
+        text = " ".join(str(r) for p, r in factors if p > 0)
+        return 5 if "a country it never used" in text else 1 if "outside its usual networks" in text else None
     if rule_id == "hostile_reuse":
         text = " ".join(str(r) for p, r in factors if p > 0)
         return 3 if "successful sign-in(s) from it" in text else 2 if "The password was right" in text else 1
@@ -141,7 +150,13 @@ def links_by_subject(alerts: Iterable, now: datetime, lookback_days: int = LOOKB
     """Group the alerts of the last ``lookback_days`` by the accounts (UPNs) they are about."""
     since = now - timedelta(days=lookback_days)
     out: dict[str, list[Link]] = {}
+    alerts = list(alerts)
+    # devices whose enrolment is proven to be the organisation's own: registering them is no way to stay in
+    enrolled = {str(a.fields.get(linkify.DEVICE_ID_FIELD)) for a in alerts
+                if a.rule_id == ENROLMENT_RULE and (a.fields or {}).get(linkify.DEVICE_ID_FIELD)}
     for a in alerts:
+        if a.rule_id == "device_registration" and str((a.fields or {}).get(linkify.DEVICE_ID_FIELD) or "") in enrolled:
+            continue
         if a.plugin_id == CHAIN_PLUGIN or a.signal in NOT_LINKS or a.when < since:
             continue
         if a.rule_id == "mfa_report" and OWN_PROMPT_MARK in a.title:
@@ -155,7 +170,7 @@ def links_by_subject(alerts: Iterable, now: datetime, lookback_days: int = LOOKB
         # guessing at a disabled account cannot get anywhere: no start of a chain
         pointless = stage == 1 and any(DISABLED_MARK in str(reason) for _points, reason in a.factors)
         for subject in a.subjects:
-            if "@" in subject:
+            if "@" in subject or subject.startswith(APP_PREFIX):
                 out.setdefault(subject, []).append(
                     Link(a.when, stage, score, a.title, a.status, a.key, _last_activity(a), a.rule_id,
                          weak=score < MIN_LINK_SCORE or pointless, subject=subject,
@@ -171,22 +186,27 @@ def _follows(prev: Link, link: Link) -> bool:
 
 
 def best_chain(links: list[Link]) -> list[Link]:
-    """Longest sequence with strictly increasing stages in time order, each step soon after the previous one."""
+    """Longest sequence with strictly increasing stages in time order, each step soon after the previous one. Of
+    several that are equally long, the one whose steps weigh most: an old, weak finding that could come before a
+    step as well does not take the place of the strong one that did."""
+    def weight(chain: list[Link]) -> tuple[int, int]:
+        return len(chain), sum(x.score for x in chain)
+
     links = sorted(links, key=lambda x: (x.when, x.stage))
-    best: list[list[Link]] = []  # best[i]: longest chain ending with links[i]
+    best: list[list[Link]] = []  # best[i]: the best chain ending with links[i]
     for i, link in enumerate(links):
         chain = [link]
         if link.weak:
             # a weak step never starts a chain: alone it is only a candidate to be appended to
             best.append(max(([*prev, link] for prev in best[:i] if prev and not prev[0].weak and _follows(prev[-1], link)),
-                            key=len, default=[]))
+                            key=weight, default=[]))
             continue
         for j in range(i):
             prev = best[j]
-            if prev and _follows(prev[-1], link) and len(prev) + 1 > len(chain):
+            if prev and _follows(prev[-1], link) and weight(prev + [link]) > weight(chain):
                 chain = prev + [link]
         best.append(chain)
-    return max(best, key=lambda c: (len(c), sum(x.score for x in c)), default=[])
+    return max(best, key=weight, default=[])
 
 
 def is_attack_chain(chain: list[Link]) -> bool:
@@ -198,7 +218,17 @@ def is_attack_chain(chain: list[Link]) -> bool:
     done = settled(chain)
     if all(x.key in done for x in chain if not x.weak):
         return False  # every real step was dismissed with the whole chain in view: nothing new to show
-    return len(stages) >= 2 and (stages[0] <= 2 and stages[-1] >= 3 or len(stages) >= 3)
+    if len(stages) < 2:
+        return False
+    if stages[0] <= 2 and stages[-1] >= 3 or len(stages) >= 3:
+        return True
+    first, last = chain[0], chain[-1]
+    if first.stage == 3 and last.stage == 5 and first.score >= STRONG_SCORE and last.score >= STRONG_SCORE:
+        return True  # a sign-in that may not be the user, then a grab for power: both at least Medium
+    if first.stage == 3 and last.stage == 4 and first.score >= HIGH_SCORE and not last.weak:
+        return True  # a sign-in rated High on its own, then a way to stay (a device, an MFA method, a consent)
+    # an application: something planted on it (a secret, an owner, a consent), then it signs in from elsewhere
+    return first.stage == 4 and last.stage == 5 and last.rule == "app_signins"
 
 
 def settled(chain: list[Link]) -> set[str]:
@@ -257,6 +287,14 @@ def _step_rows(chain: list[Link], owners: dict[str, set[str]] | None = None) -> 
     return rows
 
 
+APP_PREFIX = "app:"
+
+
+def label(subject: str) -> str:
+    """How a chain names what it is about: an account by its name, an application as one."""
+    return f"the application {subject[len(APP_PREFIX):]}" if subject.startswith(APP_PREFIX) else subject
+
+
 def chain_findings(alerts: Iterable, now: datetime) -> list[Finding]:
     alerts = list(alerts)
     revoked: dict[str, list[datetime]] = {}
@@ -275,23 +313,28 @@ def chain_findings(alerts: Iterable, now: datetime) -> list[Finding]:
         handled = bool(revs) and revs[-1] >= chain[-1].end
         if handled:
             score = max(25, score - 15)
+        is_app = subject.startswith(APP_PREFIX)
         out.append(Finding(
             key=f"chain|{subject}|{chain[0].when.astimezone():%Y-%m-%d}", rule_id="attack_chain",
             severity=_severity(score), score=score, subjects=[subject],
-            title=f"Possible attack chain: {subject} ({steps})",
-            summary=(f"{len(chain)} steps against {subject} within "
+            title=f"Possible attack chain: {label(subject)} ({steps})",
+            summary=(f"{len(chain)} steps against {label(subject)} within "
                      f"{max(1, (chain[-1].when - chain[0].when).days)} day(s), in the order of an account takeover: "
                      f"{steps}. Each step alone may look harmless or was dismissed; together they deserve a look."),
             occurred_at=chain[0].when,
             factors=_step_factors(chain)
                     + ([(-15, "Sessions were revoked after the last step (handled?)")] if handled else []),
-            fields={"Account": subject, "Chain": steps,
+            fields={("Application" if is_app else "Account"): subject[len(APP_PREFIX):] if is_app else subject,
+                    "Chain": steps,
                     "From / to": f"{timefmt.stamp(chain[0].when)} - {timefmt.stamp(chain[-1].end)}",
                     **({"Sessions revoked": timefmt.stamp(revs[-1])} if revs else {})},
             evidence=_step_rows(chain),
-            recommendation=("Check whether these steps belong together. If the account was not used by its owner in "
-                            "this way: revoke sessions, reset the password, review MFA methods, app consents, inbox "
-                            "rules and recent role changes of the account."),
+            recommendation=(("Check whether these steps belong together. If the application did not move and nobody "
+                             "planned the change: remove the credential that was added, review its owners and "
+                             "permissions, and look at what it accessed since.") if is_app else
+                            ("Check whether these steps belong together. If the account was not used by its owner in "
+                             "this way: revoke sessions, reset the password, review MFA methods, app consents, inbox "
+                             "rules and recent role changes of the account.")),
         ))
     return out
 
@@ -339,8 +382,8 @@ def connected_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> l
                             and not l.dismissed_since(getattr(a, "first_seen", None))
                             and l.when <= a.when + ORDER_TOLERANCE
                             and a.when - l.end <= SLOW_STEP_GAP and l.key != a.key for l in by_subject.get(actor, ()))
-            if suspected:
-                for target in accounts:
+            if suspected:  # (what it did to an application counts like what it did to an account)
+                for target in accounts + [s for s in a.subjects if s.startswith(APP_PREFIX)]:
                     if target != actor:
                         union(actor, target)
     for accounts in by_address.values():
@@ -371,11 +414,12 @@ def spread_findings(alerts: Iterable, now: datetime) -> list[Finding]:
             continue  # a chain inside one account is the ordinary attack chain
         score = max(25, min(100, chain_score(chain) + SPREAD_POINTS))
         steps = " -> ".join(STAGE_NAMES[x.stage] for x in chain)
-        shown = ", ".join(accounts[:4]) + (f" +{len(accounts) - 4}" if len(accounts) > 4 else "")
+        shown = ", ".join(label(a) for a in accounts[:4]) + (f" +{len(accounts) - 4}" if len(accounts) > 4 else "")
+        kind = "accounts / applications" if any(a.startswith(APP_PREFIX) for a in accounts) else "accounts"
         out.append(Finding(
             key=f"spread|{'+'.join(accounts)[:150]}|{chain[0].when.astimezone():%Y-%m-%d}", rule_id="attack_spread",
             severity=_severity(score), score=score, subjects=accounts,
-            title=f"Attack across {len(accounts)} accounts: {shown} ({steps})",
+            title=f"Attack across {len(accounts)} {kind}: {shown} ({steps})",
             summary=(f"{len(chain)} steps over {len(accounts)} accounts within "
                      f"{max(1, (chain[-1].when - chain[0].when).days)} day(s), in the order of an attack that moves on: "
                      f"{steps}. The accounts belong together because their alerts name the same attacker address or "

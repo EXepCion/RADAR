@@ -27,6 +27,8 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
   correct password stopped by MFA, session token theft and AiTM phishing, impossible travel, sign-ins
   from new countries (by hand and in the background), legacy protocols, device-code sign-ins, risky sign-ins flagged
   by Entra, accounts excluded from MFA, break-glass and disabled accounts, apps signing in with their own secrets.
+  The sign-ins of a corporate device enrolment (Apple's automated enrolment, Windows Autopilot) are recognised by
+  the device they produce and not judged as the user's own.
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
   Conditional Access and federation changes, cross-tenant trust, members added to groups that are excluded from
   Conditional Access or can hold admin roles, trusted networks (named locations), the sign-in methods policy,
@@ -34,13 +36,16 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
   applications deleted at once, BitLocker and local-admin password reads.
 - **Scores every finding** from 0 to 100 and explains the score: the network (hosting, VPN, the person's usual
   one), the device (managed, known, never seen), the kind of MFA, the account (admin, excluded from MFA, disabled).
+  What turned up moments ago does not vouch for what follows it: a device registered a minute ago is not a known
+  device.
   Low scores are only logged; from *Low* on a reminder pops up.
 - **Connects findings**: steps that together look like an account takeover become one "possible attack chain" -
   also across accounts, when they share an attacker's address or one suspected account acts on another. An
   address that one finding proves to be an attacker's counts against every other sign-in from it, for any
   account. Alerts that belong together are shown as one *incident*.
-  What was done about an account - sessions revoked, password reset, account disabled - is linked to the alerts it
-  answers and lowers their risk; if successful sign-ins continue afterwards, the risk goes up instead.
+  What was done about an account - sessions revoked, password reset, account disabled, a registered device
+  removed again - is linked to the alerts it answers and lowers their risk; if successful sign-ins continue
+  afterwards, the risk goes up instead.
 - **Shows the state on demand**: *Ongoing attacks* (who is being attacked right now, from where), an *MFA exposure
   report* (every account that can sign in without MFA), an *Alert history* (also dismissed alerts, with a way to
   bring one back) and a *Live map* of who is signed in from where, with attacks drawn as arrows.

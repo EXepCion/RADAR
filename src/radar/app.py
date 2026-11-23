@@ -755,7 +755,7 @@ class App:
 
         def work() -> None:
             try:
-                info = self.resolver.resolve(kind, entity.value)
+                info = self.resolver.resolve(kind, getattr(entity, "ref", "") or entity.value)
             except Exception as exc:
                 log.warning("Lookup of %s %s failed: %s", kind, entity.value, exc)
                 report(f"Could not look up {entity.short}: {exc}", True)

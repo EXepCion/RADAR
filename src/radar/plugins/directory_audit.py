@@ -6,7 +6,7 @@ is scored (0-100) and grouped per actor, rule and day.
 """
 from __future__ import annotations
 
-from .. import timefmt
+from .. import linkify, timefmt
 from pathlib import Path
 import fnmatch
 import json
@@ -297,7 +297,7 @@ def mass_deletion_findings(deleted: dict[tuple[str, str], list[dict]], limits: d
         activities = sorted({a.get("activityDisplayName", "") for a in audits})
         out.append(Finding(
             key=f"diraudit|mass_deletion|{who}|{day}", rule_id="mass_deletion", severity=severity_for(score),
-            score=score, factors=factors, subjects=[who],
+            score=score, factors=factors, subjects=_subject(who),
             title=f"Many objects deleted at once: {who} ({what})",
             summary=(f"{who} deleted {what} on {day}. A planned clean-up looks like this - and so does someone "
                      f"destroying what an account can reach."),
@@ -398,6 +398,52 @@ def _app_names(audits: list[dict]) -> list[str]:
     """Display names of the applications / service principals the audit events changed."""
     return sorted({t["displayName"] for a in audits for t in a.get("targetResources") or []
                    if str(t.get("type", "")).lower() in ("application", "serviceprincipal") and t.get("displayName")})
+
+
+def _subject(who: str) -> list[str]:
+    """The one who did it, as an alert's subject: an account by its name, anything else as an application."""
+    who = (who or "").strip()
+    if not who or who == "unknown":
+        return []
+    return [who.lower() if "@" in who else f"app:{who.lower()}"]
+
+
+def _done_to(audits: list[dict], who: str = "") -> list[str]:
+    """The accounts the audit events were done to (given a role, made an owner, their MFA reset ...)."""
+    return sorted({str(t["userPrincipalName"]).lower() for a in audits for t in a.get("targetResources") or []
+                   if str(t.get("type", "")).lower() == "user" and "@" in str(t.get("userPrincipalName") or "")}
+                  - {(who or "").lower()})
+
+
+# rules whose finding is also about the application it was done to
+APP_TARGET_RULES = {"app_credentials", "app_owner_change", "role_assignment"}
+ATTACKER_ADDRESS_POINTS = 30
+
+
+DEVICE_REMOVALS = ("delete device", "unregister device")
+
+
+def mark_attacker_addresses(findings: list[Finding], acted_from: dict[str, dict[str, datetime]],
+                            hostile: dict[str, str]) -> None:
+    """A change whose actor acted from a known attacker address around that time says so: the address is named
+    (which ties the alert to everything else about that address) and the finding weighs more."""
+    for f in findings:
+        actors = {m.lower() for field in ("Initiated by", "Invited by")
+                  for m in re.findall(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", str(f.fields.get(field) or ""))}
+        hits = sorted({ip for actor in actors for ip, when in acted_from.get(actor, {}).items()
+                       if ip in hostile and f.occurred_at is not None and abs(f.occurred_at - when) <= timedelta(days=1)})
+        made_from = str(f.fields.get("Registered from") or "").strip()  # (a device registration names its address)
+        if made_from in hostile:
+            hits = sorted({*hits, made_from})
+        if not hits:
+            continue
+        f.fields["Known attacker address"] = "; ".join(f"{ip} - {hostile[ip]}" for ip in hits[:4])
+        if f.signal:
+            continue  # a context signal stays one; the address is what connects it
+        f.factors = list(f.factors) + [(ATTACKER_ADDRESS_POINTS, f"Made from a known attacker address: {hits[0]} - "
+                                                                 f"{hostile[hits[0]]}")]
+        f.score = max(0, min(100, int(f.score or 0) + ATTACKER_ADDRESS_POINTS))
+        f.severity = severity_for(f.score)
 
 
 def _group_id(audit: dict) -> str:
@@ -920,9 +966,13 @@ class DirectoryAuditPlugin(Plugin):
                                   "at": parse_time(audit["activityDateTime"]).isoformat()})
         ctx.state.set("support_cases", cases)
         newest, count = None, 0
+        acted_from: dict[str, dict[str, datetime]] = defaultdict(dict)  # account -> {address it acted from: when}
         for audit in audits:
             count += 1
             when = parse_time(audit["activityDateTime"])
+            by_user = (audit.get("initiatedBy") or {}).get("user") or {}
+            if by_user.get("ipAddress") and by_user.get("userPrincipalName"):
+                acted_from[str(by_user["userPrincipalName"]).lower()][str(by_user["ipAddress"])] = when
             newest = when if newest is None or when > newest else newest
             activity = (audit.get("activityDisplayName") or "").lower()
             who = _initiator(audit)
@@ -990,6 +1040,10 @@ class DirectoryAuditPlugin(Plugin):
                     and (audit.get("initiatedBy") or {}).get("user"):
                 context_signals.append(self._device_signal(audit))
                 continue
+            if activity in DEVICE_REMOVALS and ctx.rule_enabled("device_registration"):
+                removed = self._device_removed_signal(audit)
+                if removed is not None:
+                    context_signals.append(removed)
             if ctx.rule_enabled("consent_grant"):
                 if activity in CONSENT_ACTIVITIES:
                     consents.append(audit)
@@ -1040,6 +1094,7 @@ class DirectoryAuditPlugin(Plugin):
                 score = min(69, score + 25)
             activities = sorted({a.get("activityDisplayName", "") for a in audits})
             roles = sorted({_role(a) for a in audits} - {""})
+            done_to = _done_to(audits, who)
             findings.append(Finding(
                 key=f"diraudit|{rid}|{who}|{day}", rule_id=rid, severity=severity_for(score), score=score,
                 factors=factors,
@@ -1047,8 +1102,11 @@ class DirectoryAuditPlugin(Plugin):
                 summary=(f"{who} made {len(audits)} change(s) in {day}: {', '.join(activities)}. "
                          f"Targets: {_targets(audits[0])}" + (" ..." if len(audits) > 1 else "")),
                 occurred_at=min(parse_time(a["activityDateTime"]) for a in audits),
-                fields={"Initiated by": who, "Activities": ", ".join(activities), "Roles": ", ".join(roles) or "-"},
-                subjects=[who] + ([f"app:{n.lower()}" for n in _app_names(audits)] if rid == "app_credentials" else []),
+                fields={"Initiated by": who, "Activities": ", ".join(activities), "Roles": ", ".join(roles) or "-",
+                        **({"Done to": ", ".join(done_to[:10]) + (" ..." if len(done_to) > 10 else "")} if done_to else {})},
+                # everybody it is about: who did it, the accounts it was done to, the application it was done to
+                subjects=_subject(who) + done_to + ([f"app:{n.lower()}" for n in _app_names(audits)]
+                                                    if rid in APP_TARGET_RULES else []),
                 evidence=[{
                     "Time": timefmt.sortable(parse_time(a["activityDateTime"]), seconds=True),
                     "Activity": a.get("activityDisplayName", ""),
@@ -1061,10 +1119,37 @@ class DirectoryAuditPlugin(Plugin):
                                "investigate the initiating account if not.",
                 links=[("Open audit logs", AUDIT_URL)],
             ))
+        if findings:
+            hostile = self._attacker_addresses(ctx, now)
+            if hostile:
+                mark_attacker_addresses(findings, acted_from, hostile)
         if s.get("app_origin_lookup", True):
             self._add_app_origins(ctx, findings, audits)
         ctx.set_status(f"{count} audit event(s) checked, {len(findings)} finding(s)")
         return findings
+
+    @staticmethod
+    def _attacker_addresses(ctx: PluginContext, now) -> dict[str, str]:
+        """{address: what it was used in} - the addresses the sign-in checks proved to be an attacker's (their
+        history, read only). Nothing when the sign-in checks never ran here."""
+        import sqlite3
+
+        path = ctx.data_dir.parent / "signin_threats" / "signins.db"
+        if not path.exists():
+            return {}
+        try:
+            from .signin_threats.indicators import Indicator
+
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                rows = conn.execute("SELECT data FROM indicators WHERE kind='ip' AND expires>? AND ts<=?",
+                                    (now.timestamp(), now.timestamp())).fetchall()
+            finally:
+                conn.close()
+            return {i.value: i.describe() for i in (Indicator.from_json(data) for (data,) in rows)}
+        except Exception as exc:  # noqa: BLE001 - a missing table, a locked file: the audit watch goes on without
+            ctx.log.info("Known attacker addresses not readable: %s", exc)
+            return {}
 
     # ---- app-only actions: who / where / which credential ----
     def _add_app_origins(self, ctx: PluginContext, findings: list[Finding], audits: list[dict]) -> None:
@@ -1403,7 +1488,7 @@ class DirectoryAuditPlugin(Plugin):
         if _matches(who, automation):
             factors.append((-30, f"Known automation of the tenant ({who})"))
         score = max(0, min(100, sum(p for p, _ in factors)))
-        subjects = [who] + ([str(member).lower()] if "@" in str(member) else [])
+        subjects = _subject(who) + ([str(member).lower()] if "@" in str(member) else [])
         return Finding(
             key=f"privgroup|{audit.get('id')}", rule_id="privileged_group", severity=severity_for(score), score=score,
             factors=factors, subjects=subjects,
@@ -1419,20 +1504,58 @@ class DirectoryAuditPlugin(Plugin):
         )
 
     @staticmethod
+    def _device_removed_signal(audit: dict) -> Finding | None:
+        """A device was removed from the directory: the answer to an alert about its registration (matched by the
+        device's id - without one in the entry there is nothing to tie it to)."""
+        details = {str(d.get("key")).replace(" ", "").lower(): str(d.get("value") or "").strip()
+                   for d in audit.get("additionalDetails") or [] if isinstance(d, dict)}
+        device_id = details.get("deviceid", "")
+        if not _GUID.fullmatch(device_id):
+            return None
+        who, when = _initiator(audit), parse_time(audit["activityDateTime"])
+        device = next((clean for t in audit.get("targetResources") or []
+                       if str(t.get("type", "")).lower() == "device"
+                       for clean in [str(t.get("displayName") or "").replace("\x00", "").strip()] if clean), "") or "a device"
+        return Finding(
+            key=f"devdel|{audit.get('id')}", rule_id="device_registration", severity=Severity.INFO, score=0,
+            signal="device_removed", subjects=[],
+            title=f"Device removed: {device}",
+            summary=f"{device} was removed from Entra ID by {who}. The sign-in tokens it held are gone with it.",
+            occurred_at=when, fields={"Device": device, linkify.DEVICE_ID_FIELD: device_id, "Initiated by": who},
+            evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
+                       "Initiated by": who, "Targets": device, "Correlation ID": audit.get("correlationId", "")}],
+        )
+
+    @staticmethod
     def _device_signal(audit: dict) -> Finding:
         """A user registered a device: persistence step of device-code phishing - only a chain link on its own."""
         who, when = _initiator(audit), parse_time(audit["activityDateTime"])
-        device = next((t.get("displayName") for t in audit.get("targetResources") or []
-                       if str(t.get("type", "")).lower() == "device" and t.get("displayName")), "") or "a device"
+        # (the log pads some device names with NUL characters)
+        device = next((clean for t in audit.get("targetResources") or []
+                       if str(t.get("type", "")).lower() == "device"
+                       for clean in [str(t.get("displayName") or "").replace("\x00", "").strip()] if clean), "") or "a device"
+        details = {str(d.get("key")): str(d.get("value") or "").strip() for d in audit.get("additionalDetails") or []
+                   if isinstance(d, dict)}
+        device_id = details.get("Device Id", "")
+        kind = ", ".join(v for v in (details.get("Device Trust Type", ""), details.get("Device OS", ""))
+                         if v and v.lower() != "unknown")
+        address = str(((audit.get("initiatedBy") or {}).get("user") or {}).get("ipAddress") or "").strip()
+        who = who.lower() if "@" in who else who
         return Finding(
             key=f"devreg|{audit.get('id')}", rule_id="device_registration", severity=Severity.LOW, score=30,
             signal="device_registered", subjects=[who],
             title=f"Device registered by {who}: {device}",
-            summary=(f"{who} registered {device} in Entra ID. A registered device gets long-lived sign-in tokens - "
-                     f"after a phished session this is how attackers stay in. Recorded as a step for attack chains."),
-            occurred_at=when, fields={"User": who, "Device": device},
+            summary=(f"{who} registered {device} in Entra ID" + (f" from {address}" if address else "")
+                     + ". A registered device gets long-lived sign-in tokens - "
+                     "after a phished session this is how attackers stay in. Recorded as a step for attack chains."),
+            occurred_at=when,
+            fields={"User": who, "Device": device, **({linkify.DEVICE_ID_FIELD: device_id} if device_id else {}),
+                    **({"Kind": kind} if kind else {}), **({"Registered from": address} if address else {})},
             evidence=[{"Time": timefmt.sortable(when, seconds=True), "Activity": audit.get("activityDisplayName", ""),
-                       "Initiated by": who, "Targets": _targets(audit), "Correlation ID": audit.get("correlationId", "")}],
+                       "Initiated by": who, "Targets": device, "Correlation ID": audit.get("correlationId", "")}],
+            recommendation=("If the user did not set up this device: remove it (Entra ID > Devices), revoke the "
+                            "user's sessions and reset the password - the device keeps its tokens otherwise."),
+            links=[("Open audit logs", AUDIT_URL)],
         )
 
     @staticmethod

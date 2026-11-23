@@ -214,6 +214,7 @@ class RichText(tk.Text):
         self.targets: dict[str, tuple[Entity, dict | None]] = {}
         self.actions: dict[str, str] = {}  # link tag -> explicit action (else the entity's first one)
         self._pressed: str | None = None
+        self._hovered: str | None = None  # the link under the pointer
         self._bold = tkfont.Font(root=self, font=theme.FONT_BOLD)
         self.tag_configure("bold", font=theme.FONT_BOLD)
         self.tag_configure("heading", font=theme.FONT_BOLD, spacing1=px(10), spacing3=px(4))
@@ -229,6 +230,9 @@ class RichText(tk.Text):
         self.tag_raise("sel")
         self.tag_bind("link", "<Enter>", self._enter)
         self.tag_bind("link", "<Leave>", self._leave)
+        # Enter / Leave only say "onto a link" and "off the links": from one link straight onto the next (side by
+        # side, or one line down) neither comes - the movement itself has to notice that the link changed.
+        self.tag_bind("link", "<Motion>", self._move)
         self.tag_bind("link", "<ButtonPress-1>", self._press)
         self.tag_bind("link", "<ButtonRelease-1>", self._release)
         self.bind("<Button-1>", lambda _e: self.focus_set(), add="+")
@@ -273,7 +277,7 @@ class RichText(tk.Text):
         """``text`` with every recognised entity (see linkify.find_entities) as a link."""
         text = str(text)
         pos = 0
-        for e in linkify.find_entities(text, field) if self.links else []:
+        for e in linkify.find_entities(text, field, row) if self.links else []:
             self.write(text[pos:e.start], *tags)
             self.write_link(text[e.start:e.end], e, row, tags)
             pos = e.end
@@ -355,7 +359,7 @@ class RichText(tk.Text):
 
     def _enter(self, _e: tk.Event) -> None:
         self.configure(cursor="hand2")
-        tag = self.target_at("current")
+        tag = self._hovered = self.target_at("current")
         self.tag_remove("link_hover", "1.0", "end")
         if tag and self.tag_ranges(tag):
             self.tag_add("link_hover", *self.tag_ranges(tag))
@@ -366,7 +370,12 @@ class RichText(tk.Text):
             self.links.status.hover(f"Click: {label}   ·   right-click: more options" if label
                                     else self.links.hint(entity))
 
+    def _move(self, e: tk.Event) -> None:
+        if self.target_at("current") != self._hovered:
+            self._enter(e)
+
     def _leave(self, _e: tk.Event) -> None:
+        self._hovered = None
         self.configure(cursor="arrow")
         self.tag_remove("link_hover", "1.0", "end")
         if self.links:

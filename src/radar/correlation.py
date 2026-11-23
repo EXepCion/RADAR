@@ -61,6 +61,8 @@ class Response:
     undone_by: str = ""     # a later signal of this kind about the same account cancels the response
     # further rules for which it counts only when the alert's title says so (rule id -> words, any of them)
     rules_if: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # a field both must carry with the same value: the response is about that THING (a device), not about an account
+    same: str = ""
 
     def answers(self, rule_id: str, title: str) -> bool:
         """Does this response do something about an alert of that rule (with that title)?"""
@@ -72,16 +74,16 @@ class Response:
 RESPONSE_PREFIX = "Response: "
 # Alerts where a sign-in, session or token may be in the wrong hands: revoking the sessions ends that. It does
 # nothing about password guessing from outside or a password that is known - those are not in the list.
-_SESSION_RULES = frozenset({"session_theft", "aitm_replay", "hostile_reuse", "signin_wave", "risky_signin", "new_country", "new_country_background",
+_SESSION_RULES = frozenset({"unfamiliar_signin", "new_shared_ip", "session_theft", "aitm_replay", "hostile_reuse", "signin_wave", "risky_signin", "new_country", "new_country_background",
                             "impossible_travel", "device_code", "account_state", "pinned_accounts", "sensitive_app",
                             "legacy_auth", "mfa_exempt_watch"})
 # A disabled account cannot sign in at all: that also takes the point out of attacks on its password.
-_ACCOUNT_RULES = _SESSION_RULES | {"distributed_attack", "brute_force", "password_not_completed", "mfa_fatigue",
+_ACCOUNT_RULES = _SESSION_RULES | {"attack_tooling", "password_spray", "distributed_attack", "brute_force", "password_not_completed", "mfa_fatigue",
                                    "mfa_report"}
 # Alerts where somebody knew or may have used the PASSWORD: a new password ends that. (Tokens that were already
 # handed out live on until the sessions are revoked - that is the other response; after a reset Entra usually
 # revokes them too, and then both are on record.) Not session theft: a stolen token does not need the password.
-_PASSWORD_RULES = frozenset({"password_not_completed", "mfa_fatigue", "mfa_report", "hostile_reuse", "signin_wave",
+_PASSWORD_RULES = frozenset({"unfamiliar_signin", "new_shared_ip", "password_not_completed", "mfa_fatigue", "mfa_report", "hostile_reuse", "signin_wave",
                              "risky_signin", "new_country", "new_country_background",
                              "impossible_travel", "mfa_exempt_watch", "pinned_accounts", "legacy_auth"})
 RESPONSES = [
@@ -96,6 +98,10 @@ RESPONSES = [
     Response("account_disabled", -20, 30,
              "account disabled {when} by {by} - it cannot sign in any more", "Account disabled",
              rules=_ACCOUNT_RULES, undone_by="account_enabled"),  # ... unless it was enabled again afterwards
+    # A device that was registered and has been removed again: its long-lived tokens are gone with it.
+    Response("device_removed", -15, 30,
+             "device removed {when} by {by} - the sign-in tokens it held are gone with it", "Device removed",
+             rules=frozenset({"sensitive_app"}), same="_Device ID"),
 ]
 RESPONSE_SIGNALS = {r.signal: r for r in RESPONSES}
 RESPONSE_RELATED = set(RESPONSE_SIGNALS) | {r.undone_by for r in RESPONSES if r.undone_by}  # signals that change the picture

@@ -25,13 +25,14 @@ them into a local history and runs these rules:
 | MFA changes + new device | MFA method registered/deleted, MFA reset or TAP by an admin, password reset (directory audit, `Authentication Methods` + SSPR). Judged by **where** the user made the change (his sign-in at that moment - the audit IP is a Microsoft gateway for IPv6) and **what signed in afterwards** from a device/network not used before (baseline ends 12 h before the change). Admin resets/TAPs weigh more (social-engineered help desk). Guests skipped; new accounts (< 7 days) -20 | 10–30 by change, scored |
 | Impossible travel | consecutive successful interactive sign-ins ≥ 500 km apart at > 900 km/h | scored |
 | New country | success from a country not in the user's baseline (or not in `allowed_countries`) | scored |
-| Background activity from a new country | background sign-ins (none by hand) from a country the account was not seen in. On a device the person has long used AND a network they use anyway it is only logged (their phone or laptop, wherever the address is counted to); networks that hide where someone is (VPN, hosting) count as for any sign-in. An application that is not Microsoft's own and signs in for at least `app_server_min_accounts` (3) accounts from one cloud / hosting network is that application's own server (a connector, an assistant, a sync service), not a device abroad: logged only | scored, otherwise never below Low |
+| Background activity from a new country | background sign-ins (none by hand) from a country the account was not seen in. On a device the person has long used AND a network they use anyway it is only logged (their phone or laptop, wherever the address is counted to). So it is when that device is nowhere else at the same time: it travelled with its owner. The same device in two countries at once - at home at or after its first sign-in abroad, or so shortly before that no journey covers the distance (`impossible_travel.max_speed_kmh`) - stays an alert and says where else it was: a device is in one place, its sign-in token need not be (or it is a VPN, or a carrier's address counted to another country). A device that was logged as travelled is watched for `watch_hours` (48): when it signs in at home again sooner than any journey allows, the finding is raised after all; networks that hide where someone is (VPN, hosting) count as for any sign-in. An application that is not Microsoft's own and signs in for at least `app_server_min_accounts` (3) accounts from one cloud / hosting network is that application's own server (a connector, an assistant, a sync service), not a device abroad: logged only | scored, otherwise never below Low |
 | New IP shared by several accounts | a never-seen IP used by ≥ 2 accounts within 24 h (AiTM phishing proxy) | scored |
 | Attack tools / scripted sign-ins | interactive sign-ins from HTTP libraries/attack tools (`Go-http-client`, `python-requests`, `axios`, …) | scored |
 | Legacy authentication | successful IMAP/POP/SMTP AUTH/EAS/… sign-in | scored, never below Low |
 | Pinned accounts | an account in `pinned_accounts.accounts` signs in successfully from any other IP | 85 |
 | Device code / ROPC sign-ins | completed device-code or ROPC (password-only) authentication. Base 55 for device code and 65 for ROPC (the flow is counted once). For ROPC of an admin account that needs no MFA the office network takes off only 10 instead of 30 (the password sits in a script), so it stays High there too | scored, never below Low |
-| Admin tools & device registration | first use of Azure CLI / PowerShell / Graph tools, or a device registration | scored |
+| Admin tools & device registration | first use of Azure CLI / PowerShell / Graph tools, or a device registration. What a sign-in to the registration service was is told by the audit log (the entry of the same account within minutes): a registration names the device it produced (a link to the device in Entra) - also afterwards, when the audit entry arrives a scan later; a Windows Hello key set up on a device that exists is no device registration and is left to the MFA-change rule | scored |
+| Corporate device enrolments (record only) | While a company device is enrolled, the account signs in to the enrolment service before the device has an identity: with Apple's automated enrolment from the service's own address in a cloud (another country, no device, password only), with Windows Autopilot from wherever the new computer is unpacked. That it is an enrolment cannot be read from the sign-in - the address may lie in ranges anybody can rent - but from the result: within 30 minutes the account registers a device that the directory knows as **managed** and as coming from an enrolment only the organisation's own devices can go through (Apple: `enrollmentType` contains `DEP`, the serial number is assigned to the organisation; Windows Autopilot: the device carries a `[ZTDID]` physical id, its hardware was registered for the organisation). Such a sign-in to the enrolment service is held back until that shows; then it and the account's other sign-ins from that address in those minutes become one record and are not judged as the user's own (no new country, no risky sign-in, no impossible travel measured against them, no "new IP shared by several accounts", no attacker address remembered, no chain step - the registration of that device recorded by the audit watch is none either) and what they brought is not learned as the user's habit: the service's country, network and address stay as new for the account as they were. Without the proof they are judged like any other sign-in, at most 30 minutes later; the address itself excuses nothing. Settings: `device_enrolment` (`corporate_types`, `wait_minutes`). | record |
 | App sign-ins (service principals) | apps signing in with their own secret/certificate (~12,000/day), judged against a per-app baseline (countries, /24 network ranges, credential key ids; 3 days learning; raw rows not stored): new country -> Medium, first use of a credential -> Low, new range in a known country -> logged, >= 50 credential failures a week -> Low "credential failing" (Medium if from networks outside the app's baseline = someone trying its secrets). A credential that keeps failing the same way is one alert for as long as it does: dismissed once it stays dismissed, and returns when it fails differently or starts again after a week without | 10-70 |
 
 Every scored rule also uses: **MFA registration** (account sync reads the registration report; an enabled member
@@ -85,6 +86,24 @@ is sorted by severity, then score.
 | Attack-tool user agent; device code / ROPC flow | Same device active from the home country at the same time (VPN switch) |
 
 Device and network familiarity come from a 30-day per-user **profile** built from *all* sign-ins (phones and desktop apps mostly sign in non-interactively, whose raw rows are only kept for 3 h).
+Entra lists some sign-ins under one id twice - the sign-in by hand, and a background record of the same request (often a refused one). They are kept as two: the background copy never replaces the sign-in by hand, which stays its 30 days.
+
+**Familiar needs age.** A device, a network, a client (OS + browser) or an Authenticator counts as the account's
+own only once the account has used it for 12 hours (`scoring.familiar_after_hours`; the MFA-change rule's
+`baseline_gap_hours` follows it unless set). What turned up moments ago cannot vouch for what
+follows it: an attacker who registers a device signs in with it seconds later, from the network it was registered
+from - that is not a *known device* on a *usual network*. Until then the device is named as *first used N min
+before*, and its device-bound token lowers nothing (the token says as much as the device does). One exception: a
+new network is the user's own at once when a device that is already familiar uses it - the phone on a hotel's
+Wi-Fi.
+
+**And somebody has to vouch for a device.** Age alone does not make a device the user's: it must also have been
+seen where the account otherwise is - on an office network, on a network the account knew before the device
+appeared, or on one an older device of the account uses. A device registered through a datacenter and only ever
+used from there stays a stranger (*in use since ..., but only on networks the account does not otherwise use*),
+its token lowers nothing, and the network it works from does not become a *usual* or *habitual* one through it.
+The first devices of a new account need nobody to vouch, and a device nobody vouches for becomes the user's own
+after 14 days all the same (`scoring.unvouched_after_days`) - a phone that only ever uses mobile data.
 
 New-country / travel alerts are also **classified**: *corporate network*, *likely VPN / proxy*,
 *user's habitual VPN*, *likely travel (known device)* or *unknown device*. A trip with the user's managed laptop or a VPN
@@ -154,8 +173,16 @@ Watches the audit log for directory role assignments, app credential changes, co
 Conditional Access and domain federation changes, members added to groups excluded from any enforced Conditional
 Access policy (MFA exclusion 80, other policies 60), BitLocker / LAPS secrets read (single reads logged, >= 5 per
 person and week Medium; a LAPS read Low), owners added to apps, a Global Administrator elevating to Azure root
-(High), and optionally admin password/MFA resets. Device registrations (silent links for attack chains) and
+(High), and optionally admin password/MFA resets. Device registrations (silent links for attack chains: the
+device with its id - a link to it in Entra -, its kind and the address it was registered from) and
 session revocations (remediation context: a chain followed by a revocation is marked "handled?") are recorded.
+
+*Who a finding is about.* A finding of the audit watch names everybody it concerns: the one who made the change
+(an application is named as one, also when it is the actor), the accounts it was done to (*Done to*: who got the
+role, was made an owner, had their MFA reset) and, for roles, owners and credentials, the application it was done
+to. That is what attack chains, incidents and "Don't remind again" go by. *From where.* When the one who made a
+change acted from an address the sign-in checks know as an attacker's (within a day), the finding names it
+(*Known attacker address*) and gets +30 - and belongs to everything else about that address.
 
 **What switches other protections off** is watched too:
 
@@ -179,7 +206,11 @@ invite ...) -> 5 escalation (admin role, CA / federation change). Steps about th
 in time order, each within 3 days of the previous one's last activity (a running campaign counts until its last
 attempt), form a chain. An admin role activated from the account's own surroundings is such a step only in hindsight
 (see below); activated from unfamiliar surroundings it is an alert and a full step. It becomes a reminder ("Possible attack chain: ...") if it starts with stage 1/2 and
-reaches 3+, or covers three stages - so "abroad, then a new passkey" stays quiet. A chain must combine at least
+reaches 3+, or covers three stages - so "abroad, then a new passkey" stays quiet. One pair of two is a chain as
+well: a sign-in that may not be the user (3) followed by a grab for power (5: a role, a policy, a federation, an
+outside organisation let in, a mass deletion), when both are at least Medium. And a sign-in rated High on its
+own (3) followed by a way to stay (4: a device registered, an MFA method, a consent) - "MFA completed through a
+datacenter, then a device registered" is the takeover itself. A chain must combine at least
 two different detections; a step must be at least Low on its own (score >= 25); an "access" step whose sign-ins
 all failed counts as targeting. Score = strongest step + 10 per further step (+10 if the password was known and
 something followed); two-step chains stay Medium unless a step is High on its own.
@@ -199,7 +230,8 @@ and two steps that are each at least Medium (45) may lie up to 10 days apart ins
 Rules judge one account at a time; what one of them proves about an address is kept and used by all. After every
 scan the findings of at least Medium from these rules mark the addresses of their sign-ins: a reported MFA prompt,
 session theft, AiTM / session replay, a password attack that got past the password, a guessed password (+25 on any
-later assessment), and a correct password stopped by MFA, a new address shared by several accounts, attack-tool
+later assessment), and a correct password stopped by MFA, repeated MFA prompts (whoever causes them knows the password), a new
+address shared by several accounts, attack-tool
 sign-ins, a password spray (+15). Only sign-ins foreign to their account mark an address (no office network; no
 device, network or address the account used before), never an address three or more accounts regularly sign in
 from (a hotel, a mobile carrier). The mark then counts in **every rule's assessment** of a sign-in from that
@@ -215,6 +247,12 @@ from it (a successful sign-in, a right password that was stopped), on no device 
 never to the guessing itself, and no longer once anybody signs in from that network (a mobile carrier or a home
 provider stops being one with the first person on it).
 
+*Applications* have chains too. What is planted on an application (a credential, an owner, a consent: 4) and
+the application then signing in from a country it never used (5) is a chain about the application; its secrets
+being tried from outside its networks count as targeting (1). A new credential that is simply used, or one that
+keeps failing, is operations and no step. An account under suspicion that did something to an application is
+taken together with it like with another account ("Attack across 2 accounts / applications").
+
 **Attacks across accounts** (`chains.spread_findings`). Accounts are taken together when their alerts name the
 same known attacker address, or when an account that was already under real suspicion (its password is known, or
 an alert of at least Medium that was not dismissed) acted on another one afterwards (*Initiated by* / *Invited
@@ -226,7 +264,8 @@ runs across at least two accounts it is raised as "Attack across N accounts: ...
 **Incidents** (`radar/incidents.py`, RADAR window > Incidents). Alerts that were reminders (at least Low, not only
 logged) about the same account or the same known attacker address, no more than 7 days apart, are one incident;
 chains of such pairs join. Chain alerts name the incident; responses (sessions revoked, password reset, account
-disabled) and logged-only findings are shown with it as context but neither make an incident nor join two. The
+disabled, and a registered device removed again - which answers the alert about the registration of exactly that
+device, by its id) and logged-only findings are shown with it as context but neither make an incident nor join two. The
 window lists the incidents of the last 30 days with their alerts in order; the open reminders of one incident can
 be dismissed together.
 

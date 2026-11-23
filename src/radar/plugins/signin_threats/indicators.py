@@ -32,6 +32,7 @@ SOURCES: dict[str, tuple[int, str, str]] = {
     "distributed_attack": (HIGH, "a password attack that got past the password", "access"),
     "brute_force": (HIGH, "a guessed password", "access"),
     "password_not_completed": (MEDIUM, "a sign-in with the right password that MFA stopped", "access"),
+    "mfa_fatigue": (MEDIUM, "MFA prompts sent with the right password", "access"),
     "new_shared_ip": (MEDIUM, "a new address used on several accounts", "access"),
     "attack_tooling": (MEDIUM, "attack-tool sign-ins", "all"),
     "password_spray": (MEDIUM, "a password spray", "all"),
@@ -100,7 +101,10 @@ def derive(rc: Any, findings: Iterable[Any]) -> list[Indicator]:
             continue
         points, reason, rows = SOURCES[f.rule_id]
         for row in f.evidence or []:
-            s = rc.history.get(row.get("Sign-in ID") or "") if row.get("Sign-in ID") else None
+            # (one id can stand for a sign-in by hand and a background record: the row says which one it shows)
+            kind = {"interactiveUser": True, "nonInteractiveUser": False}.get(str(row.get("_event") or ""))
+            sid = row.get("Sign-in ID") or ""
+            s = (rc.history.get(sid, kind) or rc.history.get(sid)) if sid else None
             if s is None or not s.ip or rc.trusted(s) or s.ip in rc.ignore_ips or s.upn in rc.ignore_users:
                 continue
             if rows == "access" and not (s.success or rules.password_proven(s)

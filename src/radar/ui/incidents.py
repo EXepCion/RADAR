@@ -30,7 +30,7 @@ from .cardtable import CardTable
 from .parts import Badge, Hint, Pointer, Segments, StageTrack, card, on_card
 from .rounded import Rounded
 from .richtext import StatusLine, stable_label
-from .tables import make_sortable
+from .tables import STATE_ORDER, make_sortable
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -232,10 +232,15 @@ class Summary(tk.Frame):
 
 
 def step_rows(inc: incidents.Incident | None) -> list[tuple[Alert, list[str]]]:
-    """The alerts of an incident as table rows (STEP_COLS), in order."""
+    """The alerts of an incident as table rows (STEP_COLS), in the order of what still needs a look: open first
+    - the summary, then what it sums up in the order it happened -, then snoozed, dismissed, and what was only
+    logged. (By time alone, a days-old dismissed alert stood on top and the open ones at the very end.)"""
     rows = []
     counted = {a.id for a in inc.own_alerts} if inc else set()
-    for a in (inc.alerts if inc else []):
+    summary = incidents.chains.CHAIN_PLUGIN
+    ordered = sorted(inc.alerts if inc else [], key=lambda a: (
+        STATE_ORDER.get(STATE.get(a.status, a.status), len(STATE_ORDER)), a.plugin_id != summary, a.when, a.id))
+    for a in ordered:
         stage = incidents.stage_of(a)
         # what was only logged is context: it is no stop on the line above, so it does not carry a stop's name
         kind = ("Summary" if a.plugin_id == incidents.chains.CHAIN_PLUGIN else
@@ -359,7 +364,7 @@ class IncidentsWindow:
         steps.show_as("Time")
         steps.pack(fill="both", expand=True, pady=(px(10), 0))
         self.step_sort = make_sortable(steps, STEP_COLS)
-        self.step_sort("Time")  # in the order it happened (the header says so); a click on a header sorts otherwise
+        self.step_sort("State")  # what still needs a look first (see step_rows); a click on a header sorts otherwise
         steps.bind("<<TreeviewSelect>>", lambda _e: self._buttons())
         steps.bind("<Double-1>", lambda e: self.open_selected() if steps.identify_row(e.y) else None)
         top.bind("<Return>", lambda _e: self.open_selected())
@@ -484,6 +489,7 @@ class IncidentsWindow:
         keep = [iid for iid in chosen if iid in self._steps]
         if keep:
             self.steps.selection_set(keep)
+        # (no alert is chosen to begin with: here "Open" means the incident - an alert only once one is picked)
         self._buttons()
 
     def _point(self) -> None:

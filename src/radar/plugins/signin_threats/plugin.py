@@ -9,12 +9,15 @@ from typing import Any
 from ... import tenant_settings
 from ...graph import GraphError
 from ...plugin_api import Finding, Plugin, PluginContext, Rule
-from . import apps, indicators, netintel, overview, rules
+from . import apps, enrolment, indicators, netintel, overview, registrations, rules
 from .accounts import AccountDirectory, sync_directory
 from .asnames import AsnNameResolver
 from .history import SignInHistory
 from .models import AccountChange, SignIn, graph_time, parse_time
 from .rules import RULES, RuleContext
+
+ENROLMENT_STATE = "enrolments"  # sign-ins of the enrolment service: proven ones, and those still waiting
+REGISTRATION_STATE = "registrations"  # sign-ins to the registration service still waiting for their audit entry
 
 EVENT_TYPES = ("interactiveUser", "nonInteractiveUser", "servicePrincipal", "managedIdentity")
 
@@ -116,6 +119,10 @@ class SignInThreatsPlugin(Plugin):
         # suspicious_user_agents: null = built-in list, or your own list of regexes.
         # lookup_asn_names: classify unlisted networks by their registered name via RIPEstat (sends AS numbers only).
         "scoring": {"trusted_asns": [], "extra_asns": {}, "suspicious_user_agents": None, "lookup_asn_names": True},
+        # corporate_types: what only a device of the organisation can have, in the directory's enrollmentType or
+        # among its physical id marks ("DEP" = Apple's automated device enrolment, "ZTDID" = Windows Autopilot);
+        # wait_minutes: how long the proof may take to show up
+        "device_enrolment": {"corporate_types": list(enrolment.CORPORATE_TYPES), "wait_minutes": 30},
     }
 
     #: rule id -> a short note shown behind the rule's name in the menu (why it is inactive, what cannot be verified)
@@ -155,11 +162,16 @@ class SignInThreatsPlugin(Plugin):
             history.purge(now - timedelta(days=float(s.get("retention_days", 30))),
                           now - timedelta(hours=float(s.get("non_interactive_retention_hours", 3))))
 
+            settled = self._settle_enrolments(ctx, history, new, now)
+            new = settled.new
             scoring = s.get("scoring") if isinstance(s.get("scoring"), dict) else {}
             resolver = AsnNameResolver(ctx.state, enabled=bool(scoring.get("lookup_asn_names", True)))
             rc = RuleContext.build(new, history, s, now, enabled_rules=ctx.enabled_rules, asn_resolver=resolver,
-                                   accounts=accounts)
+                                   accounts=accounts, excluded=settled.excluded)
             rc.learning = frozenset(learning)
+            rc.enrolments = settled.records
+            named = self._registrations(ctx, history, new, now)
+            rc.registrations = named.matches
             findings: list[Finding] = []
             for rule in RULES:
                 if not ctx.rule_enabled(rule.meta.id) or (rule.meta.id == "mfa_report" and report_off) \
@@ -169,6 +181,15 @@ class SignInThreatsPlugin(Plugin):
                     findings.extend(rule.evaluate(rc))
                 except Exception:
                     ctx.log.exception("Rule %s failed", rule.meta.id)
+            if named.again and ctx.rule_enabled("sensitive_app"):
+                # judged in an earlier scan, before the audit log said which device: the same alert, now with it
+                try:
+                    late = RuleContext.build(named.again, history, s, now, enabled_rules=ctx.enabled_rules,
+                                             asn_resolver=resolver, accounts=accounts, excluded=settled.excluded)
+                    late.registrations = named.matches
+                    findings.extend(f for f in rules.sensitive_app(late) if "Device" in f.fields)
+                except Exception:
+                    ctx.log.exception("Registered devices could not be added to their alerts")
             try:  # what these findings prove about attacker addresses is remembered and used from here on
                 marked = indicators.apply(rc, findings, reuse=ctx.rule_enabled("hostile_reuse"))
                 if marked:
@@ -552,6 +573,79 @@ class SignInThreatsPlugin(Plugin):
             ctx.log.info("Re-read %d incomplete sign-in record(s), %d completed by Entra since", len(rows),
                          history.enriched - before)
 
+    # ----------------------------------------------------- registrations
+    def _registrations(self, ctx: PluginContext, history: SignInHistory, new: list[SignIn],
+                       now: datetime) -> "registrations.Outcome":
+        """What the sign-ins to the device registration service were, by the audit log (see registrations.py).
+        The audit log is only asked while there is such a sign-in."""
+        if not ctx.rule_enabled("sensitive_app"):
+            return registrations.Outcome()
+
+        def entries(since: datetime) -> list[dict]:
+            found: list[dict] = []
+            for page in ctx.graph.get_pages(
+                    "/v1.0/auditLogs/directoryAudits",
+                    {"$filter": f"activityDateTime ge {graph_time(since)} and loggedByService eq 'Device Registration Service'",
+                     "$top": "999"}, max_pages=5):
+                found.extend(page)
+            return found
+
+        try:
+            state = ctx.state.get(REGISTRATION_STATE)
+            out = registrations.settle(new, history, state if isinstance(state, dict) else {}, now, entries)
+            if out.state != (state or {}):
+                ctx.state.set(REGISTRATION_STATE, out.state)
+            return out
+        except Exception:  # never let this stop the scan
+            ctx.log.exception("Device registrations could not be matched with the audit log")
+            return registrations.Outcome()
+
+    # -------------------------------------------------------- enrolments
+    def _settle_enrolments(self, ctx: PluginContext, history: SignInHistory, new: list[SignIn],
+                           now: datetime) -> "enrolment.Outcome":
+        """Sign-ins of the device enrolment service: a record when the device they produced proves a corporate
+        enrolment, held back while that may still show up, judged like any other otherwise (see enrolment.py).
+        The audit log and the directory are only asked while such a sign-in is waiting."""
+        unchanged = enrolment.Outcome(new, set(), {})
+        if not ctx.rule_enabled(enrolment.RULE_ID):
+            return unchanged
+        cfg = ctx.settings.get(enrolment.RULE_ID) if isinstance(ctx.settings.get(enrolment.RULE_ID), dict) else {}
+        types = [str(t) for t in (cfg.get("corporate_types") or enrolment.CORPORATE_TYPES)]
+        try:
+            wait = timedelta(minutes=max(1.0, float(cfg.get("wait_minutes", 30))))
+        except (TypeError, ValueError):
+            wait = enrolment.WAIT
+
+        def registrations(since: datetime) -> list[dict]:
+            found: list[dict] = []
+            for page in ctx.graph.get_pages(
+                    "/v1.0/auditLogs/directoryAudits",
+                    {"$filter": f"activityDateTime ge {graph_time(since)} and activityDisplayName eq 'Register device'",
+                     "$top": "999"}, max_pages=5):
+                found.extend(page)
+            return found
+
+        def device(device_id: str) -> dict | None:
+            if not enrolment.GUID.match(device_id):
+                return None
+            data = ctx.graph.get("/v1.0/devices", {"$filter": f"deviceId eq '{device_id}'",
+                                                   "$select": enrolment.DEVICE_SELECT})
+            values = (data or {}).get("value") or []
+            return values[0] if values else None
+
+        try:
+            state = ctx.state.get(ENROLMENT_STATE)
+            out = enrolment.settle(new, history, state if isinstance(state, dict) else {}, now, registrations, device,
+                                   types, wait)
+            if out.state != state:
+                ctx.state.set(ENROLMENT_STATE, out.state)
+            if out.records:
+                ctx.log.info("%d corporate device enrolment(s) recognised: their sign-ins are not judged", len(out.records))
+            return out
+        except Exception:  # never let this stop the scan: everything is judged as usual
+            ctx.log.exception("Device enrolments could not be worked out")
+            return unchanged
+
     # ---------------------------------------------------------- rescore
     def reevaluate(self, ctx: PluginContext, hours: int) -> list[Finding]:
         """Run the enabled rules again over the stored history of the last ``hours`` (no Graph calls)."""
@@ -562,8 +656,11 @@ class SignInThreatsPlugin(Plugin):
             recent = history.query(now - timedelta(hours=hours), now)
             scoring = s.get("scoring") if isinstance(s.get("scoring"), dict) else {}
             resolver = AsnNameResolver(ctx.state, enabled=bool(scoring.get("lookup_asn_names", True)))
+            known = ctx.state.get(ENROLMENT_STATE) if ctx.rule_enabled(enrolment.RULE_ID) else None
+            known = known if isinstance(known, dict) else {}
             rc = RuleContext.build(recent, history, s, now, enabled_rules=ctx.enabled_rules, asn_resolver=resolver,
-                                   accounts=AccountDirectory.load(ctx.data_dir / "accounts.json"))
+                                   accounts=AccountDirectory.load(ctx.data_dir / "accounts.json"),
+                                   excluded=set(known.get("explained") or {}) | set(known.get("held") or {}))
             findings: list[Finding] = []
             for rule in RULES:
                 if ctx.rule_enabled(rule.meta.id):

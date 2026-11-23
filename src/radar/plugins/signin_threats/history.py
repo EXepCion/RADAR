@@ -38,6 +38,8 @@ def anon_day(s: SignIn) -> str:
         return s.created.astimezone().strftime("%Y-%m-%d")
     return ""
 
+#: what the key of a sign-in gets when its id is already taken by its twin from the other feed (see add)
+TWIN = {True: "|i", False: "|n"}
 _DETAIL_FIELDS = ("upn", "user_name", "asn", "country", "city", "device_id", "auth_methods", "session_id")
 
 
@@ -245,46 +247,63 @@ class SignInHistory:
         """
         if not signins:
             return []
-        known: dict[str, int] = {}          # id -> stored error code
-        stored: dict[str, SignIn] = {}      # stored rows that may be replaced
-        ids = [s.id for s in signins]
-        incoming = {s.id: s for s in signins}
-        for i in range(0, len(ids), 500):
-            chunk = ids[i:i + 500]
+        # Entra lists some sign-ins under ONE id in both feeds: the sign-in by hand, and a background record of the
+        # same request (often a refused one). They are two events - the second gets a key of its own (id + TWIN), so
+        # that neither replaces the other and the background copy can go after hours while the other stays.
+        ids = sorted({s.id for s in signins})
+        keys = ids + [i + t for i in ids for t in TWIN.values()]
+        rows: dict[str, tuple[bool, int, bool, str | None]] = {}  # key -> (by hand, error code, partial, data if partial)
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
             marks = ",".join("?" * len(chunk))
-            for sid, code, partial, data in self._conn.execute(
-                    f"SELECT id, error_code, (asn IS NULL OR country='' OR (user_id<>'' AND data NOT LIKE '%\"upn\":%')), "
+            for key, by_hand, code, partial, data in self._conn.execute(
+                    f"SELECT id, interactive, error_code, (asn IS NULL OR country='' OR (user_id<>'' AND data NOT LIKE '%\"upn\":%')), "
                     f"CASE WHEN asn IS NULL OR country='' OR (user_id<>'' AND data NOT LIKE '%\"upn\":%') "
                     f"THEN data END FROM signins WHERE id IN ({marks})", chunk):
-                known[sid] = code
-                if partial:
-                    stored[sid] = SignIn.from_json(data)
-        changed = [sid for sid, code in known.items() if sid not in stored and incoming[sid].error_code != code]
+                rows[key] = (bool(by_hand), code, bool(partial), data)
+        claimed: dict[str, bool] = {}  # keys taken by new sign-ins of this batch -> by hand
+
+        def key_of(s: SignIn) -> str:
+            twin = s.id + TWIN[bool(s.interactive)]
+            if twin in rows or twin in claimed:
+                return twin
+            kind = rows[s.id][0] if s.id in rows else claimed.get(s.id)
+            return s.id if kind is None or kind == bool(s.interactive) else twin
+
+        keyed: list[tuple[str, SignIn]] = []
+        for s in signins:
+            key = key_of(s)
+            if key not in rows:
+                claimed.setdefault(key, bool(s.interactive))
+            keyed.append((key, s))
+        stored: dict[str, SignIn] = {k: SignIn.from_json(v[3]) for k, v in rows.items() if v[2] and v[3]}
+        incoming = {key: s for key, s in keyed}
+        changed = [k for k, v in rows.items() if k in incoming and k not in stored and incoming[k].error_code != v[1]]
         for i in range(0, len(changed), 500):  # result changed: load the stored copy to compare (rare)
             chunk = changed[i:i + 500]
-            for sid, data in self._conn.execute(
+            for key, data in self._conn.execute(
                     f"SELECT id, data FROM signins WHERE id IN ({','.join('?' * len(chunk))})", chunk):
-                stored[sid] = SignIn.from_json(data)
+                stored[key] = SignIn.from_json(data)
         fresh: dict[str, SignIn] = {}
         richer: dict[str, SignIn] = {}
-        for s in signins:
-            if s.id not in known:
-                fresh.setdefault(s.id, s)
+        for key, s in keyed:
+            if key not in rows:
+                fresh.setdefault(key, s)
                 continue
-            base = richer.get(s.id) or stored.get(s.id)
+            base = richer.get(key) or stored.get(key)
             # a changed result wins when the new copy is itself complete (the final record may list FEWER
             # passed steps than the preliminary one, e.g. 'Previously satisfied' disappears with 50097 -> 50074)
             if base is not None and (_detail(s) > _detail(base) or (s.error_code != base.error_code and _complete(s))):
-                richer[s.id] = s
+                richer[key] = s
         self._conn.executemany(
             "INSERT OR IGNORE INTO signins(id, ts, user_id, ip, country, error_code, interactive, has_geo,"
             " asn, device_id, session_id, app_id, data) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [_row(s) for s in fresh.values()],
+            [(key, *_row(s)[1:]) for key, s in fresh.items()],
         )
         self._conn.executemany(
             "UPDATE signins SET ts=?, user_id=?, ip=?, country=?, error_code=?, interactive=?, has_geo=?, asn=?,"
             " device_id=?, session_id=?, app_id=?, data=? WHERE id=?",
-            [(*_row(s)[1:], s.id) for s in richer.values()],
+            [(*_row(s)[1:], key) for key, s in richer.items()],
         )
         self.enriched += len(richer)
         profile = []
@@ -391,9 +410,15 @@ class SignInHistory:
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM signins").fetchone()[0]
 
-    def get(self, signin_id: str) -> SignIn | None:
-        row = self._conn.execute("SELECT data FROM signins WHERE id=?", (signin_id,)).fetchone()
-        return SignIn.from_json(row[0]) if row else None
+    def get(self, signin_id: str, interactive: bool | None = None) -> SignIn | None:
+        """The sign-in with this id. One id can stand for two (see ``add``): ``interactive`` says which one is
+        meant - the sign-in by hand or the background record; without it, the one first stored."""
+        rows = self._conn.execute("SELECT id, interactive, data FROM signins WHERE id IN (?,?,?)",
+                                  (signin_id, signin_id + TWIN[True], signin_id + TWIN[False])).fetchall()
+        if interactive is not None:
+            rows = [r for r in rows if bool(r[1]) == interactive]
+        rows.sort(key=lambda r: r[0] != signin_id)
+        return SignIn.from_json(rows[0][2]) if rows else None
 
     def query(self, start: datetime | None = None, end: datetime | None = None, *, user_id: str | None = None,
               ip: str | None = None, codes: Iterable[int] | None = None, success: bool | None = None,
@@ -490,6 +515,29 @@ class SignInHistory:
         row = self._conn.execute("SELECT first_ts, n FROM profile WHERE user_id=? AND kind='asn' AND value=?",
                                  (user_id, str(asn))).fetchone()
         return (datetime.fromtimestamp(row[0]).astimezone(), int(row[1])) if row else None
+
+    def forget(self, signins: Sequence[SignIn]) -> None:
+        """Take sign-ins out of what was learned about their accounts (they stay in the history): the countries,
+        networks, addresses ... that only they brought are no habit of the user. Used for sign-ins that were not the
+        user's own doing - a device enrolment service acting for them (enrolment.py)."""
+        from . import presence
+
+        for s in signins:
+            if not (s.success and s.user_id):
+                continue
+            self._conn.executemany("UPDATE profile SET n=n-1 WHERE user_id=? AND kind=? AND value=?",
+                                   [(s.user_id, kind, value) for kind, value in profile_values(s)])
+            ts = s.created.timestamp()
+            self._conn.execute("DELETE FROM activity WHERE user_id=? AND device=? AND ip=? AND first_ts<=? AND last_ts>=?",
+                               (s.user_id, presence.device_key(s), s.ip, ts, ts))
+        self._conn.execute("DELETE FROM profile WHERE n<=0")
+        self._conn.commit()
+
+    def first_use(self, user_id: str, kind: str, value: str) -> datetime | None:
+        """When the account first used a device, network ... (a profile kind and its value); None: never."""
+        row = self._conn.execute("SELECT first_ts FROM profile WHERE user_id=? AND kind=? AND value=?",
+                                 (user_id, kind, str(value))).fetchone()
+        return datetime.fromtimestamp(row[0]).astimezone() if row else None
 
     def asn_user_count(self, asn: int, before: datetime, exclude_user: str = "") -> int:
         sql = "SELECT COUNT(DISTINCT user_id) FROM profile WHERE kind='asn' AND value=? AND first_ts<? AND user_id<>?"

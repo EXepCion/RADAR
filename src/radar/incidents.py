@@ -167,7 +167,7 @@ def _relevant(a: Alert) -> bool:
     return not (_is_chain(a) and a.status == MUTED)  # a chain that no longer holds sums nothing up
 
 
-VICTIM_FIELDS = ("User", "Account", "Member", "Guest")
+VICTIM_FIELDS = ("User", "Account", "Member", "Guest", "Done to")
 APP_SIGNIN_RULES = {"app_signins"}  # what an application itself did (its sign-ins), not what was done to it
 Key = tuple[str, str]
 

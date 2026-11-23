@@ -94,6 +94,8 @@ SENSITIVE_APPS: dict[str, str] = {
     "d1ddf0e4-d672-4dae-b554-9d5bdfd93547": "Microsoft Intune PowerShell",
 }
 DEVICE_REGISTRATION_RESOURCE = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9"
+# Microsoft Intune Enrollment: what a device signs in to while it is being enrolled (the same id in every tenant)
+ENROLMENT_RESOURCE = "d4ebce55-015a-49b5-a083-c84d1797ae8c"
 
 # Tenants that own Microsoft first-party apps (appOwnerTenantId of the sign-in)
 MICROSOFT_TENANTS = {"f8cdef31-a31e-4b4a-93e4-5f571e91255a", "72f988bf-86f1-41af-91ab-2d7cd011db47"}

@@ -91,7 +91,7 @@ class IncidentWindow:
         steps.show_as("Time")
         steps.grid(row=0, column=0, sticky="nsew")
         self.step_sort = make_sortable(steps, STEP_COLS)
-        self.step_sort("Time")  # in the order it happened (the header says so); a click on a header sorts otherwise
+        self.step_sort("State")  # what still needs a look first (see step_rows); a click on a header sorts otherwise
         steps.bind("<<TreeviewSelect>>", lambda _e: self._step_selected())
         steps.bind("<Double-1>", lambda e: self.open_selected() if steps.identify_row(e.y) else None)
         top.bind("<Return>", lambda _e: self.open_selected())
@@ -166,11 +166,11 @@ class IncidentWindow:
             self.steps.insert("", "end", iid=iid, tags=(a.status,), values=values)
         self.step_sort.reapply()  # type: ignore[attr-defined]
         keep = [iid for iid in chosen if iid in self._steps]
-        first = incident.strongest
+        rows = self.steps.get_children("")
         if keep:
             self.steps.selection_set(keep)
-        elif first is not None and str(first.id) in self._steps:
-            self.steps.selection_set(str(first.id))  # what weighs most, to begin with
+        elif rows:
+            self.steps.selection_set(rows[0])  # the first row, to begin with: what the order puts on top
         still = bool(incident.open_alerts)
         self.dismiss_btn.configure(state="normal" if still else "disabled")
         self.snooze_btn.configure(state="normal" if any(a.status == ACTIVE for a in incident.open_alerts) else "disabled")

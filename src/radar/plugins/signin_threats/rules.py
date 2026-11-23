@@ -5,7 +5,7 @@ explains its verdict; pure volume patterns (spray, brute force, MFA fatigue) use
 """
 from __future__ import annotations
 
-from ... import timefmt
+from ... import linkify, timefmt
 import fnmatch
 import ipaddress
 import math
@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable
 
 from ...correlation import REPORT_SIGNAL
 from ...plugin_api import Finding, Rule, Severity
-from . import indicators, netintel
+from . import indicators, netintel, registrations
 from .history import SignInHistory
 from .models import (CHANGE_KINDS, NOT_ACCOUNT_CHANGES, REPORT_KIND, ROLE_KIND, AccountChange, SignIn,  # noqa: F401
                      os_family, parse_time)  # (os_family re-exported)
@@ -87,6 +87,47 @@ class UserMatcher:
         return bool(upn) and any(fnmatch.fnmatchcase(upn, p) for p in self._patterns)
 
 
+class _Without:
+    """The sign-in history without some sign-ins: the rules do not see them, whatever they ask for."""
+
+    def __init__(self, history: SignInHistory, ids: frozenset[str]):
+        self._history, self._ids = history, ids
+        self._signins: list[SignIn] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._history, name)
+
+    def query(self, *args: Any, **kw: Any) -> list[SignIn]:
+        return [s for s in self._history.query(*args, **kw) if s.id not in self._ids]
+
+    def get(self, signin_id: str, interactive: bool | None = None) -> SignIn | None:
+        return None if signin_id in self._ids else self._history.get(signin_id, interactive)
+
+    def _hidden(self) -> list[SignIn]:
+        if self._signins is None:
+            self._signins = [s for s in (self._history.get(i) for i in self._ids) if s is not None]
+        return self._signins
+
+    def user_countries(self, user_id: str, before: datetime, interactive_only: bool) -> Counter:
+        found = self._history.user_countries(user_id, before, interactive_only)
+        for s in self._hidden():
+            if s.user_id == user_id and s.success and s.country and s.created < before \
+                    and (s.interactive or not interactive_only):
+                found[s.country] -= 1
+        return +found  # (what is left with a count)
+
+    def previous_geo_success(self, user_id: str, before: datetime, after: datetime, exclude_id: str,
+                             interactive_only: bool) -> SignIn | None:
+        while True:
+            s = self._history.previous_geo_success(user_id, before, after, exclude_id, interactive_only)
+            if s is None or s.id not in self._ids:
+                return s
+            before = s.created - timedelta(milliseconds=1)
+
+    def activity(self, *args: Any, **kw: Any) -> list:
+        return [run for run in self._history.activity(*args, **kw) if run[0].id not in self._ids]
+
+
 @dataclass
 class RuleContext:
     new: list[SignIn]
@@ -108,12 +149,17 @@ class RuleContext:
     _computer_nets: dict = field(default_factory=dict)  # user id -> networks the user's computers sign in from
     _hostile: dict | None = None  # address -> [Indicator] (see hostile_index)
     _hostile_nets: dict | None = None  # AS number -> Indicator (see hostile_network)
+    enrolments: list = field(default_factory=list)  # records of proven device enrolments (see enrolment.py)
+    registrations: dict = field(default_factory=dict)  # sign-in id -> what the audit log says it was (registrations.py)
 
     @classmethod
     def build(cls, new: list[SignIn], history: SignInHistory, settings: dict, now: datetime,
               enabled_rules: Iterable[str] | None = None,
               asn_resolver: Callable[[int], str | None] | None = None,
-              accounts: "AccountDirectory | None" = None) -> "RuleContext":
+              accounts: "AccountDirectory | None" = None, excluded: Iterable[str] = ()) -> "RuleContext":
+        excluded = frozenset(excluded)
+        if excluded:  # sign-ins that are not the user's own (a proven enrolment) or wait for that to be settled
+            history, new = _Without(history, excluded), [s for s in new if s.id not in excluded]  # type: ignore[assignment]
         pinned = (settings.get("pinned_accounts") or {}).get("accounts") or {}
         from . import hosts, offices  # office addresses + other trusted addresses, each with its label
 
@@ -250,9 +296,9 @@ def _foreign_to_user(rc: RuleContext, s: SignIn) -> bool:
     h = rc.history
     if rc.trusted(s):
         return False
-    if s.device_id and s.device_id in h.user_devices(s.user_id, s.created):
+    if rc.assessor.known_device(s):
         return False
-    if s.asn and s.asn in h.user_asns(s.user_id, s.created):
+    if s.asn and s.asn in rc.assessor.asns(s):
         return False
     known_ips = h.user_profile(s.user_id, "ip", s.created)
     return not (s.ip in known_ips or _ip_net(s.ip) in {_ip_net(i) for i in known_ips})
@@ -898,9 +944,29 @@ APP_SERVER_NETWORKS = ("cloud", "hosting")  # where applications run that act fo
 OWN_NETWORKS = ("User's usual network", "Habitual network of the user")
 
 
-def _background_assessment(rc: RuleContext, s: SignIn, why: str) -> Assessment:
+def _device_elsewhere(rc: RuleContext, s: SignIn, first: datetime, last: datetime) -> tuple[SignIn, datetime] | None:
+    """The same device active in another country at a time it cannot have been in both: at or after its first
+    sign-in here, or so shortly before that no journey covers the distance. (Its activity there, and when.)"""
+    max_kmh = float(rc.cfg("impossible_travel").get("max_speed_kmh", 900))
+    for o, _begin, end in ((o, b, e) for o, b, e, _n in rc.history.activity(first - timedelta(hours=24), last + timedelta(hours=1), s.user_id)):
+        if o.device_id != s.device_id or not o.country or o.country == s.country:
+            continue
+        if end >= first:
+            return o, end
+        hours = max((first - end).total_seconds() / 3600, 1 / 60)
+        if None in (o.lat, o.lon, s.lat, s.lon):
+            if hours < 1:
+                return o, end
+        elif haversine_km(o.lat, o.lon, s.lat, s.lon) / hours > max_kmh:
+            return o, end
+    return None
+
+
+def _background_assessment(rc: RuleContext, s: SignIn, why: str, span: tuple[datetime, datetime] | None = None) -> Assessment:
     """Background activity abroad stays at least Low - except on a device the person has long used AND a network
-    they use anyway: that is their phone or laptop, wherever the address is counted to. It is logged only."""
+    they use anyway (their phone or laptop, wherever the address is counted to), and except when that device is
+    nowhere else at the same time: it travelled with its owner. Both are logged only. The same device in two
+    countries at once stays an alert - a device is in one place; its sign-in token need not be."""
     a = rc.assessor.assess(s, 25, why)
     net = rc.assessor.network(s)
     if net and net[1] in APP_SERVER_NETWORKS and s.app_id and s.asn and s.app_owner_tenant not in netintel.MICROSOFT_TENANTS:
@@ -917,8 +983,18 @@ def _background_assessment(rc: RuleContext, s: SignIn, why: str) -> Assessment:
     own = any(t.startswith(OWN_DEVICE) for t in texts) and any(t.startswith(OWN_NETWORKS) for t in texts)
     if own:
         a.factors.append(Factor(0, "The person's own device on a network they use anyway: logged only"))
-    else:
-        a.score = max(25, a.score)
+        return a
+    if span and s.device_id and a.score <= 25 and any(t.startswith(OWN_DEVICE) for t in texts):
+        other = _device_elsewhere(rc, s, *span)
+        if other is None:
+            a.factors.append(Factor(min(0, 20 - a.score), "The person's own device, and it is nowhere else at the same "
+                                    "time: it travelled with its owner - logged only"))
+            a.score = min(a.score, 20)
+            return a
+        a.factors.append(Factor(0, f"The same device was active in {other[0].location} at {timefmt.stamp(other[1])}: a "
+                                   "device is in one place - its sign-in token may be in use elsewhere (or a VPN, or "
+                                   "the carrier's address is counted to another country)"))
+    a.score = max(25, a.score)
     return a
 
 
@@ -949,7 +1025,8 @@ def new_country_background(rc: RuleContext) -> list[Finding]:
             continue  # signed in by hand from there as well: that is new_country's alert
         usual = ", ".join(c for c, _ in baseline.most_common(5))
         why = f"First activity from {country} (usually {usual}), in the background only"
-        s, a = _best([(x, _background_assessment(rc, x, why)) for x in items])
+        span = (first.created, max(x.created for x in items))
+        s, a = _best([(x, _background_assessment(rc, x, why, span)) for x in items])
         devices = sorted({x.device_name or " ".join(p for p in (x.os, x.browser) if p) or "unidentified device" for x in items})
         out.append(_scored(
             a, key=f"country-bg|{user_id}|{country}", rule_id="new_country_background",
@@ -964,6 +1041,54 @@ def new_country_background(rc: RuleContext) -> list[Finding]:
                             "person's own (registered long ago, their usual model); if it is not, or the person is not "
                             "travelling, revoke the sessions and reset the password."),
             links=_user_links(s),
+        ))
+    out.extend(_back_at_home(rc, {f.key for f in out}))
+    return out
+
+
+def _back_at_home(rc: RuleContext, already: set[str]) -> list[Finding]:
+    """A device that was judged to have travelled (logged only) is watched: when it signs in from a country the
+    account is usually in while its activity abroad is too recent - or goes on - for any journey, it is in two
+    places after all. The finding about that country is raised then, under the same key."""
+    from . import presence
+
+    watch = timedelta(hours=float(rc.cfg("new_country_background").get("watch_hours", 48)))
+    out, seen = [], set()
+    for s in rc.new:
+        if not (s.success and not s.interactive and s.user_id and s.device_id and s.country) \
+                or presence.device_class(s) == presence.SERVICE or (s.user_id, s.device_id) in seen:
+            continue
+        seen.add((s.user_id, s.device_id))
+        other = _device_elsewhere(rc, s, s.created, s.created)
+        if other is None:
+            continue
+        o, when = other
+        key = f"country-bg|{s.user_id}|{o.country}"
+        began = rc.history.first_use(s.user_id, "country", o.country)
+        home = rc.history.first_use(s.user_id, "country", s.country)
+        if key in already or began is None or rc.now - began > watch or home is None or home >= began:
+            continue  # only a country that is new for the account, left for one it was in before
+        if o.country in rc.history.user_countries(s.user_id, rc.now, True) or not rc.assessor.known_device(o):
+            continue  # signed in by hand there (new_country's alert) / not a device that was judged to have travelled
+        usual = ", ".join(c for c, _ in rc.history.user_countries(s.user_id, began, False).most_common(5))
+        why = f"First activity from {o.country} (usually {usual}), in the background only"
+        a = rc.assessor.assess(o, 25, why)
+        a.factors.append(Factor(0, f"The same device is at home again ({s.location}, {timefmt.stamp(s.created)}) while it "
+                                   f"was active in {o.location} at {timefmt.stamp(when)}: a device is in one place - "
+                                   "its sign-in token may be in use elsewhere (or a VPN, or a carrier's address)"))
+        a.score = max(25, a.score)
+        out.append(_scored(
+            a, key=key, rule_id="new_country_background",
+            title=f"Background activity from new country ({o.country}): {o.who}" + (f" - {a.label}" if a.label else ""),
+            summary=(f"{o.who}: {o.device_name or 'a device'} was active in {o.location} and is at home again sooner than "
+                     f"any journey allows. {why}. Assessment: {a.top_reasons()}."),
+            occurred_at=began,
+            fields={"User": o.who, "Country": o.country, "Usual countries": usual,
+                    "Device": o.device_name or "unidentified device", "IP address": o.ip, "Classification": a.label or "-"},
+            evidence=_evidence([o, s]),
+            recommendation=("Ask the person where the device is. If it never left: revoke the sessions and reset the "
+                            "password - a sign-in token of the account is in use somewhere else."),
+            links=_user_links(o),
         ))
     return out
 
@@ -1299,12 +1424,34 @@ def new_shared_ip(rc: RuleContext) -> list[Finding]:
                      f"Phishing proxies (AiTM) show up like this. Assessment: {a.top_reasons()}."),
             occurred_at=min(x.created for x in rows),
             fields={"IP address": ip, "Accounts": ", ".join(sorted({x.who for x in rows}))[:300]},
+            subjects=sorted({x.upn.lower() for x in rows if x.upn and "@" in x.upn}),
             evidence=_evidence(rows),
             recommendation="If the users are not together (event, hotel, new office link), check each account for "
                            "session theft: revoke sessions and reset passwords.",
             links=[("Entra: sign-in logs", SIGNIN_LOGS_URL), ("Look up IP (AbuseIPDB)", f"https://www.abuseipdb.com/check/{ip}")],
         ))
     return out
+
+
+def device_enrolment(rc: RuleContext) -> list[Finding]:
+    """Corporate device enrolments, proven by the device they produced (worked out before the rules run)."""
+    return list(rc.enrolments)
+
+
+REGISTERED_DEVICE_WINDOW = timedelta(minutes=30)
+
+
+def _registered_device(rc: RuleContext, s: SignIn) -> SignIn | None:
+    """The device a registration sign-in produced: the first sign-in afterwards, in the same operation or session,
+    of a device the account had never used. None when the device has not signed in (yet)."""
+    before = rc.history.user_devices(s.user_id, s.created)
+    for o in sorted(rc.history.query(s.created, s.created + REGISTERED_DEVICE_WINDOW, user_id=s.user_id, success=True),
+                    key=lambda x: x.created):
+        if o.device_id and o.device_id not in before and (
+                (s.correlation_id and o.correlation_id == s.correlation_id)
+                or (s.session_id and o.session_id == s.session_id)):
+            return o
+    return None
 
 
 def sensitive_app(rc: RuleContext) -> list[Finding]:
@@ -1319,6 +1466,9 @@ def sensitive_app(rc: RuleContext) -> list[Finding]:
             what = netintel.SENSITIVE_APPS[s.app_id]
             a = rc.assessor.assess(s, 30, f"First use of {what} by this user (admin / recon tool)")
         elif s.resource_id == netintel.DEVICE_REGISTRATION_RESOURCE:
+            said = rc.registrations.get(s.id)
+            if said is not None and said.kind == registrations.HELLO:
+                continue  # a Windows Hello key on a device that exists: no device was registered (see mfa_change)
             what = "Device registration"
             # (the device that is being registered has no identity yet: that it has none says nothing)
             a = rc.assessor.assess(s, 35, "Registered/joined a device to Entra ID (persistence after phishing)",
@@ -1329,12 +1479,26 @@ def sensitive_app(rc: RuleContext) -> list[Finding]:
     out = []
     for (user, what, day), items in groups.items():
         s, a = _best(items)
+        device = _registered_device(rc, s) if s.resource_id == netintel.DEVICE_REGISTRATION_RESOURCE else None
+        named = (device.device_name or device.device_id) if device else ""
+        device_id = device.device_id if device else ""
+        # what the audit log says was registered (it always names the device; the sign-in log only shows it when
+        # the new device signs in within the same scan)
+        said = next((rc.registrations[x.id] for x, _ in sorted(items, key=lambda i: i[0].id != s.id)
+                     if x.id in rc.registrations and rc.registrations[x.id].kind == registrations.REGISTERED), None)
+        if said is not None:
+            named, device_id = said.device, said.device_id or device_id
         out.append(_scored(
             a, key=f"sensitive|{user}|{what}|{day}", rule_id="sensitive_app",
             title=f"{what}: {s.who}" + (f" ({a.label})" if a.label else ""),
-            summary=(f"{s.who}: {what.lower()} from {s.location} ({s.ip}). Assessment: {a.top_reasons()}."),
+            summary=(f"{s.who}: {what.lower()} from {s.location} ({s.ip})"
+                     + (f" - registered {named}" if named else "")
+                     + (f", which signed in {Assessor._span(device.created - s.created)} later" if device else "")
+                     + f". Assessment: {a.top_reasons()}."),
             occurred_at=min(x.created for x, _ in items),
-            fields={"User": s.who, "Application": s.app, "Resource": s.resource},
+            fields={"User": s.who, "Application": s.app, "Resource": s.resource,
+                    **({"Device": named} if named else {}),
+                    **({linkify.DEVICE_ID_FIELD: device_id} if device_id else {})},
             evidence=_evidence([x for x, _ in items]),
             recommendation="Confirm with the user. Attackers use these tools for reconnaissance and register devices "
                            "to keep access after a phishing attack.",
@@ -1741,7 +1905,7 @@ def mfa_change(rc: RuleContext) -> list[Finding]:
         # 2) what signed in afterwards from a device / network the user had not used before. "Before" ends 12 h
         # ahead of the change: an attacker's own session (phished shortly before he registers his method) must
         # not make his network/browser look familiar.
-        cut = t0 - timedelta(hours=float(cfg.get("baseline_gap_hours", 12)))
+        cut = t0 - timedelta(hours=float(cfg.get("baseline_gap_hours", rc.assessor.familiar_after.total_seconds() / 3600)))
         known_dev, known_asn = rc.history.user_devices(user_id, cut), rc.history.user_asns(user_id, cut)
         known_cli = rc.history.user_clients(user_id, cut)
         later = [s for s in rc.keep(rc.history.query(t0, min(rc.now, t0 + timedelta(hours=24)), user_id=user_id,
@@ -1858,7 +2022,7 @@ def aitm_replay(rc: RuleContext) -> list[Finding]:
         if not anchors:
             continue
         o = anchors[0]  # the MFA that created the session
-        if r.device_id and (r.device_id == o.device_id or r.device_id in rc.history.user_devices(r.user_id, r.created)):
+        if r.device_id and (r.device_id == o.device_id or rc.assessor.known_device(r)):
             continue  # the user's own registered device on another network
         if o.country and r.country and o.country != r.country and (o.device_id or "") != (r.device_id or ""):
             continue  # session_theft reports cross-country pairs with different devices
@@ -1923,7 +2087,7 @@ def unfamiliar_signin(rc: RuleContext) -> list[Finding]:
             continue  # nothing to compare a new account with
         if not _foreign_to_user(rc, s):
             continue
-        if s.client and s.client in h.user_clients(s.user_id, s.created - timedelta(hours=1)):
+        if s.client and s.client in h.user_clients(s.user_id, rc.assessor.familiar_before(s)):
             continue
         if s.country and s.country not in (set(h.user_countries(s.user_id, s.created, True))
                                            | h.user_profile(s.user_id, "country", s.created)):
@@ -2202,7 +2366,7 @@ def hostile_reuse(rc: RuleContext) -> list[Finding]:
             mark = victims.get(s.user_id)
             if mark is not None and (not s.success or s.created <= mark.when):
                 continue  # the sign-ins the address was marked for, and further attempts on that account
-            if s.device_id and s.device_id in rc.history.user_devices(s.user_id, s.created):
+            if rc.assessor.known_device(s):
                 continue
             hits.append(s)
         if not hits:
@@ -2296,4 +2460,7 @@ RULES: list[RuleDef] = [
             device_code),
     RuleDef(Rule("sensitive_app", "Admin tools & device registration",
                  "First use of admin/recon tools or new device registration in a risky context"), sensitive_app),
+    RuleDef(Rule("device_enrolment", "Corporate device enrolments (record only)",
+                 "Sign-ins of the enrolment service are not judged as the user's own when the device they "
+                 "produced is a managed one from the organisation's automated enrolment"), device_enrolment),
 ]

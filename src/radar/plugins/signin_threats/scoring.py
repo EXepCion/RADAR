@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from ... import timefmt
 from ...plugin_api import Severity
 from . import netintel
 from .models import SignIn
@@ -38,6 +39,15 @@ LABEL_HABITUAL_VPN = "user's habitual VPN"
 HABIT_MIN_DAYS = 3
 HABIT_MIN_SIGNINS = 3
 HABIT_MIN_VPN_DAYS = 3
+# A device, network or Authenticator counts as the account's own only once it has been in use for this long.
+# What turned up moments ago cannot vouch for what follows it: an attacker who registers a device signs in with
+# it seconds later, from the network he registered it from (setting: scoring > familiar_after_hours). A network
+# is the exception when a device that IS the account's own used it (Assessor.asns).
+FAMILIAR_AFTER_HOURS = 12
+# A device that is old enough but was never seen where the account otherwise is (see Assessor._vouched) becomes the
+# account's own after this many days all the same: a phone that only ever uses mobile data is no stranger for ever
+# (setting: scoring > unvouched_after_days).
+UNVOUCHED_AFTER_DAYS = 14
 LABEL_UNKNOWN_DEVICE = "unknown device"
 
 
@@ -81,6 +91,16 @@ class Assessor:
         self.trusted_asns = {int(a) for a in cfg.get("trusted_asns", []) if str(a).isdigit()}
         self.ua_re = netintel.compile_user_agents(cfg.get("suspicious_user_agents"))
         self.resolver = rc.asn_resolver  # AS number -> registered holder name (optional, cached)
+        try:
+            hours = float(cfg.get("familiar_after_hours", FAMILIAR_AFTER_HOURS))
+        except (TypeError, ValueError):
+            hours = FAMILIAR_AFTER_HOURS
+        self.familiar_after = timedelta(hours=max(0.0, hours))
+        try:
+            days = float(cfg.get("unvouched_after_days", UNVOUCHED_AFTER_DAYS))
+        except (TypeError, ValueError):
+            days = UNVOUCHED_AFTER_DAYS
+        self.unvouched_after = max(self.familiar_after, timedelta(days=max(0.0, days)))
         self._cache: dict[tuple, object] = {}
 
     # ----------------------------------------------------------- helpers
@@ -129,6 +149,76 @@ class Assessor:
                 return o
         return None
 
+    # --------------------------------------------- what the account knows
+    def familiar_before(self, s: SignIn):
+        """What the account used before this moment is its own at the time of ``s`` (see FAMILIAR_AFTER_HOURS)."""
+        return s.created - self.familiar_after
+
+    def devices(self, s: SignIn) -> set[str]:
+        """Devices that are the account's own: in use for long enough AND seen where the account is otherwise
+        (see _vouched) - a device registered through a datacenter and only ever used from there stays a stranger."""
+        def find() -> set[str]:
+            aged = self.rc.history.user_devices(s.user_id, self.familiar_before(s))
+            return {d for d in aged if self._vouched(s.user_id, d, s.created)}
+        return self._cached(("udev", s.user_id, s.created), find)
+
+    def _vouched(self, user_id: str, device_id: str, at) -> bool:
+        """Does something else speak for this device? It was used on an office network, on a network the account
+        knew before the device appeared, or on one an older device of the account uses. The first devices of an
+        account need nobody: there is nothing older to compare them with. Nor does a device that has been in use
+        for weeks (UNVOUCHED_AFTER_DAYS)."""
+        h = self.rc.history
+        first = h.first_use(user_id, "device", device_id)
+        if first is None:
+            return False
+        began = h.user_first_seen(user_id)
+        before_it = first - self.familiar_after
+        if began is None or began > before_it or first <= at - self.unvouched_after:
+            return True
+        runs = self._cached(("runs", user_id), lambda: h.activity(self.rc.now - timedelta(days=31), self.rc.now, user_id))
+        older = h.user_devices(user_id, before_it)
+        mine, others = set(), set()
+        for o, begin, _end, _n in runs:
+            if begin >= at:
+                continue
+            if o.device_id == device_id:
+                if self.rc.trusted(o):
+                    return True
+                mine.add(o.asn)
+            elif o.device_id in older:
+                others.add(o.asn)
+        mine.discard(None)
+        return bool(mine & (h.user_asns(user_id, before_it) | others))
+
+    def asns(self, s: SignIn) -> set[int]:
+        """Networks that are the account's own: in use for long enough, or new but used by a device that is the
+        account's own - the phone on a hotel's Wi-Fi makes that network the user's at once. Not by age alone: a
+        network on which a device nobody vouches for is at work and none of the account's own (a stranger's
+        datacenter with the device he registered, however long he stays)."""
+        def find() -> set[int]:
+            h, cut = self.rc.history, self.familiar_before(s)
+            aged = h.user_asns(s.user_id, cut)
+            devices = self.devices(s)
+            runs = self._cached(("runs", s.user_id), lambda: h.activity(self.rc.now - timedelta(days=31), self.rc.now, s.user_id))
+            own, strangers = set(), set()
+            for o, begin, _end, _n in runs:
+                if not o.asn or begin >= s.created:
+                    continue
+                if o.device_id in devices or self.rc.trusted(o):
+                    own.add(o.asn)
+                elif o.device_id:
+                    strangers.add(o.asn)
+            return (aged - (strangers - own)) | own
+        return self._cached(("uasn", s.user_id, s.created), find)
+
+    def known_device(self, s: SignIn) -> bool:
+        return bool(s.device_id) and s.device_id in self.devices(s)
+
+    @staticmethod
+    def _span(delta: timedelta) -> str:
+        minutes = delta.total_seconds() / 60
+        return "less than a minute" if minutes < 1 else f"{int(minutes)} min" if minutes < 60 else f"{int(minutes // 60)} h"
+
     # ------------------------------------------------------------ assess
     def assess(self, s: SignIn, base: int, base_reason: str, extra: list[Factor] | None = None,
                floor: int = 0, covers: tuple[str, ...] = (), office: tuple[int, str] | None = None,
@@ -174,11 +264,11 @@ class Assessor:
         if s.asn and not trusted:
             stats = self._cached(("ustat", s.user_id, s.asn), lambda: h.user_network_stats(s.user_id, s.asn))
             habitual = bool(stats and stats[0] <= s.created - timedelta(days=HABIT_MIN_DAYS)
-                            and stats[1] >= HABIT_MIN_SIGNINS)
+                            and stats[1] >= HABIT_MIN_SIGNINS and s.asn in self.asns(s))
             if habitual:
                 f.append(Factor(-15, f"Habitual network of the user ({self.asn_label(s.asn)}: {stats[1]} sign-ins "
                                      f"since {stats[0]:%d.%m.})"))
-            elif s.asn in self._cached(("uasn", s.user_id, s.created), lambda: h.user_asns(s.user_id, s.created)):
+            elif s.asn in self.asns(s):
                 f.append(Factor(-10, f"User's usual network ({self.asn_label(s.asn)})"))
             else:
                 peers = self._cached(("asnp", s.asn, s.user_id), lambda: h.asn_user_count(s.asn, s.created, s.user_id))
@@ -189,30 +279,37 @@ class Assessor:
 
         # --- an address an attacker demonstrably used, known from another finding (indicators.py)
         mark = rc.hostile(s) if hasattr(rc, "hostile") else None
-        if mark and not trusted and not (s.device_id and s.device_id in self._cached(
-                ("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))):
+        if mark and not trusted and not self.known_device(s):
             f.append(Factor(mark.points, f"Known attacker address: used in {mark.describe()}"))
         elif not mark and not trusted and s.asn and hasattr(rc, "hostile_network"):
             # a network that only ever guesses passwords here (indicators.derive_networks) - counted for what got
             # past the password from it, on no device and no network the account knows
             net_mark = rc.hostile_network(s)
-            if net_mark and self._past_password(s) and not (s.device_id and s.device_id in self._cached(
-                    ("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))) \
-                    and s.asn not in self._cached(("uasn", s.user_id, s.created), lambda: h.user_asns(s.user_id, s.created)) \
+            if net_mark and self._past_password(s) and not self.known_device(s) \
+                    and s.asn not in self.asns(s) \
                     and not h.asn_user_count(s.asn, s.created, s.user_id):
                 f.append(Factor(net_mark.points, f"Network that only guesses passwords here: {net_mark.describe()}"))
 
         # --- device
+        known = self.known_device(s)
         if s.device_id:
-            known = s.device_id in self._cached(("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))
             if known:
                 f.append(Factor(-20, f"Known device of the user ({s.device_name or s.device_id[:8]})"))
             if s.corp_device:
                 f.append(Factor(-15, f"Company-managed device ({', '.join(p for p in (s.trust_type, 'compliant' if s.compliant else '') if p)})"))
             elif not known:
-                f.append(Factor(5, f"Device not seen before for this user ({s.trust_type or 'unmanaged'})"))
+                first = h.first_use(s.user_id, "device", s.device_id) if s.user_id else None
+                if first and first < self.familiar_before(s):  # old enough, but nothing else speaks for it
+                    f.append(Factor(5, f"Device in use since {timefmt.stamp(first)} ({s.trust_type or 'unmanaged'}), but "
+                                       "only on networks the account does not otherwise use: nothing vouches for it"))
+                elif first and first < s.created:  # there, but only just: it cannot vouch for this sign-in yet
+                    f.append(Factor(5, f"Device first used by this account {self._span(s.created - first)} before "
+                                       f"({s.trust_type or 'unmanaged'}) - too new to count as the user's own"))
+                else:
+                    f.append(Factor(5, f"Device not seen before for this user ({s.trust_type or 'unmanaged'})"))
         elif "device_identity" not in covers:
-            usual_devices = self._cached(("udev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))
+            # (whether the account has registered devices at all: any device counts, however new)
+            usual_devices = self._cached(("anydev", s.user_id, s.created), lambda: h.user_devices(s.user_id, s.created))
             if usual_devices:
                 f.append(Factor(10, "No device identity although the user normally signs in with registered devices"))
             elif acct and acct.mfa_excluded:
@@ -222,7 +319,7 @@ class Assessor:
         if s.client and not (s.device_id and s.corp_device):
             # unmanaged devices: the same OS + browser family the user already used is a weak "same person" signal
             clients = self._cached(("ucli", s.user_id, s.created),
-                                   lambda: h.user_clients(s.user_id, s.created - timedelta(hours=1)))
+                                   lambda: h.user_clients(s.user_id, self.familiar_before(s)))
             if s.client in clients:
                 f.append(Factor(-10, f"Known client of the user ({s.client.replace('|', ', ')})"))
             elif clients:
@@ -231,7 +328,7 @@ class Assessor:
         # --- which Authenticator approved the MFA (only meaningful when the sign-in succeeded)
         if s.success and s.mfa_device_id and s.user_id:
             approvers = self._cached(("umfadev", s.user_id, s.created),
-                                     lambda: h.user_profile(s.user_id, "mfadev", s.created))
+                                     lambda: h.user_profile(s.user_id, "mfadev", self.familiar_before(s)))
             if s.mfa_device_id in approvers:
                 f.append(Factor(-10, "MFA approved on the user's usual Authenticator device"))
             elif approvers:
@@ -239,7 +336,8 @@ class Assessor:
                                     f"({s.mfa_device_os or 'unknown OS'}) - newly registered by someone else?"))
 
         # --- authentication
-        if s.prt:
+        if s.prt and (known or s.corp_device or not s.device_id):
+            # (the token is bound to the device: it says as much as the device does - nothing, when that is new)
             f.append(Factor(-10, "Device-bound SSO token (Primary Refresh Token)"))
         if s.phishing_resistant:
             f.append(Factor(-15, "Phishing-resistant authentication (" + ", ".join(s.auth_methods) + ")"))
@@ -303,6 +401,7 @@ class Assessor:
                 else LABEL_VPN
         if s.device_id and ("known device" in texts or s.corp_device):
             return LABEL_TRAVEL
-        if not s.device_id or "device not seen before" in texts:
+        if not s.device_id or "device not seen before" in texts or "device first used by this account" in texts \
+                or "nothing vouches for it" in texts:
             return LABEL_UNKNOWN_DEVICE
         return ""

@@ -133,7 +133,7 @@ def test_incident_window_shows_the_story_and_dismisses_it_as_one(root):
         # the first incident is selected: its alerts in order, the cross-account chain among them
         steps = [(win.steps.set(i, "Stage"), win.steps.set(i, "Severity")) for i in win.steps.get_children("")]
         assert steps == [("Summary", "High"), ("Password known", "High"), ("Persistence", "Low")]   # what sums it up, then
-        assert win.steps.heading("Time", "text").endswith("\u25b2")                                    # as it happened
+        assert win.steps.heading("State", "text").endswith("\u25b2")                                    # what needs a look first
         # the chosen incident: who, how bad and how open is said once, in the list - the right side does not repeat it,
         # an arrowhead at the height of the selected incident shows whose it is
         root.update()
@@ -346,8 +346,9 @@ def test_an_incident_has_a_window_of_its_own_with_the_same_summary_and_the_reaso
         win.step_sort("Severity")                                               # a click on a header: by that column
         assert [win.steps.set(i, "Severity") for i in win.steps.get_children("")] == ["Low", "High", "High"]
         win.step_sort("Time")
-        # the strongest finding is selected to begin with: why it is rated as it is, every reason with its points
-        assert win._why_full == f"password_not_completed: {ANNA}" and not win.why_title.winfo_ismapped()   # no title of its own:
+        # the first row is selected to begin with - here what sums the incident up: why it is rated as it is
+        assert win.steps.selection() == (win.steps.get_children("")[0],)
+        assert win._why_full.startswith("Attack across 2 accounts") and not win.why_title.winfo_ismapped()   # no title of its own:
         assert "Risk assessment" in win.reasons.get("1.0", "end")
         # shown, not said, that the assessment is the selected alert's: an arrowhead at the height of its row
         rows = win.steps.get_children("")
@@ -441,6 +442,9 @@ def test_the_risk_assessment_in_an_incidents_window_is_the_card_of_the_alerts_de
             body = text.get(start, "end").split("Open in Entra")[0]
             return [line.strip() for line in body.splitlines() if line.strip()]
 
+        win.steps.selection_set(str(stored.id))                                          # the same alert in both windows
+        win._step_selected()
+        root.update()
         details.risk.set_score(stored.score)                                             # (its count-up animation, finished)
         assert shown(win.reasons) == shown(details.side_text)                            # the same words, line by line
         assert shown(win.reasons)[1].startswith("75  / 100") and "+65" in shown(win.reasons)[2]
@@ -514,3 +518,89 @@ def test_a_time_and_its_zone_are_never_put_on_two_lines(root):
     for width in range(60, 400, 7):
         for line in clamp(text, theme.FONT, width, 3, root).split(chr(10)):
             assert not line.startswith("UTC"), (width, line)
+
+
+# ------------------------------------------------------------- the order of an incident's alerts
+def _mixed_incident():
+    """An account with something old that was dismissed, a record, a snoozed alert and two open ones - with a chain."""
+    ac = center(alert("old", "new_country", 50, 9), alert("record", "device_registration", 30, 3, signal="device_registered"),
+                alert("pw", "password_not_completed", 60, 2), alert("later", "mfa_change", 45, 1),
+                alert("snoozed", "risky_signin", 50, 1.5), chain=False)
+    by = {a.key: a.id for a in ac.since(NOW - timedelta(days=31))}
+    ac.dismiss([by["old"]])
+    ac.snooze([by["snoozed"]], 600)
+    recent = ac.since(NOW - timedelta(days=31))
+    ac.ingest(chains.CHAIN_PLUGIN, chains.chain_findings(recent, NOW) + chains.spread_findings(recent, NOW))
+    return ac
+
+
+def test_an_incidents_alerts_come_in_the_order_of_what_still_needs_a_look():
+    """Open first - the summary, then what it sums up in the order it happened -, then snoozed, dismissed, and what
+    was only logged. Not by time alone: that put a ten days old dismissed alert on top and the open ones last."""
+    from radar.ui.incidents import step_rows
+
+    inc = next(i for i in grouped(_mixed_incident()) if len(i.alerts) >= 5)
+    rows = [(row[3], row[2], a.key.split("|")[0]) for a, row in step_rows(inc)]
+    assert [state for state, _kind, _key in rows] == ["open", "open", "open", "snoozed", "dismissed", "logged only"]
+    assert rows[0][1] == "Summary"
+    assert [key for _s, _k, key in rows[1:3]] == ["pw", "later"]          # in the order it happened
+    assert [key for _s, _k, key in rows[3:]] == ["snoozed", "old", "record"]
+
+
+def test_the_state_column_sorts_by_what_needs_a_look_not_by_the_alphabet():
+    from radar.ui.tables import sort_key
+
+    states = ["logged only", "dismissed", "open", "snoozed"]
+    assert sorted(states, key=sort_key) == ["open", "snoozed", "dismissed", "logged only"]
+
+
+def test_both_incident_tables_open_in_that_order_and_a_header_still_sorts(root):
+    from radar.ui.incident import IncidentWindow
+    from radar.ui.incidents import IncidentsWindow
+
+    class App:
+        def __init__(self):
+            self.alerts = _mixed_incident()
+
+        def open_alert(self, a):
+            pass
+
+        def on_alerts_dismissed(self):
+            pass
+
+    app = App()
+    inc = next(i for i in grouped(app.alerts) if len(i.alerts) >= 5)
+    expected = ["open", "open", "open", "snoozed", "dismissed", "logged only"]
+    one = IncidentWindow(root, app, inc)
+    try:
+        root.update()
+        steps = one.steps
+        assert [steps.set(i, "State") for i in steps.get_children("")] == expected
+        assert steps.set(steps.get_children("")[0], "Stage") == "Summary"
+        assert steps.heading("State", "text").endswith("▲") and steps.heading("Time", "text") == "Time"
+        # the first row is the one selected to begin with - whatever the order puts on top, nothing to work out
+        assert steps.selection() == (steps.get_children("")[0],)
+        assert one._why_full.startswith("Possible attack chain")              # ... and its reasons are shown
+        one.step_sort("Time")                                                  # a click on a header: by that column
+        times = [steps.set(i, "Time") for i in steps.get_children("")]
+        assert times == sorted(times)
+        one.step_sort("State")                                                 # and back
+        assert [steps.set(i, "State") for i in steps.get_children("")] == expected
+        steps.selection_set(steps.get_children("")[2])                         # what the user chose stays chosen
+        chosen = steps.selection()
+        one.refresh()                                                          # after a scan: the same order
+        root.update()
+        assert [steps.set(i, "State") for i in steps.get_children("")] == expected
+        assert steps.selection() == chosen
+    finally:
+        one.top.destroy()
+    every = IncidentsWindow(root, app)
+    try:
+        root.update()
+        every.tree.selection_set(next(i for i in every.tree.get_children("") if len(every._incidents[i].alerts) >= 5))
+        root.update()
+        assert [every.steps.set(i, "State") for i in every.steps.get_children("")] == expected
+        assert every.steps.heading("State", "text").endswith("▲")
+        assert every.steps.selection() == ()   # in the overview nothing is chosen: "Open" there means the incident
+    finally:
+        every.top.destroy()

@@ -9,6 +9,8 @@ ASC, DESC = " ▲", " ▼"
 _NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _SEVERITY = re.compile(r"(info|low|medium|high)(?:\s*\u00b7\s*(\d+))?", re.IGNORECASE)  # "High" or "High, with its score"
 _RANK = {"info": 0, "low": 1, "medium": 2, "high": 3}
+#: the states of an alert, by how much they still ask of the reader - not by the alphabet
+STATE_ORDER = {"open": 0, "snoozed": 1, "dismissed": 2, "logged only": 3}
 
 
 def sort_key(value: str) -> tuple:
@@ -17,6 +19,8 @@ def sort_key(value: str) -> tuple:
     level = _SEVERITY.fullmatch(text)
     if level:  # by how bad, then by the risk score - not by the alphabet
         return (0, _RANK[level.group(1).lower()] * 1000.0 + float(level.group(2) or 0), "")
+    if text.lower() in STATE_ORDER:
+        return (0, float(STATE_ORDER[text.lower()]), "")
     compact = text.replace("'", "").replace(",", "").replace(" ", "")
     if _NUMBER.fullmatch(compact):
         return (0, float(compact), "")
@@ -24,14 +28,18 @@ def sort_key(value: str) -> tuple:
 
 
 def make_sortable(tree: ttk.Treeview, columns: list[str], labels: dict[str, str] | None = None) -> Callable[[str], None]:
-    """Make every column header sortable. Returns the sort function (column -> None), e.g. for tests."""
+    """Make every column header sortable. Returns the sort function (column -> None), e.g. for tests.
+    Rows that are equal in the column keep the order they had (the order they were filled in, to begin with)."""
     labels = labels or {}
     state = {"col": None, "desc": False}
 
     def sort(col: str) -> None:
         desc = state["col"] == col and not state["desc"]
         items = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
-        items.sort(key=lambda x: sort_key(x[0]), reverse=desc)
+        # (reversed by hand: equal rows keep their order in both directions)
+        keys = sorted({sort_key(v) for v, _ in items}, reverse=desc)
+        rank = {k: n for n, k in enumerate(keys)}
+        items.sort(key=lambda x: rank[sort_key(x[0])])
         for index, (_, iid) in enumerate(items):
             tree.move(iid, "", index)
         state.update(col=col, desc=desc)

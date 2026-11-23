@@ -31,6 +31,7 @@ class Entity:
     value: str
     start: int = 0
     end: int = 0
+    ref: str = ""  # the object's id, when the text shown is only its name: what it is looked up by
 
     @property
     def short(self) -> str:
@@ -63,6 +64,10 @@ NAME_FIELD_KINDS = {
     "delegated permissions": "permission", "step": "alert", "correlated with": "alert", "related signals": "alert",
     "partner": "partner", "policy": "policy",
 }
+#: Fields whose name starts with this are not shown: they say nothing new, they make a link exact.
+HIDDEN_PREFIX = "_"
+#: the id of the device named in the same fields / row (several devices can share a name)
+DEVICE_ID_FIELD = "_Device ID"
 _NOT_NAMES = {"", "-", "unknown", "(blank)", "none", "n/a", "all users", "one user", "yes", "no"}
 
 
@@ -95,8 +100,17 @@ def _name_tokens(text: str, kind: str) -> list[Entity]:
     return out
 
 
-def find_entities(text: str, field: str = "") -> list[Entity]:
-    """Clickable entities in ``text`` (a value of ``field``), sorted by position and not overlapping."""
+def find_entities(text: str, field: str = "", context: dict | None = None) -> list[Entity]:
+    """Clickable entities in ``text`` (a value of ``field``), sorted by position and not overlapping.
+    ``context``: the fields / row the value stands in - a device named there is looked up by the id given there."""
+    found = _find_entities(text, field)
+    device_id = str((context or {}).get(DEVICE_ID_FIELD) or "").strip()
+    if device_id and sum(e.kind == "device" for e in found) == 1:
+        found = [Entity(e.kind, e.value, e.start, e.end, device_id) if e.kind == "device" else e for e in found]
+    return found
+
+
+def _find_entities(text: str, field: str = "") -> list[Entity]:
     text = str(text or "")
     f = _norm(field)
     if f in WHOLE_VALUE_KINDS:
