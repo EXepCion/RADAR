@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from ... import timefmt
+import dataclasses
 import json
 from datetime import datetime, timedelta
 from typing import Any
 
 from ... import tenant_settings
 from ...graph import GraphError
-from ...plugin_api import Finding, Plugin, PluginContext, Rule
+from ...plugin_api import Finding, Plugin, PluginContext, Rule, StagedState
 from . import apps, enrolment, indicators, netintel, overview, registrations, rules
 from .accounts import AccountDirectory, sync_directory
 from .asnames import AsnNameResolver
@@ -130,6 +131,35 @@ class SignInThreatsPlugin(Plugin):
 
     # ---------------------------------------------------------------- run
     def run(self, ctx: PluginContext) -> list[Finding]:
+        """One scan. Nothing it reads is lost when it is stopped, crashes or fails: the sign-ins it stores wait as
+        "unjudged" and its bookmarks are held back (StagedState) until the findings are in the alert store
+        (``ctx.when_delivered``). A scan that could not judge everything commits nothing - the next one reads
+        from the same place and judges what waits, again and again until it works."""
+        staged = StagedState(ctx.state, direct=("asn_names",))  # (network names looked up are kept either way)
+        inner = dataclasses.replace(ctx, state=staged)  # (the same lists: incomplete, what waits for delivery)
+        judged: list[str] = []
+        apps_seen: list[tuple[str, float]] = []
+        findings = self._scan(inner, judged, apps_seen)
+        if ctx.incomplete:
+            ctx.log.warning("The scan could not judge everything (%s): nothing is ticked off, the next scan judges it again",
+                            "; ".join(ctx.incomplete)[:300])
+            return findings
+        path = ctx.data_dir / "signins.db"
+
+        def done() -> None:
+            history = SignInHistory(path)
+            try:
+                history.judged(judged)
+                if apps_seen:
+                    apps.AppStore(history.conn).remember(apps_seen)
+            finally:
+                history.close()
+            staged.commit()
+
+        ctx.when_delivered(done)
+        return findings
+
+    def _scan(self, ctx: PluginContext, judged: list[str], apps_seen: list[tuple[str, float]]) -> list[Finding]:
         if "rule_notes" not in self.__dict__:
             self.rule_notes = {}
         s = ctx.settings
@@ -159,18 +189,23 @@ class SignInThreatsPlugin(Plugin):
             self._refresh_incomplete(ctx, history, now)
             report_off = self._report_setting(ctx, now, force=full) == tenant_settings.OFF
             self._ingest_changes(ctx, history, now, reports=ctx.rule_enabled("mfa_report") and not report_off)
-            history.purge(now - timedelta(days=float(s.get("retention_days", 30))),
-                          now - timedelta(hours=float(s.get("non_interactive_retention_hours", 3))))
+            # what is judged: everything stored and not judged yet - this scan's new sign-ins, and what a scan
+            # before this one stored and did not get to (it was stopped, it failed)
+            keys, new = history.pending()
+            judged.extend(keys)
 
             settled = self._settle_enrolments(ctx, history, new, now)
             new = settled.new
             scoring = s.get("scoring") if isinstance(s.get("scoring"), dict) else {}
             resolver = AsnNameResolver(ctx.state, enabled=bool(scoring.get("lookup_asn_names", True)))
+            # sign-ins to the registration service wait until it is known what they were (registrations.py)
+            named = self._registrations(ctx, history, new, now)
+            there = {x.id for x in new}
+            new = [x for x in new if x.id not in named.hold] + [x for x in named.release if x.id not in there]
             rc = RuleContext.build(new, history, s, now, enabled_rules=ctx.enabled_rules, asn_resolver=resolver,
-                                   accounts=accounts, excluded=settled.excluded)
+                                   accounts=accounts, excluded=set(settled.excluded) | named.hold)
             rc.learning = frozenset(learning)
             rc.enrolments = settled.records
-            named = self._registrations(ctx, history, new, now)
             rc.registrations = named.matches
             findings: list[Finding] = []
             for rule in RULES:
@@ -179,17 +214,9 @@ class SignInThreatsPlugin(Plugin):
                     continue
                 try:
                     findings.extend(rule.evaluate(rc))
-                except Exception:
+                except Exception as exc:
                     ctx.log.exception("Rule %s failed", rule.meta.id)
-            if named.again and ctx.rule_enabled("sensitive_app"):
-                # judged in an earlier scan, before the audit log said which device: the same alert, now with it
-                try:
-                    late = RuleContext.build(named.again, history, s, now, enabled_rules=ctx.enabled_rules,
-                                             asn_resolver=resolver, accounts=accounts, excluded=settled.excluded)
-                    late.registrations = named.matches
-                    findings.extend(f for f in rules.sensitive_app(late) if "Device" in f.fields)
-                except Exception:
-                    ctx.log.exception("Registered devices could not be added to their alerts")
+                    ctx.incomplete.append(f"the rule '{rule.meta.name}' ({rule.meta.id}) failed: {type(exc).__name__}: {exc}"[:200])
             try:  # what these findings prove about attacker addresses is remembered and used from here on
                 marked = indicators.apply(rc, findings, reuse=ctx.rule_enabled("hostile_reuse"))
                 if marked:
@@ -200,8 +227,12 @@ class SignInThreatsPlugin(Plugin):
             findings = rules.fold_same_signin(findings)  # one sign-in, one alert
             resolver.save()
             if ctx.rule_enabled("app_signins"):
-                findings.extend(self._app_signins(ctx, history, now))
+                findings.extend(self._app_signins(ctx, history, now, apps_seen))
             ctx.state.set(DATA_AS_OF, now.isoformat())  # the sign-in history is complete up to here
+            # (cleared after the rules: a background record read late is judged before it goes; what still waits
+            # to be judged is never cleared)
+            history.purge(now - timedelta(days=float(s.get("retention_days", 30))),
+                          now - timedelta(hours=float(s.get("non_interactive_retention_hours", 3))))
             self._compact(ctx, history, now)
             status = f"{fetched:,} sign-ins fetched, {len(new):,} new, {len(findings)} finding(s)"
             ctx.log.info(status + f" (history {history.count():,})")
@@ -276,7 +307,7 @@ class SignInThreatsPlugin(Plugin):
             ctx.check_cancelled()
             rows = [SignIn.from_graph(r, event_type) for r in page]
             fetched += len(rows)
-            inserted = history.add(rows)
+            inserted = history.add(rows, unjudged=True, since=new_cutoff)  # (older: the baseline, nothing to judge)
             fresh.extend(x for x in inserted if new_cutoff is None or x.created >= new_cutoff)
             for r in rows:
                 if newest is None or r.created > newest:
@@ -327,7 +358,7 @@ class SignInThreatsPlugin(Plugin):
                 rows = [SignIn.from_graph(r, event_type) for r in page]
                 pages += 1
                 fetched += len(rows)
-                fresh.extend(history.add(rows))
+                fresh.extend(history.add(rows, unjudged=True))
                 for r in rows:
                     if oldest is None or r.created < oldest:
                         oldest = r.created
@@ -400,7 +431,8 @@ class SignInThreatsPlugin(Plugin):
         rows = ctx.graph.get("/beta/auditLogs/signIns", {"$filter": flt}).get("value", [])
         return rows[0] if rows else None
 
-    def _app_signins(self, ctx: PluginContext, history: SignInHistory, now: datetime) -> list[Finding]:
+    def _app_signins(self, ctx: PluginContext, history: SignInHistory, now: datetime,
+                     seen: list[tuple[str, float]] | None = None) -> list[Finding]:
         """Service-principal sign-ins: judged against each app's baseline (see apps.py); errors never block the scan."""
         store = apps.AppStore(history.conn)
         key = "checkpoint:servicePrincipal"
@@ -423,7 +455,10 @@ class SignInThreatsPlugin(Plugin):
         except Exception as exc:
             ctx.log.warning("App sign-ins not readable: %s", exc)
             return []
-        fresh = store.new_rows(rows)
+        # (ticked off as seen only when their findings are delivered - see run)
+        fresh = store.new_rows(rows, remember=seen is None)
+        if seen is not None:
+            seen.extend((r.id, r.created.timestamp()) for r in fresh)
         findings = apps.app_findings(store, fresh, now)
         store.purge(now)
         newest = max((r.created for r in rows), default=None)
@@ -573,6 +608,16 @@ class SignInThreatsPlugin(Plugin):
             ctx.log.info("Re-read %d incomplete sign-in record(s), %d completed by Entra since", len(rows),
                          history.enriched - before)
 
+    @staticmethod
+    def _directory_device(ctx: PluginContext, device_id: str) -> dict | None:
+        """The directory's record of a device (what says whether it is the organisation's own), or None."""
+        if not enrolment.GUID.match(device_id):
+            return None
+        data = ctx.graph.get("/v1.0/devices", {"$filter": f"deviceId eq '{device_id}'",
+                                               "$select": enrolment.DEVICE_SELECT})
+        values = (data or {}).get("value") or []
+        return values[0] if values else None
+
     # ----------------------------------------------------- registrations
     def _registrations(self, ctx: PluginContext, history: SignInHistory, new: list[SignIn],
                        now: datetime) -> "registrations.Outcome":
@@ -590,9 +635,16 @@ class SignInThreatsPlugin(Plugin):
                 found.extend(page)
             return found
 
+        cfg = ctx.settings.get(enrolment.RULE_ID) if isinstance(ctx.settings.get(enrolment.RULE_ID), dict) else {}
+        types = [str(t) for t in (cfg.get("corporate_types") or enrolment.CORPORATE_TYPES)]
+        try:
+            wait = timedelta(minutes=max(1.0, float(cfg.get("wait_minutes", 30))))
+        except (TypeError, ValueError):
+            wait = registrations.WAIT
         try:
             state = ctx.state.get(REGISTRATION_STATE)
-            out = registrations.settle(new, history, state if isinstance(state, dict) else {}, now, entries)
+            out = registrations.settle(new, history, state if isinstance(state, dict) else {}, now, entries,
+                                       lambda device_id: self._directory_device(ctx, device_id), types, wait)
             if out.state != (state or {}):
                 ctx.state.set(REGISTRATION_STATE, out.state)
             return out
@@ -626,12 +678,7 @@ class SignInThreatsPlugin(Plugin):
             return found
 
         def device(device_id: str) -> dict | None:
-            if not enrolment.GUID.match(device_id):
-                return None
-            data = ctx.graph.get("/v1.0/devices", {"$filter": f"deviceId eq '{device_id}'",
-                                                   "$select": enrolment.DEVICE_SELECT})
-            values = (data or {}).get("value") or []
-            return values[0] if values else None
+            return self._directory_device(ctx, device_id)
 
         try:
             state = ctx.state.get(ENROLMENT_STATE)

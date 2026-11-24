@@ -117,6 +117,41 @@ class PluginState:
         self._store.kv_delete(self._ns)
 
 
+class StagedState:
+    """A plugin's state for the time of one scan: what the scan writes is held back until :meth:`commit` - which
+    happens when the scan's findings are in the alert store. A scan that is stopped, crashes or fails leaves the
+    state as it was, so the next scan reads again from where the last complete one ended."""
+
+    _GONE = object()
+
+    def __init__(self, state: PluginState, direct: tuple[str, ...] = ()):
+        self._state = state
+        self._held: dict[str, Any] = {}
+        self._direct = set(direct)  # keys written at once: what was looked up (a cache), no bookmark
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._held:
+            return default if self._held[key] is self._GONE else self._held[key]
+        return self._state.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        if key in self._direct:
+            self._state.set(key, value)
+        else:
+            self._held[key] = value
+
+    def delete(self, key: str) -> None:
+        self._held[key] = self._GONE
+
+    def commit(self) -> None:
+        for key, value in self._held.items():
+            if value is self._GONE:
+                self._state.delete(key)
+            else:
+                self._state.set(key, value)
+        self._held = {}
+
+
 @dataclass
 class PluginContext:
     """Everything a plugin may use while running."""
@@ -130,6 +165,27 @@ class PluginContext:
     log: logging.Logger
     stop_event: threading.Event = field(default_factory=threading.Event)
     status_callback: Callable[[str], None] | None = None
+    #: the caller stores the findings itself and then calls :meth:`delivered` (the app does); otherwise what a
+    #: plugin wants done "when delivered" is done at once
+    defer: bool = False
+    #: why this scan could not judge everything (a rule that failed ...): nothing is committed, the next scan
+    #: judges it again
+    incomplete: list[str] = field(default_factory=list)
+    _after: list[Callable[[], None]] = field(default_factory=list, repr=False)
+
+    def when_delivered(self, action: Callable[[], None]) -> None:
+        """Do ``action`` once this scan's findings are in the alert store: moving a bookmark, forgetting what
+        was waiting to be judged. A bookmark that moved before that would lose what lies behind it."""
+        if self.defer:
+            self._after.append(action)
+        else:
+            action()
+
+    def delivered(self) -> None:
+        """The findings are stored: do what was waiting for that."""
+        actions, self._after[:] = list(self._after), []
+        for action in actions:
+            action()
 
     def rule_enabled(self, rule_id: str) -> bool:
         return rule_id in self.enabled_rules

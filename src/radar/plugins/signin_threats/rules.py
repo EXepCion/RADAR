@@ -1470,9 +1470,13 @@ def sensitive_app(rc: RuleContext) -> list[Finding]:
             if said is not None and said.kind == registrations.HELLO:
                 continue  # a Windows Hello key on a device that exists: no device was registered (see mfa_change)
             what = "Device registration"
+            # a device the directory knows as the organisation's own (registered for Autopilot, enrolled through
+            # Apple's programme, managed) is a company device being set up: nothing an attacker could bring
+            own = [Factor(-35, f"The registered device is the organisation's own ({said.proof}): managed, and "
+                               "enrolled through its own programme")] if said is not None and said.proof else None
             # (the device that is being registered has no identity yet: that it has none says nothing)
             a = rc.assessor.assess(s, 35, "Registered/joined a device to Entra ID (persistence after phishing)",
-                                   covers=("device_identity",))
+                                   own, covers=("device_identity",))
         else:
             continue
         groups[(s.user_id, what, _day(s.created))].append((s, a))
@@ -1498,7 +1502,8 @@ def sensitive_app(rc: RuleContext) -> list[Finding]:
             occurred_at=min(x.created for x, _ in items),
             fields={"User": s.who, "Application": s.app, "Resource": s.resource,
                     **({"Device": named} if named else {}),
-                    **({linkify.DEVICE_ID_FIELD: device_id} if device_id else {})},
+                    **({linkify.DEVICE_ID_FIELD: device_id} if device_id else {}),
+                    **({"Enrolment": said.proof} if said is not None and said.proof else {})},
             evidence=_evidence([x for x, _ in items]),
             recommendation="Confirm with the user. Attackers use these tools for reconnaissance and register devices "
                            "to keep access after a phishing attack.",

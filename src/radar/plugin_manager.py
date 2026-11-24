@@ -57,6 +57,7 @@ class PluginManager:
         self._stop = stop_event
         self._builtin_package = builtin_package
         self._lock = threading.RLock()
+        self._contexts: dict[str, PluginContext] = {}  # plugin id -> the context of its last run
         self.runtimes: dict[str, PluginRuntime] = {}
         self.load_errors: list[LoadError] = []
         self.unapproved: list[str] = []  # files in the plugin folder the user has not allowed yet (not loaded)
@@ -178,8 +179,19 @@ class PluginManager:
             minutes = default
         return max(60, int(minutes * 60))
 
+    def delivered(self, plugin_id: str) -> None:
+        """The findings of the plugin's last run are in the alert store."""
+        ctx = self._contexts.get(plugin_id)
+        if ctx is not None:
+            ctx.delivered()
+
+    def incomplete(self, plugin_id: str) -> list[str]:
+        """Why the plugin's last run could not judge everything ([]: it could)."""
+        ctx = self._contexts.get(plugin_id)
+        return list(ctx.incomplete) if ctx is not None else []
+
     # ---------------------------------------------------------------- run
-    def build_context(self, plugin_id: str) -> PluginContext:
+    def build_context(self, plugin_id: str, defer: bool = False) -> PluginContext:
         rt = self.runtimes[plugin_id]
         rules_cfg = self._cfg.get("plugins", plugin_id, "rules", default={}) or {}
         enabled_rules = frozenset(r.id for r in rt.plugin.rules if rules_cfg.get(r.id, r.default_enabled))
@@ -197,15 +209,20 @@ class PluginManager:
             log=logging.getLogger(f"radar.plugin.{plugin_id}"),
             stop_event=self._stop,
             status_callback=_status,
+            defer=defer,
         )
 
-    def run(self, plugin_id: str) -> list[Finding]:
-        """Run one plugin. Exceptions propagate (after being recorded on the runtime)."""
+    def run(self, plugin_id: str, defer: bool = False) -> list[Finding]:
+        """Run one plugin. Exceptions propagate (after being recorded on the runtime). ``defer``: the caller
+        stores the findings and then calls :meth:`delivered` - only then does the plugin move its bookmarks."""
         rt = self.runtimes[plugin_id]
         rt.running = True
         rt.last_run = datetime.now(timezone.utc)
+        self._contexts.pop(plugin_id, None)
         try:
-            findings = list(rt.plugin.run(self.build_context(plugin_id)) or [])
+            ctx = self.build_context(plugin_id, defer)
+            findings = list(rt.plugin.run(ctx) or [])
+            self._contexts[plugin_id] = ctx
             rt.last_success = datetime.now(timezone.utc)
             rt.last_error = None
             rt.last_findings = len(findings)

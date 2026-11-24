@@ -53,8 +53,24 @@ def history():
     h.close()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _never_the_real_home(tmp_path_factory):
+    """The whole test run has a data folder of its own. The per-test one below is set with ``monkeypatch`` - which a
+    test can undo (``monkeypatch.undo()`` undoes everything, this included); without this fallback RADAR_HOME would
+    then be unset and the test would read and write the data of the RADAR installed on this PC."""
+    import os
+
+    before = os.environ.get("RADAR_HOME")
+    os.environ["RADAR_HOME"] = str(tmp_path_factory.mktemp("radar-home"))
+    yield
+    if before is None:
+        os.environ.pop("RADAR_HOME", None)
+    else:
+        os.environ["RADAR_HOME"] = before
+
+
 @pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
+def _isolated_home(tmp_path, monkeypatch, _never_the_real_home):
     monkeypatch.setenv("RADAR_HOME", str(tmp_path / "home"))
     yield
 

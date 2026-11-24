@@ -107,8 +107,14 @@ class AppStore:
         self.c = conn
         self.c.executescript(SCHEMA)
 
-    def new_rows(self, rows: list[AppSignIn]) -> list[AppSignIn]:
-        """Rows not processed before (the fetch overlaps); remembers them for two days."""
+    def remember(self, seen: list[tuple[str, float]]) -> None:
+        """These (id, time) were judged and delivered: not new any more."""
+        self.c.executemany("INSERT OR IGNORE INTO app_ids(id, ts) VALUES(?,?)", seen)
+        self.c.commit()
+
+    def new_rows(self, rows: list[AppSignIn], remember: bool = True) -> list[AppSignIn]:
+        """Rows not processed before (the fetch overlaps); remembers them for two days - at once, or (``remember``
+        False) when the caller says so with :meth:`remember`, after their findings were delivered."""
         if not rows:
             return []
         known = set()
@@ -117,7 +123,8 @@ class AppStore:
             chunk = ids[i:i + 500]
             known |= {x for (x,) in self.c.execute(f"SELECT id FROM app_ids WHERE id IN ({','.join('?' * len(chunk))})", chunk)}
         fresh = list({r.id: r for r in rows if r.id not in known}.values())
-        self.c.executemany("INSERT OR IGNORE INTO app_ids(id, ts) VALUES(?,?)", [(r.id, r.created.timestamp()) for r in fresh])
+        if remember:
+            self.c.executemany("INSERT OR IGNORE INTO app_ids(id, ts) VALUES(?,?)", [(r.id, r.created.timestamp()) for r in fresh])
         return fresh
 
     def first_seen(self, sp_id: str) -> datetime | None:

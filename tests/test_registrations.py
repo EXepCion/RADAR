@@ -85,14 +85,15 @@ def settle(history, new, state, minutes, entries=()):
     return registrations.settle(new, history, state, T0 + timedelta(minutes=minutes), lambda _since: list(entries))
 
 
-def test_an_alert_raised_before_the_audit_entry_arrived_gets_its_device_afterwards(history):
+def test_a_sign_in_waits_for_the_audit_entry_and_is_judged_with_its_device(history):
     baseline(history)
     s = drs()
-    out = settle(history, [s], {}, 3)                       # nothing in the audit log yet
-    assert out.matches == {} and out.again == [] and s.id in out.state
+    out = settle(history, [s], {}, 3)                       # nothing in the audit log yet: it waits, unjudged
+    assert out.matches == {} and out.hold == {s.id} and out.release == [] and s.id in out.state
     out = settle(history, [], out.state, 13, [entry(0.2)])  # there it is
-    assert [x.id for x in out.again] == [s.id] and out.matches[s.id].device == "WS-00001" and out.state == {}
-    rc = RuleContext.build(out.again, history, {}, T0 + timedelta(minutes=13))
+    assert [x.id for x in out.release] == [s.id] and out.matches[s.id].device == "WS-00001" and out.state == {}
+    assert out.hold == set()
+    rc = RuleContext.build(out.release, history, {}, T0 + timedelta(minutes=13))
     rc.registrations = out.matches
     f = next(f for f in rules.sensitive_app(rc) if "Device registration" in f.title)
     assert f.fields["Device"] == "WS-00001" and f.key.startswith("sensitive|u1|Device registration|")   # the same alert
@@ -102,11 +103,13 @@ def test_what_is_matched_at_once_or_never_does_not_wait(history):
     baseline(history)
     s = drs()
     out = settle(history, [s], {}, 3, [entry(0.2)])
-    assert out.matches[s.id].kind == registrations.REGISTERED and out.state == {} and out.again == []
+    assert out.matches[s.id].kind == registrations.REGISTERED and out.state == {} and out.hold == set()
     late = drs(1)
     out = settle(history, [late], {}, 3)
-    out = settle(history, [], out.state, 90)                # an hour and more: the audit log will not say any more
-    assert out.state == {} and out.again == []
+    assert out.hold == {late.id}
+    out = settle(history, [], out.state, 40)                # half an hour and more: judged without the audit log's word
+    assert out.state == {} and [x.id for x in out.release] == [late.id] and out.matches == {}
+    assert settle(history, [], out.state, 50).release == []
     assert settle(history, [make_signin(0, **HOME)], {}, 3).state == {}   # not a sign-in to the registration service
 
 

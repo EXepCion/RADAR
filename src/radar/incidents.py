@@ -182,10 +182,14 @@ def links(a: Alert) -> tuple[list[Key], list[Key]]:
     actors = {e for f in chains.ACTOR_FIELDS for e in chains._emails(fields.get(f))}
     victims = {e for f in VICTIM_FIELDS for e in chains._emails(fields.get(f))}
     about: list[Key] = [("address", ip) for ip in chains.attacker_addresses(a)]
+    # the accounts an administrator's change was done TO are named by it: five people given a role do not become
+    # one incident (a chain alert is about everybody in it)
+    done_to = set() if _is_chain(a) else set(chains._emails(fields.get("Done to")))
     named: list[Key] = []
     for s in a.subjects:
         if "@" in s:
-            (named if s in actors and s not in victims and not _is_chain(a) else about).append(("account", s))
+            merely = (s in actors and s not in victims and not _is_chain(a)) or s in done_to
+            (named if merely else about).append(("account", s))
         elif s.startswith("app:"):
             (about if a.rule_id in APP_SIGNIN_RULES else named).append(("app", s))
     return about, named
@@ -229,7 +233,12 @@ def group(alerts: Iterable[Alert], now: datetime, days: int = LOOKBACK_DAYS, gap
                     join(a, earlier)
             last_about[key] = a
         for key in named:
-            join(a, last_about.get(key))
+            # ... which is still open, at least Medium, or a chain: a Low alert that was looked at and dismissed is
+            # not reopened by somebody doing something for that account
+            earlier = last_about.get(key)
+            if earlier is not None and (earlier.status in (ACTIVE, SNOOZED) or earlier.severity >= Severity.MEDIUM
+                                        or _is_chain(earlier)):
+                join(a, earlier)
             named_before.setdefault(key, []).append(a)
     groups: dict[int, list[Alert]] = {}
     for a in core:

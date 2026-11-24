@@ -80,9 +80,12 @@ def test_the_account_a_role_was_given_to_has_the_escalation_in_its_chain(tmp_pat
     ac.ingest("directory_audit", [given])
     f, = chain_for(ac)
     assert f.subjects == [USER] and f.fields["Chain"] == "Password known -> Suspicious access -> Escalation"
-    # and it is one incident: what was done TO an account is about it, not merely naming it
+    # and it is one incident with what was known about that account - although the role change only NAMES the account
+    # it was done to (see test_admin_work: five receivers do not become one incident)
     about, named = incidents.links(next(a for a in ac.since(NOW - timedelta(days=30)) if a.rule_id == "role_assignment"))
-    assert ("account", USER) in about and ("account", ADMIN) in named
+    assert ("account", USER) in named and ("account", ADMIN) in named and about == []
+    together = [i for i in incidents.group(ac.since(NOW - timedelta(days=30)), NOW) if USER in i.accounts]
+    assert len(together) == 1 and "role_assignment" in {a.rule_id for a in together[0].alerts}
 
 
 def test_a_suspected_admin_giving_another_account_a_role_is_an_attack_across_accounts(tmp_path):

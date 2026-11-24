@@ -127,6 +127,11 @@ CREATE TABLE IF NOT EXISTS activity (
 CREATE INDEX IF NOT EXISTS ix_activity_user ON activity(user_id, last_ts);
 CREATE INDEX IF NOT EXISTS ix_activity_run ON activity(user_id, device, ip, last_ts);
 CREATE INDEX IF NOT EXISTS ix_activity_last ON activity(last_ts);
+-- Sign-ins that are stored but not judged yet: marked when they are stored, cleared when the findings of the scan
+-- that judged them are in the alert store. A scan that is stopped in between leaves them for the next one.
+CREATE TABLE IF NOT EXISTS unjudged (id TEXT PRIMARY KEY, ts REAL NOT NULL);
+-- Sign-ins whose traces were taken out of the profile (see forget): never twice.
+CREATE TABLE IF NOT EXISTS forgotten (id TEXT PRIMARY KEY, ts REAL NOT NULL);
 """
 ACTIVITY_GAP = 2 * 3600  # seconds without a sign-in that end a run of activity
 
@@ -237,8 +242,11 @@ class SignInHistory:
         return self._conn
 
     # -------------------------------------------------------------- write
-    def add(self, signins: Sequence[SignIn]) -> list[SignIn]:
+    def add(self, signins: Sequence[SignIn], unjudged: bool = False, since: datetime | None = None) -> list[SignIn]:
         """Insert unknown sign-ins. Returns only the ones that were not stored before.
+
+        ``unjudged``: the new ones (from ``since`` on, when given) are marked as waiting to be judged, in the same
+        step that stores them - see :meth:`pending` / :meth:`judged`.
 
         Entra first logs some events as a preliminary record and completes it seconds to minutes later: without
         UPN, network and location (seen with 50074), or with a preliminary result (50097 "device authentication"
@@ -300,6 +308,10 @@ class SignInHistory:
             " asn, device_id, session_id, app_id, data) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(key, *_row(s)[1:]) for key, s in fresh.items()],
         )
+        if unjudged:
+            self._conn.executemany("INSERT OR IGNORE INTO unjudged(id, ts) VALUES(?,?)",
+                                   [(key, s.created.timestamp()) for key, s in fresh.items()
+                                    if since is None or s.created >= since])
         self._conn.executemany(
             "UPDATE signins SET ts=?, user_id=?, ip=?, country=?, error_code=?, interactive=?, has_geo=?, asn=?,"
             " device_id=?, session_id=?, app_id=?, data=? WHERE id=?",
@@ -375,10 +387,29 @@ class SignInHistory:
                "ORDER BY ts DESC LIMIT ?")
         return [SignIn.from_json(r[0]) for r in self._conn.execute(sql, (since.timestamp(), int(limit)))]
 
+    def pending(self) -> tuple[list[str], list[SignIn]]:
+        """The sign-ins that are stored but not judged yet: (their keys for :meth:`judged`, the sign-ins)."""
+        rows = self._conn.execute("SELECT u.id, s.data FROM unjudged u JOIN signins s ON s.id=u.id ORDER BY s.ts").fetchall()
+        return [r[0] for r in rows], [SignIn.from_json(r[1]) for r in rows]
+
+    def judged(self, keys: Sequence[str]) -> None:
+        """These were judged and what was found is in the alert store: they wait no longer."""
+        keys = list(keys)
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            self._conn.execute(f"DELETE FROM unjudged WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+        self._conn.commit()
+
     def purge(self, interactive_before: datetime, noninteractive_before: datetime) -> int:
+        # what still waits to be judged is kept, however old a background record it is - until the history's own
+        # limit: older than that, nothing is kept
+        self._conn.execute("DELETE FROM unjudged WHERE ts<?", (interactive_before.timestamp(),))
+        self._conn.execute("DELETE FROM forgotten WHERE ts<?", (interactive_before.timestamp(),))
         cur = self._conn.execute(
-            "DELETE FROM signins WHERE (interactive=1 AND ts<?) OR (interactive=0 AND ts<?)",
+            "DELETE FROM signins WHERE ((interactive=1 AND ts<?) OR (interactive=0 AND ts<?)) "
+            "AND id NOT IN (SELECT id FROM unjudged)",
             (interactive_before.timestamp(), noninteractive_before.timestamp()))
+        self._conn.execute("DELETE FROM unjudged WHERE id NOT IN (SELECT id FROM signins)")
         self._conn.execute("DELETE FROM profile WHERE last_ts<?", (interactive_before.timestamp(),))
         self._conn.execute("DELETE FROM changes WHERE ts<?", (interactive_before.timestamp(),))
         self._conn.execute("DELETE FROM activity WHERE last_ts<?", (interactive_before.timestamp(),))
@@ -525,6 +556,10 @@ class SignInHistory:
         for s in signins:
             if not (s.success and s.user_id):
                 continue
+            key = f"{s.id}{TWIN[bool(s.interactive)]}"  # (the sign-in by hand and its background twin: each once)
+            if self._conn.execute("SELECT 1 FROM forgotten WHERE id=?", (key,)).fetchone():
+                continue  # a scan that ran again: its traces are out already
+            self._conn.execute("INSERT INTO forgotten(id, ts) VALUES(?,?)", (key, s.created.timestamp()))
             self._conn.executemany("UPDATE profile SET n=n-1 WHERE user_id=? AND kind=? AND value=?",
                                    [(s.user_id, kind, value) for kind, value in profile_values(s)])
             ts = s.created.timestamp()

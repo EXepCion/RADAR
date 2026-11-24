@@ -81,6 +81,7 @@ NOT_LINKS = {"account_disabled", "account_enabled", "support_case", "sessions_re
 NOT_ACTIONS = NOT_LINKS - {"password_reset"}
 DISMISSED = "dismissed"
 ENROLMENT_RULE = "device_enrolment"  # the sign-in checks' record of a proven corporate enrolment
+ENROLMENT_FIELD = "Enrolment"        # on an alert about a device: the organisation's programme it was enrolled through
 DISABLED_MARK = "Account is disabled (attempts cannot succeed)"  # written by the sign-in checks (scoring.py)
 
 
@@ -152,8 +153,10 @@ def links_by_subject(alerts: Iterable, now: datetime, lookback_days: int = LOOKB
     out: dict[str, list[Link]] = {}
     alerts = list(alerts)
     # devices whose enrolment is proven to be the organisation's own: registering them is no way to stay in
+    # (the record of an enrolment, or a registration alert that says which programme the device came through)
     enrolled = {str(a.fields.get(linkify.DEVICE_ID_FIELD)) for a in alerts
-                if a.rule_id == ENROLMENT_RULE and (a.fields or {}).get(linkify.DEVICE_ID_FIELD)}
+                if (a.rule_id == ENROLMENT_RULE or (a.fields or {}).get(ENROLMENT_FIELD))
+                and (a.fields or {}).get(linkify.DEVICE_ID_FIELD)}
     for a in alerts:
         if a.rule_id == "device_registration" and str((a.fields or {}).get(linkify.DEVICE_ID_FIELD) or "") in enrolled:
             continue
@@ -352,8 +355,20 @@ def attacker_addresses(alert) -> list[str]:
 
 
 def connected_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> list[set[str]]:
+    """Groups of accounts whose alerts belong to one story (see :func:`tied_accounts`)."""
+    return tied_accounts(alerts, by_subject)[0]
+
+
+def tied_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> tuple[list[set[str]], dict[str, datetime]]:
     """Groups of accounts whose alerts belong to one story: they name the same known attacker address, or one of
-    them - itself under suspicion at that time (password known or worse) - acted on the other."""
+    them - itself under suspicion at that time - acted on the other.
+
+    Under suspicion means evidence that somebody else may be IN the account: its password is known, or a sign-in
+    of at least Medium that may not be the user. What the account DOES with its rights (assigning a role, changing
+    a policy) is no such evidence - an administrator at work would otherwise be tied to everybody they administer.
+
+    Also returned: for each account that was only acted ON, since when it is part of the story - the first time
+    the suspected account acted on it. What it did before that belongs to nobody else's story."""
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -367,6 +382,8 @@ def connected_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> l
         parent[find(a)] = find(b)
 
     by_address: dict[str, set[str]] = {}
+    acted_on: dict[str, datetime] = {}  # account / application -> when a suspected account first acted on it
+    whole: set[str] = set()             # accounts whose whole story counts: the suspected ones themselves
     for a in alerts:
         if a.plugin_id == CHAIN_PLUGIN:
             continue
@@ -378,22 +395,26 @@ def connected_accounts(alerts: Iterable, by_subject: dict[str, list[Link]]) -> l
         actors = {e for f in ACTOR_FIELDS for e in _emails((a.fields or {}).get(f))}
         for actor in actors:
             # under real suspicion: the password is known, or an alert of at least Medium that was not dismissed
-            suspected = any((l.stage == 2 or (l.stage >= 3 and l.score >= STRONG_SCORE)) and not l.weak
+            suspected = any((l.stage == 2 or (l.stage == 3 and l.score >= STRONG_SCORE)) and not l.weak
                             and not l.dismissed_since(getattr(a, "first_seen", None))
                             and l.when <= a.when + ORDER_TOLERANCE
                             and a.when - l.end <= SLOW_STEP_GAP and l.key != a.key for l in by_subject.get(actor, ()))
             if suspected:  # (what it did to an application counts like what it did to an account)
+                whole.add(actor)
                 for target in accounts + [s for s in a.subjects if s.startswith(APP_PREFIX)]:
                     if target != actor:
                         union(actor, target)
+                        acted_on[target] = min(acted_on.get(target, a.when), a.when)
     for accounts in by_address.values():
         accounts = sorted(accounts)
+        whole.update(accounts)  # (an attacker's address ties everything about them, whenever it was)
         for other in accounts[1:]:
             union(accounts[0], other)
     groups: dict[str, set[str]] = {}
     for account in parent:
         groups.setdefault(find(account), set()).add(account)
-    return [g for g in groups.values() if len(g) > 1]
+    since = {account: when for account, when in acted_on.items() if account not in whole}
+    return [g for g in groups.values() if len(g) > 1], since
 
 
 def spread_findings(alerts: Iterable, now: datetime) -> list[Finding]:
@@ -401,11 +422,14 @@ def spread_findings(alerts: Iterable, now: datetime) -> list[Finding]:
     alerts = list(alerts)
     by_subject = links_by_subject(alerts, now)
     out = []
-    for group in connected_accounts(alerts, by_subject):
+    groups, since = tied_accounts(alerts, by_subject)
+    for group in groups:
         owners: dict[str, set[str]] = {}
         links: dict[str, Link] = {}
         for account in group:
             for link in by_subject.get(account, ()):
+                if account in since and link.end < since[account] - ORDER_TOLERANCE:
+                    continue  # from before this account was acted on: not what the other one's story led to
                 owners.setdefault(link.key, set()).add(account)
                 links.setdefault(link.key, link)
         chain = best_chain(list(links.values()))

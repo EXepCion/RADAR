@@ -12,12 +12,13 @@ import fnmatch
 import json
 import re
 from collections import Counter, defaultdict
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .. import entra
 from ..graph import GraphError
-from ..plugin_api import Finding, Plugin, PluginContext, Rule, Severity
+from ..plugin_api import Finding, Plugin, PluginContext, Rule, Severity, StagedState
 from .signin_threats.models import graph_time, parse_time
 from .. import account_events
 from .signin_threats.scoring import severity_for
@@ -380,7 +381,45 @@ def _role(audit: dict) -> str:
         for p in t.get("modifiedProperties") or []:
             if p.get("displayName") in ("Role.DisplayName", "RoleDefinition.DisplayName"):
                 return str(p.get("newValue") or "").strip().strip('"')
-    return ""
+    # PIM names the role as a target of its own (directory roles and the roles on Azure resources alike)
+    return next((str(t.get("displayName")).strip() for t in audit.get("targetResources") or []
+                 if str(t.get("type", "")).lower() == "role" and t.get("displayName")), "")
+
+
+#: what a role can be given on outside the directory (PIM for Azure resources), by the target's type
+AZURE_SCOPES = {"subscription": "Azure subscription", "managementgroup": "Azure management group",
+                "resourcegroup": "Azure resource group", "resource": "Azure resource"}
+#: roles on Azure resources that can hand out access to them - to others, and to themselves
+GRANTING_ROLES = {"owner", "user access administrator", "role based access control administrator"}
+
+
+def _scope(audit: dict) -> tuple[str, str] | None:
+    """(kind, name) of the Azure resource a role was given on; None for a role in the directory."""
+    for t in audit.get("targetResources") or []:
+        kind = str(t.get("type", "")).replace(" ", "").lower()
+        if kind in AZURE_SCOPES and t.get("displayName"):
+            return AZURE_SCOPES[kind], str(t["displayName"]).strip()
+    return None
+
+
+def _role_text(audit: dict) -> str:
+    """'Owner on Contoso Production (Azure subscription)', or just the directory role's name."""
+    role, scope = _role(audit), _scope(audit)
+    return f"{role} on {scope[1]} ({scope[0]})" if role and scope else role
+
+
+def _receivers(audit: dict) -> list[str]:
+    return sorted({str(t.get("userPrincipalName")).lower() for t in audit.get("targetResources") or []
+                   if str(t.get("type", "")).lower() == "user" and "@" in str(t.get("userPrincipalName") or "")})
+
+
+def _self_assigned(audit: dict) -> bool:
+    """The one who made the change is among those it was made for."""
+    user = (audit.get("initiatedBy") or {}).get("user") or {}
+    upn, uid = str(user.get("userPrincipalName") or "").lower(), user.get("id")
+    return any(str(t.get("type", "")).lower() == "user"
+               and ((uid and t.get("id") == uid) or (upn and str(t.get("userPrincipalName") or "").lower() == upn))
+               for t in audit.get("targetResources") or [])
 
 
 def _targets(audit: dict) -> str:
@@ -476,10 +515,18 @@ def score_audit(rid: str, audit: dict, automation: list[str]) -> tuple[int, list
         factors.append((20, TRUSTED_LOCATION_REASON))
     role = _role(audit)
     if rid == "role_assignment" and role:
-        if role.lower() in TOP_ROLES:
+        scope = _scope(audit)
+        if scope and role.lower() in GRANTING_ROLES:
+            factors.append((15, f"{role} on {scope[1]} ({scope[0]}): can give itself and others access to "
+                                f"everything in it"))
+        elif scope:
+            factors.append((0, f"Role: {_role_text(audit)}"))
+        elif role.lower() in TOP_ROLES:
             factors.append((25, f"Highly privileged role: {role}"))
         else:
             factors.append((0, f"Role: {role}"))
+    if rid == "role_assignment" and _self_assigned(audit):
+        factors.append((5, "Given to their own account"))
     who = _initiator(audit)
     if _matches(who, automation):
         factors.append((-30, f"Known automation of the tenant ({who})"))
@@ -929,6 +976,14 @@ class DirectoryAuditPlugin(Plugin):
     }
 
     def run(self, ctx: PluginContext) -> list[Finding]:
+        """One scan. Its bookmark moves only when its findings are in the alert store: a scan that is stopped or
+        fails after reading reads the same entries again (its findings have fixed keys: nothing is doubled)."""
+        staged = StagedState(ctx.state)
+        findings = self._scan(dataclasses.replace(ctx, state=staged))
+        ctx.when_delivered(staged.commit)
+        return findings
+
+    def _scan(self, ctx: PluginContext) -> list[Finding]:
         s = ctx.settings
         now = ctx.now()
         checkpoint = ctx.state.get("checkpoint")
@@ -1093,14 +1148,28 @@ class DirectoryAuditPlugin(Plugin):
                 factors = factors + [(25, f"{len(audits)} device secrets read by the same person in one week")]
                 score = min(69, score + 25)
             activities = sorted({a.get("activityDisplayName", "") for a in audits})
-            roles = sorted({_role(a) for a in audits} - {""})
+            roles = sorted({_role_text(a) for a in audits} - {""})
             done_to = _done_to(audits, who)
+            said = (f"{who} made {len(audits)} change(s) in {day}: {', '.join(activities)}. "
+                    f"Targets: {_targets(audits[0])}" + (" ..." if len(audits) > 1 else ""))
+            if rid == "role_assignment" and roles:
+                # one assignment is logged several times (requested, completed, the directory's own entry): what
+                # was given to whom is said once
+                given: dict[str, set[str]] = {}
+                for a in audits:
+                    if _role_text(a):
+                        given.setdefault(_role_text(a), set()).update(_receivers(a) or [""])
+                count = sum(len(v) for v in given.values())
+                own = any(_self_assigned(a) for a in audits)
+                said = (f"{who} made {count} role assignment(s) in {day}: "
+                        + "; ".join(f"{role} for {', '.join(sorted(x for x in to if x)) or 'an account'}"
+                                    for role, to in sorted(given.items()))[:500]
+                        + (" - among them their own account" if own else "") + ".")
             findings.append(Finding(
                 key=f"diraudit|{rid}|{who}|{day}", rule_id=rid, severity=severity_for(score), score=score,
                 factors=factors,
                 title=(f"{rule_names[rid]}: {who}" + (f" ({', '.join(roles[:3])})" if roles else "")),
-                summary=(f"{who} made {len(audits)} change(s) in {day}: {', '.join(activities)}. "
-                         f"Targets: {_targets(audits[0])}" + (" ..." if len(audits) > 1 else "")),
+                summary=said,
                 occurred_at=min(parse_time(a["activityDateTime"]) for a in audits),
                 fields={"Initiated by": who, "Activities": ", ".join(activities), "Roles": ", ".join(roles) or "-",
                         **({"Done to": ", ".join(done_to[:10]) + (" ..." if len(done_to) > 10 else "")} if done_to else {})},

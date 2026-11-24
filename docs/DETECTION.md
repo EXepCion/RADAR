@@ -31,7 +31,7 @@ them into a local history and runs these rules:
 | Legacy authentication | successful IMAP/POP/SMTP AUTH/EAS/… sign-in | scored, never below Low |
 | Pinned accounts | an account in `pinned_accounts.accounts` signs in successfully from any other IP | 85 |
 | Device code / ROPC sign-ins | completed device-code or ROPC (password-only) authentication. Base 55 for device code and 65 for ROPC (the flow is counted once). For ROPC of an admin account that needs no MFA the office network takes off only 10 instead of 30 (the password sits in a script), so it stays High there too | scored, never below Low |
-| Admin tools & device registration | first use of Azure CLI / PowerShell / Graph tools, or a device registration. What a sign-in to the registration service was is told by the audit log (the entry of the same account within minutes): a registration names the device it produced (a link to the device in Entra) - also afterwards, when the audit entry arrives a scan later; a Windows Hello key set up on a device that exists is no device registration and is left to the MFA-change rule | scored |
+| Admin tools & device registration | first use of Azure CLI / PowerShell / Graph tools, or a device registration. What a sign-in to the registration service was is told by the audit log (the entry of the same account within minutes): a registration names the device it produced (a link to the device in Entra) - a Windows Hello key set up on a device that exists is no device registration and is left to the MFA-change rule. The sign-in waits up to 30 minutes (`device_enrolment.wait_minutes`) for the audit entry and for the directory's word on the device: one that is managed and came through the organisation's own programme (registered for Windows Autopilot, Apple's automated enrolment) is a company device being set up - logged with that programme named, and no persistence step of a chain (neither is the audit watch's record of the same device). Without that proof it is judged as before | scored |
 | Corporate device enrolments (record only) | While a company device is enrolled, the account signs in to the enrolment service before the device has an identity: with Apple's automated enrolment from the service's own address in a cloud (another country, no device, password only), with Windows Autopilot from wherever the new computer is unpacked. That it is an enrolment cannot be read from the sign-in - the address may lie in ranges anybody can rent - but from the result: within 30 minutes the account registers a device that the directory knows as **managed** and as coming from an enrolment only the organisation's own devices can go through (Apple: `enrollmentType` contains `DEP`, the serial number is assigned to the organisation; Windows Autopilot: the device carries a `[ZTDID]` physical id, its hardware was registered for the organisation). Such a sign-in to the enrolment service is held back until that shows; then it and the account's other sign-ins from that address in those minutes become one record and are not judged as the user's own (no new country, no risky sign-in, no impossible travel measured against them, no "new IP shared by several accounts", no attacker address remembered, no chain step - the registration of that device recorded by the audit watch is none either) and what they brought is not learned as the user's habit: the service's country, network and address stay as new for the account as they were. Without the proof they are judged like any other sign-in, at most 30 minutes later; the address itself excuses nothing. Settings: `device_enrolment` (`corporate_types`, `wait_minutes`). | record |
 | App sign-ins (service principals) | apps signing in with their own secret/certificate (~12,000/day), judged against a per-app baseline (countries, /24 network ranges, credential key ids; 3 days learning; raw rows not stored): new country -> Medium, first use of a credential -> Low, new range in a known country -> logged, >= 50 credential failures a week -> Low "credential failing" (Medium if from networks outside the app's baseline = someone trying its secrets). A credential that keeps failing the same way is one alert for as long as it does: dismissed once it stays dismissed, and returns when it fails differently or starts again after a week without | 10-70 |
 
@@ -168,8 +168,21 @@ within the last minutes or hours (session replay right after a fresh MFA) see on
 Non-interactive sign-ins (thousands per hour in a mid-size tenant) are kept for 3 h only
 (`non_interactive_retention_hours`; raise it to ~26 if you turn on `include_non_interactive` for the geo rules).
 
+**Nothing that was read is lost.** A bookmark - how far the sign-in log, the audit log, the applications' sign-ins
+were read - moves only when what was read up to it is in the alert store. Sign-ins are marked *unjudged* in the
+step that stores them and stay so until the findings of the scan that judged them are stored; they are not
+cleared meanwhile, however old a background record is. A scan that is stopped (RADAR closed, the PC shut down),
+crashes or fails - also in the middle of reading - therefore leaves nothing behind: the next scan reads from the
+same place and judges what waits. It never gives up: a rule that fails keeps the scan open (its sign-ins are
+judged again by every scan), and after two scans in a row that did not finish, or a rule that failed, a reminder
+says so until it works again. The audit watch stores nothing itself: it reads the same entries again, and its
+findings have fixed keys, so nothing is doubled.
+
 ### Directory audit watch (`directory_audit`, every 15 min)
-Watches the audit log for directory role assignments, app credential changes, consent grants,
+Watches the audit log for role assignments (a role alert says which role on what for whom - `Owner on <subscription>
+(Azure subscription)` -, counts an assignment once although it is logged as requested, completed and by the directory,
+and says when somebody gave a role to their own account, +5; a role on an Azure resource that can hand out access -
+Owner, User Access Administrator - adds 15, a top directory role 25), app credential changes, consent grants,
 Conditional Access and domain federation changes, members added to groups excluded from any enforced Conditional
 Access policy (MFA exclusion 80, other policies 60), BitLocker / LAPS secrets read (single reads logged, >= 5 per
 person and week Medium; a LAPS read Low), owners added to apps, a Global Administrator elevating to Azure root
@@ -254,9 +267,13 @@ keeps failing, is operations and no step. An account under suspicion that did so
 taken together with it like with another account ("Attack across 2 accounts / applications").
 
 **Attacks across accounts** (`chains.spread_findings`). Accounts are taken together when their alerts name the
-same known attacker address, or when an account that was already under real suspicion (its password is known, or
-an alert of at least Medium that was not dismissed) acted on another one afterwards (*Initiated by* / *Invited
-by*: reset its MFA, gave it a role, invited it ...). An administrator nobody suspects joins nothing, and what is
+same known attacker address, or when an account that was already under real suspicion acted on another one
+afterwards (*Initiated by* / *Invited by*: reset its MFA, gave it a role, invited it ...). Under suspicion means
+evidence that somebody else may be IN the account: its password is known, or a sign-in of at least Medium that may
+not be the user (and was not dismissed). What the account DOES with its rights - a role it assigned, a policy it
+changed - is no such evidence: an administrator at work would be tied to everybody they administer. The account
+that was acted on is part of the story from that moment on; what it did before belongs to nobody else's story.
+An administrator nobody suspects joins nothing, and what is
 done ABOUT an account - disabling it, enabling it again, revoking its sessions - is the answer to an attack and
 ties nobody together. Over the alerts of such a group the same chain is looked for; when it
 runs across at least two accounts it is raised as "Attack across N accounts: ..." (chain score +15).
@@ -269,10 +286,12 @@ device, by its id) and logged-only findings are shown with it as context but nei
 window lists the incidents of the last 30 days with their alerts in order; the open reminders of one incident can
 be dismissed together.
 
-"About an account" means the account it happened to. An alert that only names an account as the one who did
-something (*Initiated by* / *Invited by*: a consent, a policy change, a key that was read) joins an incident about
-that account when it comes after an alert about the account itself; two things an administrator did are their
-work, not an incident. An application ties alerts together through its own sign-ins (a new credential or consent,
+"About an account" means the account it happened to. An alert that only names an account - as the one who did
+something (*Initiated by* / *Invited by*: a consent, a policy change, a key that was read) or as one an
+administrator's change was done to (*Done to*: five people given a role) - joins an incident about that account
+when it comes after an alert about the account itself that is still open, at least Medium, or a chain; a Low
+alert that was looked at and dismissed is not reopened by it. Two things an administrator did are their work, not
+an incident, and the people an administrator did something for do not become one. An application ties alerts together through its own sign-ins (a new credential or consent,
 then a sign-in from somewhere new) - a credential and a consent alone are an application being set up. Not part
 of an incident: an alert that was merged into another, a chain that no longer holds, and what merely does not
 work (a failing app credential). How far an incident got is told by what is still open; a stage whose alerts

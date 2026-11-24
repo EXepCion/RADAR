@@ -29,6 +29,8 @@ you have an idea for a check, please [open an issue](https://github.com/EXepCion
   by Entra, accounts excluded from MFA, break-glass and disabled accounts, apps signing in with their own secrets.
   The sign-ins of a corporate device enrolment (Apple's automated enrolment, Windows Autopilot) are recognised by
   the device they produce and not judged as the user's own.
+  Nothing that was read is lost: a scan that is stopped or fails is picked up by the next one, which judges what
+  the stopped one had already stored.
 - **Watches directory changes** (every 15 minutes): admin role assignments, app secrets and owners, consent grants,
   Conditional Access and federation changes, cross-tenant trust, members added to groups that are excluded from
   Conditional Access or can hold admin roles, trusted networks (named locations), the sign-in methods policy,

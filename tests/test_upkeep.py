@@ -137,7 +137,7 @@ def test_what_is_read_afterwards_is_judged_like_any_sign_in(tmp_path):
 
 # ------------------------------------------------------------------ no connection
 def test_a_lost_connection_is_waited_out_and_not_called_a_crash(app, caplog):  # noqa: F811
-    def no_network(plugin_id):
+    def no_network(plugin_id, defer=False):
         raise requests.exceptions.ConnectionError("HTTPSConnectionPool(host='login.microsoftonline.com', port=443)")
 
     app.plugins.run = no_network
@@ -149,7 +149,7 @@ def test_a_lost_connection_is_waited_out_and_not_called_a_crash(app, caplog):  #
     assert "crashed" not in caplog.text and not any(r.exc_info for r in caplog.records)
     assert "HTTPSConnectionPool" not in app.last_error
 
-    def wrapped(plugin_id):
+    def wrapped(plugin_id, defer=False):
         try:
             raise requests.exceptions.ReadTimeout("read timed out")
         except requests.exceptions.ReadTimeout as exc:
@@ -157,12 +157,12 @@ def test_a_lost_connection_is_waited_out_and_not_called_a_crash(app, caplog):  #
 
     app.plugins.run = wrapped
     assert app.run_plugin("signin_threats") is False and app.offline
-    app.plugins.run = lambda plugin_id: []
+    app.plugins.run = lambda plugin_id, defer=False: []
     assert app.run_plugin("signin_threats") is True and not app.offline and app.last_error is None
 
 
 def test_a_real_fault_is_still_a_crash(app, caplog):  # noqa: F811
-    def broken(plugin_id):
+    def broken(plugin_id, defer=False):
         raise ValueError("boom")
 
     app.plugins.run = broken

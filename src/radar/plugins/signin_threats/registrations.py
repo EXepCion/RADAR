@@ -5,8 +5,9 @@ registered - or an existing device setting up a Windows Hello key, or fetching s
 of the same account within seconds that says which: "Register device" with the device's name and id, or "Add Windows
 Hello for Business credential". (The two logs rarely share a correlation id; account and time are what ties them.)
 
-The audit entry may arrive a scan later than the sign-in: such sign-ins are remembered for a while and their alert
-gets its device afterwards.
+A registered device that the directory then shows as managed and as coming from the organisation's own programme
+(Windows Autopilot, Apple's automated enrolment) is a company device being set up - no way for an attacker to stay.
+Both the audit entry and that mark take a moment: the sign-in waits for them (at most ``WAIT``) before it is judged.
 
 Pure logic: the audit log is asked through the callable given to :func:`settle`.
 """
@@ -14,15 +15,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
-from . import netintel
+from . import enrolment, netintel
 from .models import SignIn, parse_time
 
 REGISTERED, HELLO = "registered", "hello"
 ACTIVITIES = {"register device": REGISTERED, "add windows hello for business credential": HELLO}
 AROUND = timedelta(minutes=5)   # the two logs stamp the same operation seconds apart; minutes of slack
-WAIT = timedelta(minutes=60)    # how long an audit entry is waited for
+WAIT = timedelta(minutes=30)    # how long the audit entry and the directory's word on the device are waited for
 
 
 @dataclass(frozen=True)
@@ -30,13 +31,15 @@ class Match:
     kind: str            # REGISTERED or HELLO
     device: str = ""     # the registered device's name
     device_id: str = ""
+    proof: str = ""      # what makes the device the organisation's own, by the directory ('' = nothing known)
 
 
 @dataclass
 class Outcome:
     matches: dict[str, Match] = field(default_factory=dict)  # sign-in id -> what it was
-    state: dict[str, str] = field(default_factory=dict)      # sign-ins still waiting for their audit entry -> when
-    again: list[SignIn] = field(default_factory=list)        # judged in an earlier scan, device known only now
+    state: dict[str, str] = field(default_factory=dict)      # sign-ins still waiting -> when they were
+    hold: set[str] = field(default_factory=set)              # ... not judged by this scan
+    release: list[SignIn] = field(default_factory=list)      # waited in an earlier scan, judged by this one
 
 
 def is_candidate(s: SignIn) -> bool:
@@ -73,16 +76,22 @@ def match(s: SignIn, entries: list[dict]) -> Match | None:
 
 
 def settle(new: list[SignIn], history: Any, state: dict | None, now: datetime,
-           entries: Callable[[datetime], list[dict]], wait: timedelta = WAIT) -> Outcome:
-    """Match the registration-service sign-ins among ``new`` and those still waiting from earlier scans.
-    ``entries(since)``: the audit entries of the registration service since then (may fail: nothing is matched)."""
+           entries: Callable[[datetime], list[dict]], device: Callable[[str], dict | None] | None = None,
+           types: Iterable[str] = enrolment.CORPORATE_TYPES, wait: timedelta = WAIT) -> Outcome:
+    """Sort out the registration-service sign-ins among ``new`` and those waiting from earlier scans.
+
+    Such a sign-in is settled when the audit log says it was a Windows Hello key, or a registration whose device the
+    directory proves to be the organisation's own (``device(device id)``, see enrolment.proves). Until then it waits -
+    it is not judged - for at most ``wait``: the audit entry comes seconds after the sign-in, a new device is marked
+    as managed some minutes after it was registered. Then it is judged with whatever is known.
+    ``entries(since)``: the audit entries of the registration service since then. Either callable may fail."""
     out = Outcome()
     waiting = dict(state or {})
     fresh = {s.id: s for s in new if is_candidate(s)}
     earlier: dict[str, SignIn] = {}
-    for signin_id in list(waiting):
+    for signin_id in waiting:
         s = history.get(signin_id, True) if signin_id not in fresh else None
-        if s is not None and now - s.created < wait:
+        if s is not None:
             earlier[signin_id] = s
     if not fresh and not earlier:
         return out
@@ -93,10 +102,22 @@ def settle(new: list[SignIn], history: Any, state: dict | None, now: datetime,
         audits = None
     for signin_id, s in pending.items():
         found = match(s, audits) if audits is not None else None
-        if found is not None:
-            out.matches[signin_id] = found
-            if signin_id in earlier and found.kind == REGISTERED:
-                out.again.append(s)
-        elif now - s.created < wait:
+        if found is not None and found.kind == REGISTERED and found.device_id and device is not None:
+            try:
+                proof = enrolment.proves(device(found.device_id), types)
+            except Exception:  # noqa: BLE001
+                proof = ""
+            if proof:
+                found = Match(found.kind, found.device, found.device_id, proof)
+        # nothing more to wait for: it was no registration, the device is proven the organisation's own - or nobody
+        # can be asked whose it is
+        settled = found is not None and (found.kind == HELLO or bool(found.proof) or device is None)
+        if settled or now - s.created >= wait:
+            if found is not None:
+                out.matches[signin_id] = found
+            if signin_id in earlier:
+                out.release.append(s)
+        else:
             out.state[signin_id] = s.created.isoformat()
+            out.hold.add(signin_id)
     return out

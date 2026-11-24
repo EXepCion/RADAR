@@ -53,6 +53,7 @@ class App:
     def __init__(self, demo: bool = False):
         self.demo = demo
         self.stop_event = threading.Event()
+        self._unfinished: dict[str, int] = {}  # plugin id -> scans in a row that ended with an error
         self.cfg = ConfigManager(paths.config_path())
         self.store = Store(paths.db_path())
         self.auth = AuthManager(self.cfg, paths.token_cache_path(),
@@ -319,7 +320,7 @@ class App:
         self._running.add(plugin_id)
         self._refresh_tray()
         try:
-            findings = self.plugins.run(plugin_id)
+            findings = self.plugins.run(plugin_id, defer=True)  # (its bookmarks move when the findings are stored)
             self.offline = False
         except TenantChangedError:
             self._other_tenant()
@@ -365,6 +366,13 @@ class App:
             self.offline = False
             self.last_error = f"{rt.plugin.name}: {type(exc).__name__}: {exc}"
             log.exception("Plugin %s crashed", plugin_id)
+            self._unfinished[plugin_id] = self._unfinished.get(plugin_id, 0) + 1
+            if self._unfinished[plugin_id] >= 2:  # (once may be a hiccup; RADAR tries again either way)
+                self._report_problem(
+                    f"incomplete:{plugin_id}", f"{rt.plugin.name}: the last scans did not finish",
+                    f"{self._unfinished[plugin_id]} scans in a row ended with an error ({type(exc).__name__}: {exc}). "
+                    "What was read is kept: it is judged as soon as a scan finishes.",
+                    "RADAR tries again with every scan. If this stays, the log (RADAR > Settings > About) says more.", [])
             return False
         finally:
             self._running.discard(plugin_id)
@@ -378,6 +386,16 @@ class App:
         if not self.setup_done:  # it works now (a role that was assigned in the meantime, a later sign-in ...)
             self._setup_finished(scan=False)
         self.deliver(plugin_id, findings)
+        self.plugins.delivered(plugin_id)  # the findings are stored: now the plugin moves its bookmarks
+        self._unfinished.pop(plugin_id, None)
+        left = self.plugins.incomplete(plugin_id)
+        if left:
+            self._report_problem(
+                f"incomplete:{plugin_id}", f"{rt.plugin.name}: not everything could be judged",
+                "; ".join(left)[:600] + ". What was read is kept and judged again by every scan until this works.",
+                "Nothing is lost meanwhile. If this stays, the log (RADAR > Settings > About) says more.", [])
+        else:
+            self.alerts.resolve_system(f"incomplete:{plugin_id}")
         return True
 
     # ------------------------------------------------------- reminders switched off
