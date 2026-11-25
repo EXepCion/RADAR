@@ -303,11 +303,14 @@ def test_the_movement_card_shows_24_hours_its_devices_lead_to_their_pages_and_no
                 lanes._go(lanes.offset - lanes.stage)
                 root.update()
                 said = p.span.cget("text")
-                assert not lanes.at_end and p.now_button.winfo_manager() and said in p._said and p._said[0].split(" ")[0] in ("Sat", "Sun")
-                assert "UTC" in said and where() == placed                                         # (however little room: the zone is said)
+                # (a screen too narrow for the window at this scaling leaves the heading less room than its shortest form
+                # needs: then it is cut - and a time is never left standing without its zone)
+                whole = lambda words: words in p._said or (host.winfo_width() < 1196 and not any(ch.isdigit() for ch in words))  # noqa: E731
+                assert not lanes.at_end and p.now_button.winfo_manager() and whole(said) and p._said[0].split(" ")[0] in ("Sat", "Sun")
+                assert ("UTC" in said or said not in p._said) and where() == placed                # (however little room: the zone is said)
                 p.now_button.invoke()                                                     # back to now (at once: animations are off here)
                 root.update()
-                assert lanes.at_end and not p.now_button.winfo_manager() and where() == placed and p.span.cget("text") in p._said
+                assert lanes.at_end and not p.now_button.winfo_manager() and where() == placed and whole(p.span.cget("text"))
                 assert p._said[0].startswith("the last 24 hours") and all("UTC" in form for form in p._said)
             finally:
                 host.destroy()

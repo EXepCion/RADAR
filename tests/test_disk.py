@@ -290,7 +290,11 @@ def test_the_new_section_is_inside_the_window_and_nothing_is_cut_off(root):
         last = win.rows[setup_check.STEPS[-1][0]][0].master
         assert 0 < row.winfo_rooty() - (last.winfo_rooty() + last.winfo_height()) < px(45)
         assert win.headline.winfo_rooty() >= bottom
-        assert row.winfo_height() > 20 and bottom <= top.winfo_rooty() + top.winfo_height()
+        if top.winfo_height() < px(ui.HEIGHT):   # a screen too low for the whole page: it scrolls, and the section can be reached
+            first, last_part = win.scroll.canvas.yview()
+            assert row.winfo_height() > 20 and (first, last_part) != (0.0, 1.0)
+        else:
+            assert row.winfo_height() > 20 and bottom <= top.winfo_rooty() + top.winfo_height()
         # ... and the texts of the row are not cut off at the right edge by the button and the switch
         from tkinter import ttk
         for cell in win._choices.values():   # the two ways to sign in above still show their whole title
