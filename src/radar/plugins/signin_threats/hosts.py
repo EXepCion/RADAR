@@ -69,6 +69,11 @@ class HostMatcher:
     def __bool__(self) -> bool:
         return bool(self._names or self._nets)
 
+    @property
+    def by_address(self) -> bool:
+        """Is a host listed by its addresses (any account signing in from there was on it)?"""
+        return bool(self._nets)
+
     def label(self, s: SignIn) -> str | None:
         """What the host is ('Citrix', ...), or None if the sign-in is not from a configured host."""
         name = (s.device_name or "").lower()

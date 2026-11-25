@@ -44,6 +44,24 @@ def test_rescore_drops_rows_it_excluded_but_keeps_older_and_non_interactive_ones
     assert [r["Sign-in ID"] for r in after.evidence] == ["a2", "bg", "a1", "early"]  # 'own' was excluded on purpose
 
 
+def test_the_fields_come_from_the_finding_the_score_comes_from():
+    """A later, lower finding of the same alert leaves its explanation alone - score, title, factors AND fields
+    (a "Risk score" of 0 under a score of 100 contradicted itself); what it saw is collected all the same."""
+    ac = center()
+    high = f(sev=Severity.HIGH, score=100, factors=[(100, "simultaneous use")], ev=[row("s1", "10:00")],
+             fields={"Risk score": "100/100", "Judged side": "Ashburn, US"})
+    low = f(sev=Severity.INFO, score=0, factors=[(0, "one device on two network paths")], ev=[row("s2", "11:00")],
+            fields={"Risk score": "0/100", "Judged side": "Toronto, CA", "Session ID": "S"})
+    ac.ingest("p", [high])
+    ac.ingest("p", [low])
+    a = ac.active()[0]
+    assert (a.score, a.factors) == (100, [(100, "simultaneous use")])
+    assert a.fields == {"Risk score": "100/100", "Judged side": "Ashburn, US"}
+    assert [r["Sign-in ID"] for r in a.evidence] == ["s2", "s1"]
+    ac.ingest("p", [f(sev=Severity.HIGH, score=100, fields={"Risk score": "100/100", "Judged side": "Dublin, IE"})])
+    assert ac.active()[0].fields["Judged side"] == "Dublin, IE"  # as high: it is the explanation now
+
+
 def test_below_min_severity_is_muted_until_escalated():
     ac = center()
     assert ac.ingest("p", [f(sev=Severity.INFO)], min_severity=Severity.LOW) == []

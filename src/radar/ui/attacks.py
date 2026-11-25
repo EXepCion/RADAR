@@ -26,7 +26,7 @@ from .. import linkify, timefmt
 from . import icons, theme
 from .cardtable import CardTable, friendly_time
 from .freshness import DataAge
-from .parts import Pointer, Segments, card, on_card
+from .parts import Hint, Pointer, Segments, card, on_card
 from .richtext import LinkHandler, StatusLine, attach_table_menu, scrolled_text, stable_label
 from .rounded import Rounded
 from .tables import make_sortable
@@ -176,6 +176,8 @@ class AttacksWindow:
         self.filter = Segments(under, [(key, name) for key, name, *_rest in SECTIONS], self._filter_chosen, width=19)
         self.filter.pack(side="left")
         self.status = stable_label(under, SUMMARY_TEMPLATE, width=inner - px(4 * 190 + 30), max_lines=1)
+        self._status_whole = ""   # (the line is one line long: what does not fit can be read by pointing at it)
+        Hint((self.status,), lambda: self._status_whole if str(self.status.cget("text")) != self._status_whole else "", wrap=px(520))
         self.status.pack(side="left", fill="x", expand=True, padx=(px(14), 0))
 
         footer = ttk.Frame(top, padding=(px(MARGIN), px(10), px(MARGIN), px(12)))
@@ -295,6 +297,7 @@ class AttacksWindow:
             tk.Misc.lift(self.empty.outer)
         if self.result is not None and not self._failed:
             note_ = summary_text(len(self.result.sources), self.result.single_attempt_ips) if self.section == "ips" else ""
+            self._status_whole = note_
             self.status.configure(text=clamp_line(note_, self.status), foreground=theme.color("muted"))
         self._selection_changed()
 
@@ -429,7 +432,8 @@ class AttacksWindow:
         if self.exists():
             self.age.set(busy=False, error=message, keep_time=True)
             self._failed = True
-            self.status.configure(text=clamp_line(f"Could not analyse the history: {message}", self.status),
+            self._status_whole = f"Could not analyse the history: {message}"
+            self.status.configure(text=clamp_line(self._status_whole, self.status),
                                   foreground=theme.color("error"))
 
     # ---------------------------------------------------------------- actions

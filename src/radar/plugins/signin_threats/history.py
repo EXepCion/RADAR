@@ -137,12 +137,19 @@ ACTIVITY_GAP = 2 * 3600  # seconds without a sign-in that end a run of activity
 
 
 class SignInHistory:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, read_only: bool = False):
+        """``read_only``: for whoever only reads - a window, the live map. Nothing is written when it opens (no
+        upgrade, no bookkeeping), so it never waits for a scan that is writing: under WAL a reader sees the history as
+        it was before that write. Only the scans open it to write."""
+        self._backfill = False
+        self.enriched = 0  # stored rows replaced by a more complete copy (see add)
+        self.was_reset = False
+        if read_only:
+            self._conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+            return
         self._conn = sqlite3.connect(str(path), timeout=30)
         if str(path) != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
-        self._backfill = False
-        self.enriched = 0  # stored rows replaced by a more complete copy (see add)
         self.was_reset = self._migrate()
         self._conn.executescript(SCHEMA)
         if self._backfill:  # v2/v3 -> v4: (re)build the profile from the history we already have
@@ -577,6 +584,60 @@ class SignInHistory:
     def asn_user_count(self, asn: int, before: datetime, exclude_user: str = "") -> int:
         sql = "SELECT COUNT(DISTINCT user_id) FROM profile WHERE kind='asn' AND value=? AND first_ts<? AND user_id<>?"
         return self._conn.execute(sql, (str(asn), before.timestamp(), exclude_user)).fetchone()[0]
+
+    def asn_users(self, asn: int, before: datetime) -> set[str]:
+        """The accounts that used a network before ``before`` (what asn_user_count counts)."""
+        sql = "SELECT DISTINCT user_id FROM profile WHERE kind='asn' AND value=? AND first_ts<?"
+        return {r[0] for r in self._conn.execute(sql, (str(asn), before.timestamp()))}
+
+    # ------------------------------------- machines whose place is not the person's (machines.py)
+    # Each is asked once per run of the rules, never per sign-in.
+    def device_users(self) -> list[tuple[str, str, int | None, str, int, datetime]]:
+        """The activity record per device, account, network and device name: (device key - its id when it has one -,
+        user id, AS number, device name, sign-ins, first seen)."""
+        sql = ("SELECT device, user_id, json_extract(data, '$.asn'), json_extract(data, '$.device_name'), SUM(n), "
+               "MIN(first_ts) FROM activity GROUP BY 1, 2, 3, 4")
+        return [(device, user_id, int(asn) if asn else None, name or "", int(n), datetime.fromtimestamp(first, timezone.utc))
+                for device, user_id, asn, name, n, first in self._conn.execute(sql)]
+
+    def machine_marks(self, resource_ids: Iterable[str], start: datetime) -> list[SignIn]:
+        """Stored successful sign-ins since ``start`` that tell of another machine (machines.py), in one pass: to one
+        of these resources (a remote desktop client), with the device code flow, or with a remote desktop token."""
+        ids = sorted(set(resource_ids)) or [""]
+        sql = (f"SELECT data FROM signins WHERE ts>=? AND error_code=0 AND ("
+               f"json_extract(data, '$.resource_id') IN ({','.join('?' * len(ids))}) "
+               f"OR lower(json_extract(data, '$.auth_protocol'))='devicecode' "
+               f"OR lower(json_extract(data, '$.incoming_token'))='remotedesktoptoken') ORDER BY ts")
+        return [SignIn.from_json(r[0]) for r in self._conn.execute(sql, (start.timestamp(), *ids))]
+
+    def activity_mentioning(self, text: str, start: datetime) -> list[tuple[SignIn, datetime, datetime, int]]:
+        """Runs of activity since ``start`` whose first sign-in mentions ``text`` anywhere (as written): the same."""
+        sql = "SELECT data, first_ts, last_ts, n FROM activity WHERE last_ts>=? AND instr(data, ?)>0 ORDER BY first_ts"
+        return [(SignIn.from_json(data), datetime.fromtimestamp(first, timezone.utc), datetime.fromtimestamp(last, timezone.utc), n)
+                for data, first, last, n in self._conn.execute(sql, (start.timestamp(), text))]
+
+    def signins_at(self, user_id: str, ips: Iterable[str], start: datetime, end: datetime) -> list[SignIn]:
+        """The account's stored successful sign-ins from these addresses between ``start`` and ``end``."""
+        ips = sorted(set(ips))
+        if not ips:
+            return []
+        rows: list[SignIn] = []
+        for i in range(0, len(ips), 500):
+            chunk = ips[i:i + 500]
+            sql = (f"SELECT data FROM signins WHERE user_id=? AND ts>=? AND ts<=? AND error_code=0 "
+                   f"AND ip IN ({','.join('?' * len(chunk))})")
+            rows.extend(SignIn.from_json(r[0]) for r in self._conn.execute(sql, (user_id, start.timestamp(), end.timestamp(), *chunk)))
+        return sorted(rows, key=lambda s: s.created)
+
+    def network_runs(self, asn: int, user_ids: Iterable[str]) -> list[tuple[SignIn, datetime]]:
+        """Runs of activity of these accounts on one network: (first sign-in of the run, its begin)."""
+        users = sorted(set(user_ids))
+        if not users:
+            return []
+        sql = (f"SELECT data, first_ts FROM activity WHERE user_id IN ({','.join('?' * len(users))}) "
+               f"AND json_extract(data, '$.asn')=?")
+        return [(SignIn.from_json(data), datetime.fromtimestamp(first, timezone.utc))
+                for data, first in self._conn.execute(sql, (*users, int(asn)))]
 
     def ip_first_seen(self, ip: str) -> datetime | None:
         row = self._conn.execute("SELECT MIN(ts) FROM signins WHERE ip=?", (ip,)).fetchone()

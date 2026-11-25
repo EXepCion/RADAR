@@ -10,10 +10,11 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from . import APP_DISPLAY_NAME, __version__, audio, correlation, paths, startup
+from . import APP_DISPLAY_NAME, __version__, audio, correlation, disk, incidents, paths, startup
 from . import quiet as quiet_rules
 from .alerts import Alert, AlertCenter
 from . import tenant
@@ -85,6 +86,10 @@ class App:
             enabled=lambda: not self.demo and bool(self.cfg.get("general", "check_for_updates", default=True)),
             notified=lambda: str(self.cfg.get("general", "update_notified", default="") or ""),
             remember=lambda version: self.cfg.set("general", "update_notified", value=version))
+        self.disk = disk.Watch(
+            read=self.disk_status, enabled=lambda: not self.demo and self.remind_disk,
+            since=lambda: str(self.store.kv_get("radar", "disk_suspended_since", "") or ""),
+            remember=lambda value: self.store.kv_set("radar", "disk_suspended_since", value))
         self.scheduler = Scheduler(self)
         self._ui_queue: queue.Queue = queue.Queue()
         self._running: set[str] = set()
@@ -199,6 +204,8 @@ class App:
             self.on_alerts_changed()
         if self.updates.due():
             self.check_for_update()
+        if self.disk.due():
+            self.check_disk()
         if time.monotonic() >= self._next_purge:
             self._next_purge = time.monotonic() + 6 * 3600
             self.purge_old_alerts()
@@ -342,6 +349,9 @@ class App:
         except OperationCancelled:
             return False
         except GraphError as exc:
+            if _no_connection(exc):  # Graph was not reached at all (what the client raises after its retries)
+                return self._no_connection_now(plugin_id, exc)
+            self.offline = False
             if exc.status in (401, 403) and not self.setup_done:
                 self.last_error = "set-up not finished"
                 self._setup_needed(f"{rt.plugin.name}: HTTP {exc.status} {exc.code}")
@@ -358,11 +368,7 @@ class App:
             return False
         except Exception as exc:
             if _no_connection(exc):
-                # the PC is offline, on a network without a way out, or just woke up: nothing is broken
-                self.offline = True
-                self.last_error = "no connection to Microsoft - trying again"
-                log.warning("No connection to Microsoft (%s): %s is tried again", type(exc).__name__, plugin_id)
-                return False
+                return self._no_connection_now(plugin_id, exc)
             self.offline = False
             self.last_error = f"{rt.plugin.name}: {type(exc).__name__}: {exc}"
             log.exception("Plugin %s crashed", plugin_id)
@@ -389,14 +395,35 @@ class App:
         self.plugins.delivered(plugin_id)  # the findings are stored: now the plugin moves its bookmarks
         self._unfinished.pop(plugin_id, None)
         left = self.plugins.incomplete(plugin_id)
+        failing = self.plugins.failing(plugin_id)
         if left:
             self._report_problem(
                 f"incomplete:{plugin_id}", f"{rt.plugin.name}: not everything could be judged",
                 "; ".join(left)[:600] + ". What was read is kept and judged again by every scan until this works.",
                 "Nothing is lost meanwhile. If this stays, the log (RADAR > Settings > About) says more.", [])
+        elif failing:
+            # a check that failed scan after scan: the scans go on without it. Said once (the same reminder as "not
+            # everything could be judged" before), until it works again - the scans themselves did not fail
+            one = len(failing) == 1
+            if self.alerts.raise_system(
+                    f"incomplete:{plugin_id}",
+                    f"{rt.plugin.name}: {'a check keeps' if one else f'{len(failing)} checks keep'} failing",
+                    "; ".join(failing)[:600] + f". {'It' if one else 'They'} failed in several scans in a row, so RADAR "
+                    f"now judges without {'it' if one else 'them'}: everything else is checked as usual. "
+                    f"{'It is' if one else 'They are'} tried again with every scan; this reminder goes when "
+                    f"{'it works' if one else 'they work'} again.",
+                    "If this stays, the log (RADAR > Settings > About) says more."):
+                self.ui_call(self.reminders.show, True)
         else:
             self.alerts.resolve_system(f"incomplete:{plugin_id}")
         return True
+
+    def _no_connection_now(self, plugin_id: str, exc: BaseException) -> bool:
+        """The PC is offline, on a network without a way out, or just woke up: nothing is broken - tried again."""
+        self.offline = True
+        self.last_error = "no connection to Microsoft - trying again"
+        log.warning("No connection to Microsoft (%s): %s is tried again", type(exc).__name__, plugin_id)
+        return False
 
     # ------------------------------------------------------- reminders switched off
     def quiet_entries(self) -> list[quiet_rules.Quiet]:
@@ -545,9 +572,143 @@ class App:
         win = self._main = MainWindow(self.root, self, page, sub)
         return win
 
-    def show_main(self, page: str = "incidents", sub: str | None = None) -> None:
-        """Tray > Open RADAR: incidents, attacks, history, reports and the settings in one window."""
-        self.ui_call(self._open_main, page, sub)
+    def show_main(self, page: str | None = None, sub: str | None = None) -> None:
+        """Tray > Open RADAR: search, incidents, attacks, history, reports and the settings in one window. Without a
+        page named it opens on what needs attention: the incidents while one is open, the search otherwise."""
+        self.ui_call(lambda: self._open_main(page or self.start_page(), sub))
+
+    def start_page(self) -> str:
+        try:
+            now = datetime.now(timezone.utc)
+            alerts = self.alerts.since(now - timedelta(days=incidents.LOOKBACK_DAYS + 1))
+            return "incidents" if any(i.open for i in incidents.group(alerts, now)) else "search"
+        except Exception:  # noqa: BLE001 - whatever is wrong with the alerts, the window opens
+            return "incidents"
+
+    # ================================================================ search
+    OPENED_LAST = 6   # how many of the things opened last the search page offers
+
+    def search_history(self):
+        """The sign-in history for reading (a connection of the calling thread's own), or None before the first scan.
+        Opened read-only: it never waits for a scan that is writing to it."""
+        from .plugins.signin_threats.history import SignInHistory
+
+        path = paths.plugin_data_dir(self.ATTACK_PLUGIN) / "signins.db"
+        return SignInHistory(path, read_only=True) if path.exists() else None
+
+    def unfold(self, line) -> list[tuple[str, str]]:
+        """What a sign-in's line on a timeline unfolds into (radar.search.unfold). Called on the UI thread: the
+        history is read without waiting for a scan, and let go of at once."""
+        from . import search as finder
+
+        history = self.search_history()
+        if history is None:
+            return []
+        try:
+            return finder.unfold(history, line)
+        finally:
+            history.close()
+
+    def _directory(self):
+        from .plugins.signin_threats.accounts import AccountDirectory
+
+        return AccountDirectory.load(paths.plugin_data_dir(self.ATTACK_PLUGIN) / "accounts.json")
+
+    def search(self, text: str, limit: int = 5):
+        """What the stored data has for ``text`` (radar.search). Called off the UI thread."""
+        from . import search as finder
+
+        history = self.search_history()
+        if history is None:
+            return finder.Results(text)
+        try:
+            return finder.search(text, history, self._directory(), self.alerts.recent(2000), datetime.now(timezone.utc), limit)
+        finally:
+            history.close()
+
+    def search_signins(self, text: str):
+        """The sign-ins a search found, as lines for the table of all sign-ins. Called off the UI thread."""
+        from . import search as finder
+
+        history = self.search_history()
+        if history is None:
+            return []
+        try:
+            return finder.signin_list(text, history, self._directory(), datetime.now(timezone.utc))
+        finally:
+            history.close()
+
+    def account_view(self, user_id: str):
+        """Everything stored about one account (radar.search.account_view). Called off the UI thread."""
+        from . import search as finder
+
+        now = datetime.now(timezone.utc)
+        alerts = self.alerts.since(now - timedelta(days=max(finder.DAYS, incidents.LOOKBACK_DAYS) + 1))
+        names = self.store.kv_get(f"plugin:{self.ATTACK_PLUGIN}", "asn_names", {}) or {}
+        history = self.search_history()
+        if history is None:
+            return finder.AccountView(user_id, user_id)
+        try:
+            settings = self.cfg.get("plugins", self.ATTACK_PLUGIN, "settings", default={}) or {}
+            return finder.account_view(user_id, history, self._directory(), alerts, incidents.group(alerts, now), now, names, settings=settings)
+        finally:
+            history.close()
+
+    def thing_view(self, kind: str, key: str):
+        """Everything stored about a device, an address, a network, a country or an application. Off the UI thread."""
+        from . import search as finder
+
+        now = datetime.now(timezone.utc)
+        alerts = self.alerts.since(now - timedelta(days=max(finder.DAYS, incidents.LOOKBACK_DAYS) + 1))
+        names = self.store.kv_get(f"plugin:{self.ATTACK_PLUGIN}", "asn_names", {}) or {}
+        history = self.search_history()
+        if history is None:
+            return finder.AccountView(key, key, kind=kind, key=key)
+        try:
+            return finder.thing_view(kind, key, history, self._directory(), alerts, incidents.group(alerts, now), now, names)
+        finally:
+            history.close()
+
+    def search_age(self) -> str:
+        """How old what the search reads is: '30 days, up to 07:50 UTC+1' (the last scan that finished)."""
+        from . import search as finder
+
+        return f"{finder.DAYS} days, up to {timefmt.stamp(self.last_scan)}" if self.last_scan else f"{finder.DAYS} days"
+
+    def opened_last(self) -> list[dict]:
+        return list(self.store.kv_get("radar", "opened_last", []) or [])
+
+    def remember_opened(self, kind: str, key, title: str = "", line: str = "") -> None:
+        """What was opened from the search: offered again on its empty page (the newest first, each once)."""
+        mine = {"kind": kind, "key": key, "title": title or str(key), "line": line, "when": timefmt.stamp(datetime.now(timezone.utc))}
+        rest = [x for x in self.opened_last() if (x.get("kind"), x.get("key")) != (kind, key)]
+        self.store.kv_set("radar", "opened_last", ([mine] + rest)[:self.OPENED_LAST])
+
+    def clear_opened(self) -> None:
+        self.store.kv_set("radar", "opened_last", [])
+
+    def open_found(self, kind: str, key, title: str = "") -> None:
+        """Open what a search hit, a habit or a timeline line names (Tk thread)."""
+        if kind == "alert":
+            alert = self.alerts.get(int(key))
+            if alert is not None:
+                self.open_alert(alert)
+        elif kind == "signin":
+            rt = self.plugins.get(self.ATTACK_PLUGIN)
+            if rt is not None and rt.plugin.entry_id_field:
+                self.view_entry(None, {rt.plugin.entry_id_field: str(key), "Application": title})
+        elif kind == "change":
+            self.view_audit(audit_id=str(key))
+        else:  # an account, a device, an address, a network, a country, an application: its page
+            main = self._open_main("search")
+            page = main.page("search") if main is not None else None
+            if page is not None:
+                self.remember_opened(kind, key, title)
+                page.show_thing(kind, key, title)
+
+    def open_account_in_entra(self, user_id: str) -> None:
+        webbrowser.open("https://entra.microsoft.com/#view/Microsoft_AAD_UsersAndTenants/UserProfileMenuBlade/~/overview/userId/"
+                        + quote(str(user_id), safe=""))
 
     def show_incidents(self, select: str | None = None) -> None:
         """Alerts that belong to one story (same account or same attacker address), as one incident each.
@@ -676,7 +837,7 @@ class App:
         if self.paused:
             return "Status: paused"
         if self._running:
-            names = [self.plugins.get(p).plugin.name for p in self._running if self.plugins.get(p)]
+            names = self.running_names()
             return f"Status: scanning ({', '.join(names)})"
         if self.auth.state == "required":
             return "Status: sign-in required"
@@ -685,6 +846,11 @@ class App:
         if self.last_scan:
             return f"Status: OK, last scan {timefmt.clock(self.last_scan)}"
         return "Status: waiting for first scan"
+
+    def running_names(self) -> list[str]:
+        """The names of the plugins scanning right now. (The scheduler adds and removes them meanwhile: read from a
+        copy, each looked up once.)"""
+        return [rt.plugin.name for rt in (self.plugins.get(p) for p in list(self._running)) if rt]
 
     def plugin_status_text(self, rt: PluginRuntime) -> str:
         if rt.running:
@@ -772,27 +938,26 @@ class App:
             self.ui_call(say, text, error)
 
         def work() -> None:
-            try:
+            try:  # (whatever happens, the status says how it ended: "Looking up ..." never stays)
                 info = self.resolver.resolve(kind, getattr(entity, "ref", "") or entity.value)
+                if info is None:
+                    report(f"{entity.short} was not found in this directory (deleted, external, or not a directory "
+                           "object).", True)
+                    return
+                target = linkify.PRIMARY_ACTION.get(info["kind"], "") if action == "find_id" else action
+                url = linkify.portal_url(target, info) if target else ""
+                text = linkify.describe(info)
+                if url:
+                    self.open_link(url)
+                    report(f"Opened in Entra: {text}")
+                elif target in ("app_credentials", "app_owners") and info.get("kind") == "app":
+                    report(f"{text}: no app registration in this tenant (it belongs to another organisation), "
+                           "so there are no secrets or owners to show here.")
+                else:
+                    report(f"{entity.short} is the {text}.")
             except Exception as exc:
                 log.warning("Lookup of %s %s failed: %s", kind, entity.value, exc)
                 report(f"Could not look up {entity.short}: {exc}", True)
-                return
-            if info is None:
-                report(f"{entity.short} was not found in this directory (deleted, external, or not a directory "
-                       "object).", True)
-                return
-            target = linkify.PRIMARY_ACTION.get(info["kind"], "") if action == "find_id" else action
-            url = linkify.portal_url(target, info) if target else ""
-            text = linkify.describe(info)
-            if url:
-                self.open_link(url)
-                report(f"Opened in Entra: {text}")
-            elif target in ("app_credentials", "app_owners") and info.get("kind") == "app":
-                report(f"{text}: no app registration in this tenant (it belongs to another organisation), "
-                       "so there are no secrets or owners to show here.")
-            else:
-                report(f"{entity.short} is the {text}.")
 
         self._background(work, name="resolve")
 
@@ -918,13 +1083,13 @@ class App:
             self._show_attacks_result(win, kept[0], kept[1], True)
 
         def work() -> None:
-            error = self.refresh_threat_data() if refresh else ""
-            try:
+            try:  # (the page always hears back: a refresh that fails must not leave it turning)
+                error = self.refresh_threat_data() if refresh else ""
                 result = rt.plugin.ongoing(self.plugins.build_context(self.ATTACK_PLUGIN), hours)
                 as_of = self.threat_data_as_of()
             except Exception as exc:
                 log.exception("Ongoing-attacks overview failed")
-                self.ui_call(win.show_error, str(exc))
+                self.ui_call(win.show_error, str(exc) or type(exc).__name__)
                 return
             self._keep_attacks(result, as_of)
             self.ui_call(self._tell_attack_count, result)
@@ -1053,7 +1218,14 @@ class App:
                 return
             self.ui_call(self._open_exposure_report, finding, self.threat_data_as_of(), True, "")
 
-        self._background(work, name="exposure-report")
+        def said() -> None:  # (whatever goes wrong is said: the report was asked for and does not just stay away)
+            try:
+                work()
+            except Exception as exc:
+                log.exception("MFA exposure report could not be opened")
+                self.tray.notify(f"The MFA exposure report could not be opened: {str(exc) or type(exc).__name__}"[:250])
+
+        self._background(said, name="exposure-report")
 
     NO_EXPOSURE = "No account can sign in without MFA (no exclusions from the MFA policies)."
 
@@ -1092,9 +1264,19 @@ class App:
         win.age.set(busy=True, keep_time=True)
 
         def work() -> None:
-            error = self.refresh_threat_data()
-            finding = self._build_exposure_report()
-            self.ui_call(done, finding, self.threat_data_as_of(), error)
+            try:  # (the window always hears back: a refresh that fails must not leave it turning)
+                error = self.refresh_threat_data()
+                finding = self._build_exposure_report()
+                as_of = self.threat_data_as_of()
+            except Exception as exc:
+                log.exception("MFA exposure report could not be refreshed")
+                self.ui_call(failed, str(exc) or type(exc).__name__)
+                return
+            self.ui_call(done, finding, as_of, error)
+
+        def failed(error: str) -> None:
+            if win.exists():
+                win.age.set(busy=False, error=error, keep_time=True)
 
         def done(finding: Finding | None, as_of: datetime | None, error: str) -> None:
             if not win.exists():
@@ -1305,6 +1487,35 @@ class App:
         if not self.check_updates:
             self.updates.available = None
 
+    # ------------------------------------------------------ disk encryption
+    def disk_status(self) -> disk.Status:
+        """What Windows says about the disk RADAR keeps its data on (asked now)."""
+        return disk.read(paths.data_dir())
+
+    def check_disk(self) -> None:
+        """Remind when the disk is not encrypted (once, until it is - or until the reminder is switched off)."""
+        status, remind = self.disk.check()
+        if not remind:
+            if self.alerts.resolve_system(disk.ALERT_KEY):
+                self.on_alerts_changed()
+            return
+        title, summary, recommendation = disk.reminder(status)
+        if self.alerts.raise_system(disk.ALERT_KEY, title, summary, recommendation,
+                                    [("Open the Windows encryption settings", disk.SETTINGS_LINK)], severity=Severity.LOW):
+            log.info("Drive %s is not encrypted (%s): reminder raised", status.drive, status.what)
+            self.ui_call(lambda: self.reminders.show(True))
+
+    @property
+    def remind_disk(self) -> bool:
+        return bool(self.cfg.get("general", "remind_disk_not_encrypted", default=True))
+
+    def toggle_remind_disk(self) -> None:
+        self.cfg.set("general", "remind_disk_not_encrypted", value=not self.remind_disk)
+        self.check_disk()  # off: the reminder goes at once; on: it is there if there is reason for it
+
+    def open_disk_settings(self) -> None:
+        disk.open_settings()
+
     # ------------------------------------------------------------- set-up
     @property
     def identity_label(self) -> str:
@@ -1358,22 +1569,28 @@ class App:
         from . import identity, setup_check
 
         def work() -> None:
-            kind = identity.current(self.cfg.get("auth", default={}) or {})[0]
-            if other_account:
-                try:
-                    self.auth.sign_in_interactive(select_account=True)
-                    first = setup_check.Check(setup_check.SIGN_IN, "Sign in", True, True, f"signed in as {self.auth.account}")
-                except Exception as exc:  # noqa: BLE001
-                    first = setup_check.Check(setup_check.SIGN_IN, "Sign in", False, True, *setup_check.explain_auth(str(exc), kind))
-            else:
-                first = setup_check.sign_in(self.auth, kind)
-            if self.auth.state == "other_tenant":
-                self._other_tenant()
-            checks = [first]
-            self.ui_call(win.step_done, first)
-            if first.ok:
-                checks += setup_check.probe(GraphClient(self.auth, self.stop_event), self.auth.account or "", kind,
-                                            on_result=lambda c: self.ui_call(win.step_done, c))
+            checks: list = []
+            try:  # (the window always hears back: a check that stops on the way ends as one that did not pass)
+                kind = identity.current(self.cfg.get("auth", default={}) or {})[0]
+                if other_account:
+                    try:
+                        self.auth.sign_in_interactive(select_account=True)
+                        first = setup_check.Check(setup_check.SIGN_IN, "Sign in", True, True, f"signed in as {self.auth.account}")
+                    except Exception as exc:  # noqa: BLE001
+                        first = setup_check.Check(setup_check.SIGN_IN, "Sign in", False, True, *setup_check.explain_auth(str(exc), kind))
+                else:
+                    first = setup_check.sign_in(self.auth, kind)
+                if self.auth.state == "other_tenant":
+                    self._other_tenant()
+                checks.append(first)
+                self.ui_call(win.step_done, first)
+                if first.ok:
+                    checks += setup_check.probe(GraphClient(self.auth, self.stop_event), self.auth.account or "", kind,
+                                                on_result=lambda c: self.ui_call(win.step_done, c))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("The connection check stopped")
+                checks.append(setup_check.Check("stopped", "Check", False, True, f"the check stopped ({type(exc).__name__}: {exc}).",
+                                                "Check again in a moment. If this stays, the log (RADAR > Settings > About) says more."))
             self.ui_call(self._setup_checked, win, checks)
         self._background(work, name="setup-check")
 
@@ -1425,6 +1642,8 @@ class App:
             self.sign_in(True)
         elif url == FRESH_START_LINK:
             self.start_fresh()
+        elif url == disk.SETTINGS_LINK:
+            self.open_disk_settings()
         else:
             webbrowser.open(url)
 

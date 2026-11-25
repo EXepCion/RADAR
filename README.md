@@ -168,6 +168,10 @@ as. The reminders, the details of an alert and the live map are windows of their
   still judged and kept in the alert history, anything worse than the alert it was made from still comes, and
   *Settings > Reminders* lists what is switched off, with *Remind me again*. Alerts that belong to one incident are one
   row there: opened, snoozed and dismissed as one.
+- **Search** - one field that finds accounts, devices, IP addresses, networks, countries, applications, sign-ins and
+  alerts in what RADAR has stored. A hit opens its page: for an account who it is, what is open right now, its
+  habits, what stands out, where its devices were in the last days (*Movement*) and one timeline of sign-ins,
+  changes and alerts.
 - **Incidents** - alerts that belong to one story (the same account or the same attacker address, within days),
   the most urgent first. For the chosen one: how far along an attack it is and when each stage was reached, which
   accounts and addresses are involved, what was already done, its strongest finding, what to do, and its alerts
@@ -202,7 +206,14 @@ organisation to settle. Uninstalling with `-RemoveData` deletes it all.
 
 Only the sign-in token is encrypted. The databases, the settings and the log file are plain files in your Windows
 profile (`%LOCALAPPDATA%\RADAR`), protected by your Windows account like the rest of your profile; the log file
-names the account RADAR signs in with and its tenant. Use RADAR on a PC whose disk is encrypted.
+names the account RADAR signs in with and its tenant. Use RADAR on a PC whose disk is encrypted: RADAR asks Windows
+whether the drive its data is on is protected by BitLocker or device encryption, shows the answer under *Settings >
+Account and connection > Disk encryption*, and reminds you when it is not (also when protection stays suspended for
+a day). It only tells - nothing stops working - and the reminder can be switched off there, for a disk that is
+encrypted by something Windows does not report (another product, the host of a virtual PC).
+
+The live map opens in an Edge window with a browser profile of its own (`mapview-profile`). That profile is thrown
+away before a map window opens and after it closed.
 
 **One installation, one tenant.** The stored data belongs to the tenant of the first sign-in. If you later sign
 in to another tenant, RADAR reads nothing and asks: sign in with an account of the original tenant, or *start

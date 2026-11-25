@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -133,6 +134,8 @@ class AccountDirectory:
         return directory
 
     def save(self, path: Path) -> None:
+        """Written whole, then put in the place of the old file. A window or the live map may be reading the old one
+        at that moment - Windows does not let a file that is open be replaced: tried again for a moment."""
         tmp = Path(path).with_suffix(".tmp")
         tmp.write_text(json.dumps({
             "synced_at": self.synced_at.isoformat() if self.synced_at else None,
@@ -140,7 +143,14 @@ class AccountDirectory:
             "breakglass_groups": self.breakglass_groups, "licenses_synced": True,
             "accounts": {k: asdict(v) for k, v in self.accounts.items()},
         }), encoding="utf-8")
-        tmp.replace(path)
+        for attempt in range(8):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
 
 def sync_directory(graph, now: datetime, breakglass_groups: list[str] | None = None) -> AccountDirectory:

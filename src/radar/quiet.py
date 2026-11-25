@@ -21,7 +21,9 @@ from . import timefmt
 KEY = ("general", "quiet_reminders")
 NOTE_FIELD = "Reminder"
 PERIODS = [("for 30 days", 30), ("for 90 days", 90), ("for a year", 365)]
-NOT_FOR_PLUGINS = ("correlation", "system")  # conclusions drawn from other alerts, and RADAR's own notices
+# conclusions drawn from other alerts (chains.CHAIN_PLUGIN), and RADAR's own notices (alerts.SYSTEM_PLUGIN; not
+# imported: alerts imports this module)
+NOT_FOR_PLUGINS = ("correlation", "core")
 
 
 @dataclass(frozen=True)

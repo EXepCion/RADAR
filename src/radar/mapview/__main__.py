@@ -28,6 +28,7 @@ from .. import paths, screens
 from ..config import ConfigManager
 from ..plugins.signin_threats.accounts import AccountDirectory
 from ..plugins.signin_threats.history import SignInHistory
+from ..plugins.signin_threats.plugin import DATA_AS_OF
 from . import data
 
 log = logging.getLogger("radar.mapview")
@@ -47,7 +48,8 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=u
 
 
 class MapData:
-    """Reads what the tray app has collected. Opens the history per request and never writes to it."""
+    """Reads what the tray app has collected - the history, the settings, its state - and never writes to any of it:
+    the tray app looks after them."""
 
     def __init__(self, data_dir: Path | None = None, config_path: Path | None = None, db_path: Path | None = None):
         self.data_dir = data_dir or paths.plugin_data_dir(PLUGIN)
@@ -56,29 +58,49 @@ class MapData:
         self._lock = threading.Lock()
         self._cache: dict[Any, tuple[float, Any, dict[str, Any]]] = {}  # (attack hours, offline) -> (time, stamp, result)
         self._asn_names: dict[str, dict] | None = None
+        self._cfg: ConfigManager | None = None
+
+    def _config(self) -> ConfigManager:
+        """The tray app's settings, read only: read again when the file changed; while it is invalid (being edited)
+        the values read last stay - the map never repairs or rewrites it (that is the tray app's)."""
+        if self._cfg is None:
+            self._cfg = ConfigManager(self.config_path, read_only=True)
+        else:
+            self._cfg.reload_if_changed()
+        return self._cfg
 
     def settings(self) -> dict:
-        return ConfigManager(self.config_path).get("plugins", PLUGIN, "settings", default={}) or {}
+        return self._config().get("plugins", PLUGIN, "settings", default={}) or {}
+
+    def _state(self, key: str) -> Any:
+        """A value the tray app keeps for the sign-in plugin (read-only; None when there is none)."""
+        try:
+            conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute("SELECT value FROM kv WHERE namespace=? AND key=?", (f"plugin:{PLUGIN}", key)).fetchone()
+            finally:
+                conn.close()
+            return json.loads(row[0]) if row else None
+        except (sqlite3.Error, ValueError, OSError):
+            log.debug("%s not readable", key, exc_info=True)
+            return None
 
     def as_of(self) -> datetime | None:
-        """When the tray app last wrote the sign-in history (= its last scan)."""
-        stamps = [p.stat().st_mtime for p in (self.data_dir / "signins.db", self.data_dir / "signins.db-wal") if p.exists()]
-        return datetime.fromtimestamp(max(stamps), timezone.utc) if stamps else None
+        """When the tray app's last complete scan read the sign-ins: what it records as the age of its data (not the
+        time a file was written - opening a database to read it creates and touches files too). None: no scan has
+        been completed yet."""
+        recorded = self._state(DATA_AS_OF)
+        try:
+            return datetime.fromisoformat(str(recorded)).astimezone(timezone.utc) if recorded else None
+        except ValueError:
+            log.debug("data_as_of not readable: %r", recorded)
+            return None
 
     def asn_name(self, asn: int | None) -> str | None:
         """Network names the tray app has looked up before (read-only; the map does no lookups itself)."""
         if self._asn_names is None:
-            self._asn_names = {}
-            try:
-                conn = sqlite3.connect(f"file:{self.db_path.as_posix()}?mode=ro", uri=True, timeout=5)
-                try:
-                    row = conn.execute("SELECT value FROM kv WHERE namespace=? AND key=?",
-                                       (f"plugin:{PLUGIN}", "asn_names")).fetchone()
-                finally:
-                    conn.close()
-                self._asn_names = json.loads(row[0]) if row else {}
-            except (sqlite3.Error, ValueError, OSError):
-                log.debug("network names not readable", exc_info=True)
+            names = self._state("asn_names")
+            self._asn_names = names if isinstance(names, dict) else {}
         hit = self._asn_names.get(str(asn)) if asn else None
         return (hit or {}).get("n") or None
 
@@ -101,7 +123,7 @@ class MapData:
 
     def _history(self) -> SignInHistory | None:
         path = self.data_dir / "signins.db"
-        return SignInHistory(path) if path.exists() else None
+        return SignInHistory(path, read_only=True) if path.exists() else None
 
     def snapshot(self, attack_hours: float = 24, offline: bool = False) -> dict[str, Any]:
         """The map's data. Recomputed when the tray app has written new sign-ins (at most every CACHE_SECONDS) or
@@ -128,7 +150,7 @@ class MapData:
                                                      paths.plugin_data_dir(account_events.PLUGIN) / account_events.FILE))
                 finally:
                     history.close()
-            cfg = ConfigManager(self.config_path)
+            cfg = self._config()
             result["ui"] = {"dark": bool(cfg.get("general", "dark_mode", default=False)),
                             "animations": bool(cfg.get("general", "animations", default=True))}
             self._cache[cache_key] = (time.monotonic(), stamp, result)
@@ -232,15 +254,37 @@ def find_edge() -> str | None:
     return shutil.which("msedge")
 
 
+def clear_profile(profile: Path) -> bool:
+    """Throw the browser profile of the map window away, unless a map window is using it (False then: it is left
+    exactly as it is). Edge keeps its own bookkeeping there - hundreds of megabytes of components it downloads, and
+    traces of what it showed; none of it is needed a second time.
+
+    Whether it is in use is not guessed: the folder is moved aside first, which Windows refuses while the browser
+    has files open in it. What cannot be deleted then (a file a virus scanner holds) is swept the next time."""
+    for left in profile.parent.glob(profile.name + ".old-*"):
+        shutil.rmtree(left, ignore_errors=True)
+    if not profile.exists():
+        return True
+    aside = profile.with_name(f"{profile.name}.old-{time.time_ns()}")
+    try:
+        os.rename(profile, aside)
+    except OSError:
+        return False
+    shutil.rmtree(aside, ignore_errors=True)
+    return True
+
+
 def open_window(url: str, profile: Path) -> subprocess.Popen | None:
-    """An Edge app window (no address bar) with a profile of its own: the process lives as long as the window."""
+    """An Edge app window (no address bar) with a profile of its own: the process lives as long as the window.
+    The profile starts empty (see clear_profile) and Edge is told not to fetch its components into it."""
     edge = find_edge()
     if not edge:
         webbrowser.open(url)
         return None
+    clear_profile(profile)
     profile.mkdir(parents=True, exist_ok=True)
     args = [edge, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
-            "--no-default-browser-check", "--disable-sync", "--disable-extensions"]
+            "--no-default-browser-check", "--disable-sync", "--disable-extensions", "--disable-component-update"]
     return subprocess.Popen(args + window_bounds(screens.pointer_area()))
 
 
@@ -279,7 +323,8 @@ def serve(source: MapData | None = None, open_browser: bool = True) -> None:
     threading.Thread(target=server.serve_forever, name="map-http", daemon=True).start()
     log.info("Live map serving on port %s", server.server_address[1])
     heartbeat = source.data_dir / HEARTBEAT
-    window = open_window(url, paths.data_dir() / "mapview-profile") if open_browser else None
+    profile = paths.data_dir() / "mapview-profile"
+    window = open_window(url, profile) if open_browser else None
     try:
         while True:
             try:
@@ -297,6 +342,11 @@ def serve(source: MapData | None = None, open_browser: bool = True) -> None:
         except OSError:
             pass
         server.shutdown()
+        if open_browser:
+            for _attempt in range(10):  # (the browser needs a moment to let go of its files)
+                if clear_profile(profile):
+                    break
+                time.sleep(0.5)
         log.info("Live map closed")
 
 

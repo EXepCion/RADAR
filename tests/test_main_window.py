@@ -400,3 +400,31 @@ def test_the_attacks_page_opens_with_what_the_figure_was_counted_from(app, root)
     app.load_attacks(page, 24)                              # another period: nothing kept for it - and the figure on
     assert shown == [(3, False)] and win.nav.badge("attacks") == "3" and computed[2:] == [24]   # the navigation follows
     assert app.count_attacked_accounts() == 3 and computed[2:] == [24, 24]   # the page: counted for the period it shows
+
+
+def test_the_search_button_always_leads_to_the_search_field(app, root):  # noqa: F811
+    """A click on Search in the navigation shows the field, ready to be typed into - also from a page that was opened
+    from the search (an account, a device ...), which is part of the same section. A page that opens another page
+    goes through the same door and must not be sent back to the field."""
+    win = app._open_main()
+    settle(root)
+    win.show("search")
+    page = win.page("search")
+    focused = []
+    focus = page.focus
+    page.focus = lambda: (focused.append(1), focus())[1]
+    page.background = False                          # (read here and now: the test has no loop for a worker to call back into)
+    page.show_thing("account", "no-such-account", "Somebody")
+    for _ in range(200):                             # (it comes forward when it has been read)
+        settle(root, 2)
+        if page.stack.winfo_children()[-1] is page.account_view().top:
+            break
+    assert page.path and page.stack.winfo_children()[-1] is page.account_view().top      # a page is in view
+    win.show("search")                               # (what the app does before it opens the next page: nothing moves)
+    assert page.path and focused == []
+    win._nav_chosen("search")                        # the click
+    settle(root)
+    assert focused == [1] and page.path == [] and page.stack.winfo_children()[-1] is page.find
+    win.show("incidents")
+    win._nav_chosen("search")                        # ... and from another section
+    assert focused == [1, 1] and page.stack.winfo_children()[-1] is page.find

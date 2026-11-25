@@ -26,9 +26,9 @@ from ..plugin_api import Severity
 from . import icons, theme
 from .cardtable import CardTable
 from .reminder import SNOOZE_CHOICES
-from .richtext import autoscroll, stable_label
+from .richtext import stable_label
 from .tables import make_sortable
-from .parts import Hint, card
+from .parts import Hint, ScrollFrame, card
 from .rounded import round_points, rounded_image
 from .theme import px
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 WIDTH, HEIGHT, RAIL, SUB = 1400, 820, 204, 186
-SECTIONS = [("incidents", "Incidents", "story"), ("attacks", "Ongoing attacks", "aim"),
+SECTIONS = [("search", "Search", "search"), ("incidents", "Incidents", "story"), ("attacks", "Ongoing attacks", "aim"),
             ("history", "Alert history", "clock"), ("reports", "Reports", "report")]
 SETTINGS, MAP = "settings", "map"
 WELCOME = f"Welcome to {APP_DISPLAY_NAME}"
@@ -240,32 +240,6 @@ BADGE_ROLES = {"error": ("error", "card"), "warn": ("sev_medium_bg", "sev_medium
 AUTO_CLOSE = [("Never", 0), ("After 3 days", 3), ("After 7 days", 7), ("After 14 days", 14), ("After 30 days", 30)]
 
 
-class ScrollFrame(ttk.Frame):
-    """A frame whose content scrolls vertically (rows of settings); the inner frame is ``body``."""
-
-    def __init__(self, parent: tk.Misc):
-        super().__init__(parent)
-        canvas = self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, background=theme.color("window"))
-        bar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=autoscroll(bar))  # (the bar is there only when the rows do not fit)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        bar.grid(row=0, column=1, sticky="ns")
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, minsize=bar.winfo_reqwidth())  # its place is kept: the rows never change width
-        self.body = ttk.Frame(canvas)
-        self._window = canvas.create_window(0, 0, anchor="nw", window=self.body)
-        self.body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(self._window, width=e.width))
-        for widget in (canvas, self.body):
-            widget.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", self._wheel), add="+")
-            widget.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"), add="+")
-
-    def _wheel(self, event: tk.Event) -> None:
-        if self.canvas.winfo_exists() and self.body.winfo_reqheight() > self.canvas.winfo_height():
-            self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-
 class Rows:
     """Rows of a settings page, grouped in white cards: a title, an explanation under it, the controls on the right."""
 
@@ -423,7 +397,7 @@ class MainWindow:
         if key == MAP:
             self.app.show_map()
         else:
-            self.show(key)
+            self.show(key, clicked=True)
 
     @property
     def current(self) -> str:
@@ -460,8 +434,9 @@ class MainWindow:
         self.top.lift()
         self.top.focus_force()
 
-    def show(self, page: str, sub: str | None = None) -> None:
-        """Bring a section to the front (and, for the settings, one of its pages); built on first use."""
+    def show(self, page: str, sub: str | None = None, clicked: bool = False) -> None:
+        """Bring a section to the front (and, for the settings, one of its pages); built on first use. ``clicked``:
+        the user chose it in the navigation (not the app, on its way to somewhere in it)."""
         if page not in self.nav.items or page == MAP or (self._setup_mode and page != SETTINGS):
             page = SETTINGS if self._setup_mode else "incidents"
         came_from = self.current
@@ -476,6 +451,11 @@ class MainWindow:
         self._frames[page].tkraise()
         if page == SETTINGS:
             self.show_settings(sub or self.current_settings or "detection")
+        elif page == "search":
+            # Coming from another section, or by a click on Search itself - also from a page that was opened from the
+            # search: the field, ready to be typed into. (Not when the app comes through here to open the next page.)
+            if came_from != "search" or clicked:
+                self._pages["search"].focus()
         elif page == "attacks":
             win = self._pages.get("attacks")
             if win is not None and not getattr(win, "_loaded_once", False):
@@ -493,6 +473,10 @@ class MainWindow:
 
     def _build(self, page: str) -> tk.Misc:
         app, root, content = self.app, self.root, self.content
+        if page == "search":
+            from .search import SearchPage
+            win = self._pages[page] = SearchPage(root, app, content)
+            return win.top
         if page == "incidents":
             from .incidents import IncidentsWindow
             win = app._incidents = self._pages[page] = IncidentsWindow(root, app, parent=content)
@@ -663,7 +647,7 @@ class MainWindow:
     @staticmethod
     def _device_text() -> str:
         try:
-            return f"Plays on the default playback device: {audio.output_state().describe_device()}"
+            return f"Plays on the default playback device: {audio.output_state().describe_device(limit=200)}"  # (the line wraps: no need to cut)
         except Exception:  # noqa: BLE001
             return "Plays on the default playback device"
 
@@ -814,8 +798,7 @@ class MainWindow:
         if app.paused:
             return "warn", "Paused", "No scans until you resume"
         if app._running:
-            names = [app.plugins.get(p).plugin.name for p in app._running if app.plugins.get(p)]
-            return "link", "Scanning", ", ".join(names)
+            return "link", "Scanning", ", ".join(app.running_names())
         if app.auth.state == "required":
             return "error", "Sign-in required", "Settings > Account and connection"
         if app.last_error and getattr(app, "offline", False):
@@ -878,6 +861,8 @@ class MainWindow:
             self.status_app.configure(text=self._shorten(self.app_now()[0], theme.FONT_CAPTION))
         except tk.TclError:
             pass
+        except Exception:  # noqa: BLE001 - one status that cannot be read must not end the ones after it (see _tick)
+            log.exception("The status could not be shown")
 
     def _tick(self) -> None:
         if not self.exists():

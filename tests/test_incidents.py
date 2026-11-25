@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from radar import chains, incidents
-from radar.alerts import ACTIVE, DISMISSED, AlertCenter
+from radar.alerts import ACTIVE, DISMISSED, SYSTEM_PLUGIN, AlertCenter
 from radar.plugin_api import Finding, Severity
 from radar.store import Store
 from radar.ui import theme
@@ -80,8 +80,8 @@ def test_responses_join_the_incident_and_dismissed_incidents_are_closed():
     anna = next(i for i in found if ANNA in i.accounts)
     assert anna.own == 2 and "device_registration" in [x.rule_id for x in anna.alerts]
     # reminders about the app itself are never part of an incident
-    ac.ingest("system", [alert("h1", "health", 50, 1), alert("h2", "health", 50, 0.5)])
-    assert len(grouped(ac)) == 2
+    ac.ingest(SYSTEM_PLUGIN, [alert("h1", "health", 50, 1), alert("h2", "health", 50, 0.5)])
+    assert len(grouped(ac)) == 2 and not any(a.rule_id == "health" for i in grouped(ac) for a in i.alerts)
 
 
 @pytest.fixture(scope="module")

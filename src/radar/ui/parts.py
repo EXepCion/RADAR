@@ -7,6 +7,7 @@ from tkinter import ttk
 from typing import Any, Callable
 
 from . import theme
+from .richtext import autoscroll
 from .rounded import Rounded, background_of, rounded_image
 from .theme import px
 
@@ -24,6 +25,109 @@ def on_card(parent: tk.Misc, **kw: Any) -> tk.Frame:
 def line(parent: tk.Misc) -> tk.Frame:
     """A hairline across a card."""
     return tk.Frame(parent, height=1, background=theme.color("border"), bd=0, highlightthickness=0)
+
+
+class ScrollFrame(ttk.Frame):
+    """A frame whose content scrolls vertically (rows of settings); the inner frame is ``body``."""
+
+    def __init__(self, parent: tk.Misc, ground: str = "window"):
+        """``ground``: what it stands on - the window, or ("card") a card."""
+        super().__init__(parent, **({} if ground == "window" else {"style": "Card.TFrame"}))
+        self.on_scroll: Callable[[float, float], None] | None = None   # told the part in view (0..1, 0..1) whenever it changes
+        canvas = self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, background=theme.color(ground))
+        bar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        shown = autoscroll(bar)  # (the bar is there only when the rows do not fit)
+
+        def scrolled(first: str, last: str) -> None:
+            shown(first, last)
+            if self.on_scroll is not None:
+                self.on_scroll(float(first), float(last))
+
+        canvas.configure(yscrollcommand=scrolled)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, minsize=bar.winfo_reqwidth())  # its place is kept: the rows never change width
+        self.body = ttk.Frame(canvas) if ground == "window" else tk.Frame(canvas, background=theme.color(ground), bd=0, highlightthickness=0)
+        self._window = canvas.create_window(0, 0, anchor="nw", window=self.body)
+        self.body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(self._window, width=e.width))
+        canvas._scrolls = self  # type: ignore[attr-defined]  # (see _wheel_anywhere)
+        root = canvas._root()
+        if not getattr(root, "_radar_wheel", False):
+            root._radar_wheel = True  # type: ignore[attr-defined]
+            root.bind_all("<MouseWheel>", _wheel_anywhere, add="+")
+
+    NOTCH = 100      # how far one notch of the wheel goes
+    SCROLL_MS = 110  # ... and how long the way there takes (at once with animations off)
+
+    def _wheel(self, event: tk.Event) -> None:
+        if not self.canvas.winfo_exists():
+            return
+        going = getattr(self, "_going", None)   # (a notch while it is still moving adds to where it is going)
+        start = going if going is not None else self.canvas.canvasy(0)
+        self.scroll_to(start + (-1 if event.delta > 0 else 1) * px(self.NOTCH))
+
+    def scroll_to(self, top: float) -> None:
+        """Move softly until ``top`` (pixels from the beginning of the rows) is at the upper edge - as far as the
+        rows go."""
+        try:
+            total, height = max(1, self.body.winfo_reqheight()), self.canvas.winfo_height()
+            if total <= height:
+                return
+            goal = max(0.0, min(float(total - height), float(top)))
+            begin = float(self.canvas.canvasy(0))
+            self._going: float | None = goal
+            self._scroll_run = run = getattr(self, "_scroll_run", 0) + 1
+        except tk.TclError:
+            return
+
+        def step(t: float) -> None:
+            if run != self._scroll_run:
+                return
+            self.canvas.yview_moveto((begin + (goal - begin) * t) / total)
+            if t >= 1.0:
+                self._going = None
+
+        theme.animate(self.canvas, self.SCROLL_MS, step)
+
+    def see(self, widget: tk.Misc) -> None:
+        """Scroll as far as it takes to have ``widget`` (something on the body) in view."""
+        try:
+            self.update_idletasks()
+            top = widget.winfo_rooty() - self.body.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            height = self.canvas.winfo_height()
+            going = getattr(self, "_going", None)
+            first = going if going is not None else self.canvas.canvasy(0)
+            if top < first:
+                self.scroll_to(top)
+            elif bottom > first + height:
+                self.scroll_to(bottom - height)
+        except tk.TclError:
+            pass
+
+
+SCROLL_THEMSELVES = {"Text", "Treeview", "Listbox", "TCombobox", "TSpinbox", "Spinbox", "Scale", "TScale"}
+
+
+def _wheel_anywhere(event: tk.Event) -> None:
+    """The mouse wheel, wherever it is turned: it scrolls the scroll area the pointer is on - whatever stands under
+    the pointer there (a label, a picture, a row), not only the bare ground between them. What scrolls by itself
+    (a text, a table) keeps the wheel to itself."""
+    widget: Any = event.widget
+    while widget is not None and not isinstance(widget, str):
+        frame = getattr(widget, "_scrolls", None)
+        if frame is not None:
+            frame._wheel(event)
+            return
+        try:
+            if isinstance(widget, (tk.Toplevel, tk.Tk)) or SCROLL_THEMSELVES.intersection(widget.bindtags()) or widget.bind("<MouseWheel>"):
+                return
+        except tk.TclError:
+            return
+        widget = getattr(widget, "master", None)
 
 
 class Hint:
@@ -73,6 +177,39 @@ class Hint:
         except tk.TclError:
             pass
         self._due = self._tip = None
+
+
+class Tips:
+    """The whole text of what is shown shortened ("…"), in a small note under the pointer that rests on it - for the
+    parts of a canvas (its items) and of a text (its tags), which are no widgets a :class:`Hint` could be bound to.
+
+    The rule it serves: wherever a text is cut off, the whole of it can be read by pointing at it. ``add(what, whole)``
+    after whatever else is bound to that item or tag (it adds to their bindings)."""
+
+    def __init__(self, widget: Any) -> None:
+        self.widget, self._text = widget, ""
+        self.whole: dict[Any, str] = {}   # what has a note, and what the note says
+        self.hint = Hint((), lambda: self._text)
+        widget.bind("<Leave>", lambda _e=None: self.hint.hide(), add="+")
+        widget.bind("<ButtonPress>", lambda _e=None: self.hint.hide(), add="+")
+
+    def add(self, what: Any, whole: str) -> None:
+        self.whole[what] = whole
+        self.widget.tag_bind(what, "<Enter>", lambda _e=None, text=whole: self._over(text), add="+")
+        self.widget.tag_bind(what, "<Leave>", lambda _e=None: self.hint.hide(), add="+")
+
+    def clear(self) -> None:
+        self.whole = {}
+        self.hint.hide()
+
+    def show_for(self, text: str) -> None:
+        """The pointer came onto something whose note is ``text`` - for parts that are drawn anew as the view moves
+        and are bound once for all of them (the bars of the Movement card), not each by itself with ``add``."""
+        self._over(text)
+
+    def _over(self, text: str) -> None:
+        self._text = text
+        self.hint._wait(self.widget)
 
 
 class Tiles(ttk.Frame):

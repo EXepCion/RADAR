@@ -35,22 +35,29 @@ HEADING_TEXT_SHIFT = 4  # Tk draws cell text this much further in than heading t
 LIGHT = {
     "window": "#f3f3f3", "card": "#ffffff", "border": "#e5e5e5", "track": "#e6e6e6", "heading_bg": "#f9f9f9",
     "text": "#1a1a1a", "muted": "#5d5d5d", "link": "#005fb8", "select": "#cce4f7",
-    "row_select": "#dcebf8", "new_row": "#eef5fc", "attention": "#fff4ce", "menu_hover": "#f0f0f0", "disabled": "#a3a3a3",
+    "row_select": "#dcebf8", "new_row": "#eef5fc", "alert_bg": "#fdf6ea", "attention": "#fff4ce", "menu_hover": "#f0f0f0", "disabled": "#a3a3a3",
     "rail": "#eaeaeb", "rail_select": "#dcdcdd", "rail_hover": "#e3e3e4",
     "error": "#a4262c", "pos": "#a4262c", "neg": "#107c10", "warn": "#8a5300",
     "sev_high_bg": "#fde7e9", "sev_high_fg": "#a4262c", "sev_medium_bg": "#fdeadb", "sev_medium_fg": "#8a3b00",
     "sev_low_bg": "#fff4ce", "sev_low_fg": "#7a4600", "sev_info_bg": "#ebebeb", "sev_info_fg": "#5d5d5d",
     "diff_add": "#dff6dd",
+    # a chart over time: its lines every few hours and at midnight; the places of the Movement card, in the order they
+    # are given out (the first three tell apart best, also for eyes that do not see every colour), and the grey of
+    # all places beyond them
+    "grid": "#ececec", "grid_strong": "#d9d9d9",
+    "place1": "#2f6fd0", "place2": "#b56a00", "place3": "#0b7f73", "place4": "#c03a7e", "place5": "#7b5cc4", "place_other": "#7d7d7d",
 }
 DARK = {
     "window": "#202020", "card": "#2b2b2b", "border": "#3d3d3d", "track": "#454545", "heading_bg": "#323232",
     "text": "#f3f3f3", "muted": "#ababab", "link": "#60cdff", "select": "#264f78",
-    "row_select": "#2e4a66", "new_row": "#26333f", "attention": "#4a3b10", "menu_hover": "#383838", "disabled": "#6f6f6f",
+    "row_select": "#2e4a66", "new_row": "#26333f", "alert_bg": "#3a3020", "attention": "#4a3b10", "menu_hover": "#383838", "disabled": "#6f6f6f",
     "rail": "#1a1a1b", "rail_select": "#343435", "rail_hover": "#272728",
     "error": "#ff99a4", "pos": "#ff99a4", "neg": "#6ccb5f", "warn": "#fcb76a",
     "sev_high_bg": "#4a2327", "sev_high_fg": "#ff99a4", "sev_medium_bg": "#4a2f1a", "sev_medium_fg": "#ffb86b",
     "sev_low_bg": "#4a3b10", "sev_low_fg": "#f9e2a6", "sev_info_bg": "#3a3a3a", "sev_info_fg": "#ababab",
     "diff_add": "#1e3a22",
+    "grid": "#363636", "grid_strong": "#4a4a4a",
+    "place1": "#6ea8ff", "place2": "#ffb961", "place3": "#4fd1c1", "place4": "#f78bb8", "place5": "#b39cf0", "place_other": "#a3a3a3",
 }
 # light-palette constants kept for callers / tests that compare against them
 MUTED, HEADER_BG, TEXT_BG, BORDER = LIGHT["muted"], LIGHT["window"], LIGHT["card"], LIGHT["border"]
@@ -427,7 +434,7 @@ def title_bar(top: tk.Misc) -> None:
 ICONS = {"open": "\ue8a7", "copy": "\ue8c8", "clock": "\ue823", "check": "\ue73e", "refresh": "\ue72c",
          # the main window's navigation
          "link": "\ue71b", "target": "\ue7ba", "history": "\ue81c", "document": "\ue8a5", "globe": "\ue774",
-         "settings": "\ue713", "story": "\uf003", "aim": "\uf272", "report": "\uf000"}
+         "settings": "\ue713", "search": "\ue721", "device": "\ue7f8", "network": "\ue968", "pin": "\ue707", "apps": "\ueca5", "back": "\ue76b", "story": "\uf003", "aim": "\uf272", "report": "\uf000"}
 #: glyphs only the Windows 11 icon font has, and what the older one (Windows 10) shows in their place
 ICONS_OLD_FONT = {"story": "link", "aim": "target", "report": "document"}
 ACCENT_FG = {False: "#ffffff", True: "#000000"}  # text on the accent button (sv-ttk: white on blue / black on cyan)
@@ -754,6 +761,28 @@ def reveal(top: tk.Misc, fade_ms: int = 180) -> None:
         top.after(REVEAL_DELAY_MS + fade_ms + 600, lambda: _safe_alpha(top, 1.0))
     except tk.TclError:
         pass
+
+
+def underlined(widget: tk.Misc, name: str):
+    """The named font ``name`` with an underline - a font of its own, in every other respect the same, to the pixel.
+
+    To the pixel is the point. A copy made the usual way (``Font(font=...)``) is given its size in whole points, and
+    at some scalings that is a pixel or two more or less than the original: at 150 % a text became 7 % smaller when
+    it was underlined. A link that is underlined under the pointer then shrinks away from a pointer resting on its
+    last pixels, is no longer under it, goes back to its size, is under it again ... without end - the window stops
+    answering. So the copy takes the original's options as they are set (the size in pixels), and follows them when
+    the scale changes."""
+    import tkinter.font as tkfont
+
+    root = widget._root()
+    fonts = root.__dict__.setdefault("_radar_underlined", {})
+    options = dict(tkfont.nametofont(name, root=root).configure())
+    options["underline"] = 1
+    if name not in fonts:
+        fonts[name] = tkfont.Font(root=root, name=f"{name}Underlined", exists=False, **options)
+    else:
+        fonts[name].configure(**options)
+    return fonts[name]
 
 
 # ------------------------------------------------------------- animation

@@ -145,7 +145,8 @@ class Assessor:
         window = timedelta(minutes=minutes)
         for o in self.rc.history.query(s.created - window, s.created + window, user_id=s.user_id,
                                        device_id=s.device_id, success=True):
-            if o.id != s.id and o.country and o.country != s.country:
+            # (a device-code sign-in names the approving device, at the address of the machine that asked)
+            if o.id != s.id and o.country and o.country != s.country and not self.rc.on_virtual_host(o):
                 return o
         return None
 
@@ -175,7 +176,7 @@ class Assessor:
         before_it = first - self.familiar_after
         if began is None or began > before_it or first <= at - self.unvouched_after:
             return True
-        runs = self._cached(("runs", user_id), lambda: h.activity(self.rc.now - timedelta(days=31), self.rc.now, user_id))
+        runs = self.rc.runs(user_id)
         older = h.user_devices(user_id, before_it)
         mine, others = set(), set()
         for o, begin, _end, _n in runs:
@@ -194,22 +195,48 @@ class Assessor:
         """Networks that are the account's own: in use for long enough, or new but used by a device that is the
         account's own - the phone on a hotel's Wi-Fi makes that network the user's at once. Not by age alone: a
         network on which a device nobody vouches for is at work and none of the account's own (a stranger's
-        datacenter with the device he registered, however long he stays)."""
+        datacenter with the device he registered, however long he stays). Nor by what was done on a machine whose
+        place is not the person's (machines.py: a virtual machine in a cloud, a remote desktop): only the account's
+        other use of such a network counts."""
         def find() -> set[int]:
             h, cut = self.rc.history, self.familiar_before(s)
-            aged = h.user_asns(s.user_id, cut)
+            machines = self.rc.machines.networks(s.user_id)
+            aged = {asn for asn in h.user_asns(s.user_id, cut)
+                    if asn not in machines or (machines[asn][0] is not None and machines[asn][0] < cut)}
             devices = self.devices(s)
-            runs = self._cached(("runs", s.user_id), lambda: h.activity(self.rc.now - timedelta(days=31), self.rc.now, s.user_id))
             own, strangers = set(), set()
-            for o, begin, _end, _n in runs:
+            for o, begin, _end, _n, machine in self.rc.machines.runs(s.user_id):
                 if not o.asn or begin >= s.created:
                     continue
                 if o.device_id in devices or self.rc.trusted(o):
-                    own.add(o.asn)
+                    if not machine:
+                        own.add(o.asn)
                 elif o.device_id:
                     strangers.add(o.asn)
             return (aged - (strangers - own)) | own
         return self._cached(("uasn", s.user_id, s.created), find)
+
+    def network_stats(self, s: SignIn) -> tuple | None:
+        """(first seen, successful sign-ins) of the sign-in's network for the account - of a network it used on a
+        machine whose place is not the person's, only the rest of its use (see asns)."""
+        def find():
+            machines = self.rc.machines.networks(s.user_id)
+            if s.asn in machines:
+                first, n = machines[s.asn]
+                return (first, n) if first is not None else None
+            return self.rc.history.user_network_stats(s.user_id, s.asn)
+        return self._cached(("ustat", s.user_id, s.asn), find)
+
+    def colleagues(self, s: SignIn, net: tuple[str, str] | None) -> int:
+        """How many other accounts use the sign-in's network - of a cloud or hosting network not those that use it
+        only on a machine there (machines.Machines.colleagues)."""
+        from .machines import CLOUD_CATEGORIES
+
+        def find() -> int:
+            if net and net[1].lower() in CLOUD_CATEGORIES:
+                return self.rc.machines.colleagues(s.asn, s.created, s.user_id)
+            return self.rc.history.asn_user_count(s.asn, s.created, s.user_id)
+        return self._cached(("asnp", s.asn, s.user_id), find)
 
     def known_device(self, s: SignIn) -> bool:
         return bool(s.device_id) and s.device_id in self.devices(s)
@@ -262,16 +289,16 @@ class Assessor:
             if vpn_days >= HABIT_MIN_VPN_DAYS:
                 f.append(Factor(-10, f"User regularly signs in through VPNs ({vpn_days} earlier days in 30)"))
         if s.asn and not trusted:
-            stats = self._cached(("ustat", s.user_id, s.asn), lambda: h.user_network_stats(s.user_id, s.asn))
+            stats = self.network_stats(s)
             habitual = bool(stats and stats[0] <= s.created - timedelta(days=HABIT_MIN_DAYS)
                             and stats[1] >= HABIT_MIN_SIGNINS and s.asn in self.asns(s))
             if habitual:
                 f.append(Factor(-15, f"Habitual network of the user ({self.asn_label(s.asn)}: {stats[1]} sign-ins "
-                                     f"since {stats[0]:%d.%m.})"))
+                                     f"since {stats[0].astimezone():%d.%m.})"))
             elif s.asn in self.asns(s):
                 f.append(Factor(-10, f"User's usual network ({self.asn_label(s.asn)})"))
             else:
-                peers = self._cached(("asnp", s.asn, s.user_id), lambda: h.asn_user_count(s.asn, s.created, s.user_id))
+                peers = self.colleagues(s, net)
                 if peers >= 3:
                     f.append(Factor(-10, f"Network {self.asn_label(s.asn)} also used by {peers} colleagues"))
                 elif peers == 0:

@@ -42,6 +42,21 @@ def test_a_time_is_written_with_its_zone_and_summer_time_is_told_apart():
         assert timefmt.stamp(winter)[-6:] != timefmt.stamp(summer)[-6:]
 
 
+def test_from_when_until_when_within_a_week_says_its_zone_once_and_each_where_the_clocks_changed():
+    utc1 = timezone(timedelta(hours=1))
+    sunday = datetime(2026, 11, 22, 6, 0, tzinfo=utc1)
+    local = sunday.astimezone()
+    assert timefmt.weekday_bare(sunday) == f"{local:%a %H:%M}" and timefmt.weekday_bare(None) == ""
+    later = sunday + timedelta(hours=2, minutes=10)
+    assert timefmt.span(sunday, later) == f"{local:%a %H:%M} – {later.astimezone():%H:%M} {timefmt.zone(later.astimezone())}"
+    assert timefmt.span(sunday, sunday) == f"{local:%a %H:%M} {timefmt.zone(local)}"                # a moment
+    monday = sunday + timedelta(days=1)
+    assert timefmt.span(sunday, monday).endswith(f"{monday.astimezone():%a %H:%M} {timefmt.zone(monday.astimezone())}")   # another day: its name
+    winter, summer = datetime(2026, 1, 15, 12, 0).astimezone(), datetime(2026, 7, 15, 12, 0).astimezone()
+    if winter.utcoffset() != summer.utcoffset():
+        assert timefmt.unzoned(timefmt.span(winter, summer)) == []                                  # each with its own zone
+
+
 def test_times_without_a_zone_are_found_and_older_texts_get_theirs():
     assert timefmt.unzoned("From 06.11. 15:53 - 16.11. 12:27") == ["06.11. 15:53", "16.11. 12:27"]
     assert timefmt.unzoned("at 2026-11-16 07:50:24 and 14:02, 09.11.2026 11:00") == ["2026-11-16 07:50:24", "14:02", "09.11.2026 11:00"]

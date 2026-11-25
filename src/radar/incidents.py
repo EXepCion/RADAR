@@ -25,13 +25,13 @@ from datetime import datetime, timedelta
 from typing import Iterable
 
 from . import chains
-from .alerts import ACTIVE, MUTED, SNOOZED, Alert
+from .alerts import ACTIVE, MUTED, SNOOZED, SYSTEM_PLUGIN, Alert
 from .correlation import NOT_A_PARTNER_RULES
 from .plugin_api import Severity
 
 LOOKBACK_DAYS = 30
 GAP_DAYS = 7  # alerts further apart than this are not the same story, even about the same account
-SYSTEM_PLUGINS = {"system"}
+SYSTEM_PLUGINS = {SYSTEM_PLUGIN}  # RADAR's own notices (sign-in needed, a check that keeps failing ...)
 
 
 @dataclass

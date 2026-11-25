@@ -1,4 +1,5 @@
 """'Set up RADAR' window: choose how RADAR signs in, then see - step by step - whether it can read what it needs.
+Below that, independent of the sign-in: whether the disk RADAR keeps its data on is encrypted (radar.disk).
 
 Shown on the first start and from Settings > Account > Set-up and connection check. While set-up is not finished,
 sign-in and permission problems are explained here (with "Check again") instead of being raised as alerts.
@@ -11,17 +12,17 @@ from typing import TYPE_CHECKING, Any
 
 from PIL import ImageTk
 
-from .. import identity, setup_check
+from .. import disk, identity, setup_check
 from ..setup_check import Check
 from . import icons, theme
-from .parts import card, on_card
+from .parts import ScrollFrame, card, on_card
 from .richtext import card_label, stable_label
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..app import App
 
-WIDTH = 780
+WIDTH = 920   # (both ways to sign in show their whole title; the page keeps room for its scroll bar)
 INTRO = ("To read the logs from Microsoft Graph, RADAR has to sign in as an application. RADAR has no application "
          "identity of its own, so you choose once which one it uses.")
 OWN_TEXT = ("RADAR appears in your sign-in logs under the name you gave the registration, and you can allow or block "
@@ -38,6 +39,16 @@ WAITING, RUNNING, OK, FAILED, SKIPPED = "waiting", "running", "ok", "failed", "s
 MARK = {WAITING: "○", RUNNING: "◔", OK: "✔", FAILED: "✖", SKIPPED: "–"}
 ROLE = {WAITING: "muted", RUNNING: "link", OK: "neg", FAILED: "error", SKIPPED: "muted"}  # palette roles
 LONGEST = "words that wrap " * 30  # room for the longest hint (the label keeps this height)
+HEIGHT = 905   # everything shows at this height; on a smaller screen the page scrolls
+DISK = {  # state -> mark, its colour, the title, what follows the drive in the line below
+    disk.ENCRYPTED: (OK, "neg", "The disk RADAR keeps its data on is encrypted", "{what}"),
+    disk.NOT_ENCRYPTED: (FAILED, "error", "The disk RADAR keeps its data on is not encrypted",
+                         "{what} · sign-in history and alerts are plain files"),
+    disk.SUSPENDED: (FAILED, "warn", "The disk RADAR keeps its data on: encryption suspended",
+                     "usual during some Windows updates; a reminder follows after a day"),
+    disk.UNKNOWN: (SKIPPED, "muted", "Whether the disk RADAR keeps its data on is encrypted could not be determined",
+                   "RADAR can only see BitLocker and Windows device encryption"),
+}
 
 
 class SetupWindow:
@@ -47,7 +58,7 @@ class SetupWindow:
         kind, client, tenant = identity.current(app.cfg.get("auth", default={}) or {})
         top = self.top = theme.new_window(root, parent=parent, on_close=on_close)
         top.title("Set up RADAR")
-        top.geometry(f"{px(WIDTH)}x{min(px(860), int(top.winfo_screenheight() * 0.9))}")
+        top.geometry(f"{px(WIDTH)}x{min(px(HEIGHT), int(top.winfo_screenheight() * 0.9))}")
         top.resizable(False, False)
         top.bind("<Escape>", lambda _e: theme.close(top))
         self._icon = ImageTk.PhotoImage(icons.app_icon(32), master=root)
@@ -64,8 +75,10 @@ class SetupWindow:
         pad = 0 if theme.is_panel(top) else px(20)  # (a page has its host's margins)
         body = ttk.Frame(top, padding=(pad, px(8), pad, px(8) if theme.is_panel(top) else px(14)))
         body.pack(fill="both", expand=True)
-        box = card(body)
-        box.pack(fill="both", expand=True)
+        self.scroll = ScrollFrame(body)  # (a small screen, a low main window: the page scrolls, nothing is cut off)
+        self.scroll.pack(fill="both", expand=True)
+        box = card(self.scroll.body)
+        box.pack(fill="x")
 
         def section(text: str) -> None:
             strip = tk.Frame(box, background=c("heading_bg"), bd=0, highlightthickness=0, padx=px(16), pady=px(7))
@@ -136,6 +149,29 @@ class SetupWindow:
             detail = card_label(text, "", "muted", font=theme.FONT_CAPTION)  # shown once there is something to say
             tk.Frame(box, height=1, background=c("border"), bd=0, highlightthickness=0).pack(fill="x")
             self.rows[key] = (mark, detail)
+        # ---- 3: is the disk the data is on encrypted? Known at once, no part of the check above
+        section("3 · Disk encryption")
+        row = self.disk_row = on_card(box, padx=px(16), height=px(46))
+        row.pack(fill="x")
+        row.pack_propagate(False)  # the same height in every state
+        self.disk_mark = tk.Label(row, text="", width=2, font=theme.FONT_BOLD, background=c("card"), bd=0, padx=0, pady=0)
+        self.disk_mark.pack(side="left", padx=(0, px(10)))
+        self._remind = tk.BooleanVar(value=bool(app.remind_disk))
+        self.disk_remind = ttk.Checkbutton(row, text="", variable=self._remind, style="Card.TCheckbutton",
+                                           command=self._toggle_remind)
+        self.disk_button = ttk.Button(row, text="Windows settings", command=app.open_disk_settings)
+        text = on_card(row)
+        self.disk_title = card_label(text, "")
+        self.disk_title.pack(anchor="w")
+        self.disk_detail = card_label(text, "", "muted", font=theme.FONT_CAPTION)
+        self.disk_detail.pack(anchor="w")
+        self._disk_text = text
+        self.refresh_disk()
+        top.bind("<FocusIn>", lambda e: self.refresh_disk() if e.widget is top else None, add="+")  # (back from Windows' settings)
+
+        # ---- what it all comes to. Last on the card: the room it keeps for the longest message is then empty space
+        # at the end and not a hole in the middle, and nothing below it can move
+        tk.Frame(box, height=1, background=c("border"), bd=0, highlightthickness=0).pack(fill="x")
         result = on_card(box, padx=px(16), pady=px(10))
         result.pack(fill="x")
         self.headline = tk.Label(result, text="", justify="left", anchor="w", wraplength=full, font=theme.FONT,
@@ -165,6 +201,31 @@ class SetupWindow:
         self.top.deiconify()
         self.top.lift()
         self.top.focus_force()
+
+    def refresh_disk(self) -> None:
+        """Ask Windows again and show what it says."""
+        if not self.exists():
+            return
+        status = self.app.disk_status()
+        state, role, title, detail = DISK[status.state]
+        self.disk_mark.configure(text=MARK[state], foreground=theme.color(role))
+        self.disk_title.configure(text=title)
+        where = f"Drive {status.drive} · " if status.drive else ""
+        self.disk_detail.configure(text=where + detail.format(what=status.what))
+        known = status.state != disk.UNKNOWN  # (where Windows cannot say, there is nothing to remind of)
+        self._remind.set(bool(self.app.remind_disk))
+        self.disk_remind.configure(text="Remind me when it is not" if status.state == disk.ENCRYPTED else "Remind me")
+        for widget in (self.disk_remind, self.disk_button, self._disk_text):
+            widget.pack_forget()
+        if known:
+            self.disk_remind.pack(side="right")
+        if status.state in (disk.NOT_ENCRYPTED, disk.SUSPENDED):
+            self.disk_button.pack(side="right", padx=(0, px(12)))
+        self._disk_text.pack(side="left", fill="x", expand=True)
+
+    def _toggle_remind(self) -> None:
+        self.app.toggle_remind_disk()
+        self._remind.set(bool(self.app.remind_disk))
 
     def _sync(self) -> None:
         own = self.kind.get() == identity.OWN

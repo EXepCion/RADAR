@@ -171,6 +171,9 @@ class PluginContext:
     #: why this scan could not judge everything (a rule that failed ...): nothing is committed, the next scan
     #: judges it again
     incomplete: list[str] = field(default_factory=list)
+    #: what keeps failing (a rule that failed in several scans in a row) and was left out: the scan is complete
+    #: without it - one broken part does not hold the rest back - and the user is told
+    failing: list[str] = field(default_factory=list)
     _after: list[Callable[[], None]] = field(default_factory=list, repr=False)
 
     def when_delivered(self, action: Callable[[], None]) -> None:

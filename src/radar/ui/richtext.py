@@ -215,7 +215,7 @@ class RichText(tk.Text):
         self.actions: dict[str, str] = {}  # link tag -> explicit action (else the entity's first one)
         self._pressed: str | None = None
         self._hovered: str | None = None  # the link under the pointer
-        self._bold = tkfont.Font(root=self, font=theme.FONT_BOLD)
+        self._bold = tkfont.nametofont(theme.FONT_BOLD, root=self)  # what field names are drawn in (not a copy of it)
         self.tag_configure("bold", font=theme.FONT_BOLD)
         self.tag_configure("heading", font=theme.FONT_BOLD, spacing1=px(10), spacing3=px(4))
         self.tag_configure("muted", foreground=c("muted"))

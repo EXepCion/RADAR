@@ -10,7 +10,7 @@ import fnmatch
 import ipaddress
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
 
@@ -21,6 +21,7 @@ from .history import SignInHistory
 from .models import (CHANGE_KINDS, NOT_ACCOUNT_CHANGES, REPORT_KIND, ROLE_KIND, AccountChange, SignIn,  # noqa: F401
                      os_family, parse_time)  # (os_family re-exported)
 from .accounts import AccountDirectory  # noqa: F401  (type of RuleContext.accounts)
+from .machines import Machines
 from .scoring import LABEL_HABITUAL_VPN, Assessment, Assessor, Factor, severity_for
 
 SIGNIN_LOGS_URL = "https://portal.azure.com/#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/SignIns"
@@ -127,6 +128,9 @@ class _Without:
     def activity(self, *args: Any, **kw: Any) -> list:
         return [run for run in self._history.activity(*args, **kw) if run[0].id not in self._ids]
 
+    def signins_at(self, *args: Any, **kw: Any) -> list[SignIn]:
+        return [s for s in self._history.signins_at(*args, **kw) if s.id not in self._ids]
+
 
 @dataclass
 class RuleContext:
@@ -151,6 +155,8 @@ class RuleContext:
     _hostile_nets: dict | None = None  # AS number -> Indicator (see hostile_network)
     enrolments: list = field(default_factory=list)  # records of proven device enrolments (see enrolment.py)
     registrations: dict = field(default_factory=dict)  # sign-in id -> what the audit log says it was (registrations.py)
+    _machines: Machines | None = None  # (see machines.py)
+    _activity: dict = field(default_factory=dict)  # user id -> runs of activity (see runs)
 
     @classmethod
     def build(cls, new: list[SignIn], history: SignInHistory, settings: dict, now: datetime,
@@ -257,10 +263,49 @@ class RuleContext:
         e = presence.assess(s, self.trusted(s), nets, self.assessor.extra_asns)
         return e is not None and e.rank == 5
 
-    def on_virtual_host(self, s: SignIn) -> bool:
-        """Sign-in from a configured virtual desktop / shared host (Citrix, AVD ...): the country and city are
-        those of the data centre, not of the person."""
-        return bool(self.virtual_hosts) and s in self.virtual_hosts
+    @property
+    def machines(self) -> Machines:
+        if self._machines is None:
+            self._machines = Machines(self)
+        return self._machines
+
+    def runs(self, user_id: str) -> list[tuple[SignIn, datetime, datetime, int]]:
+        """The account's runs of activity of the last 31 days (SignInHistory.activity), read once per run."""
+        if user_id not in self._activity:
+            self._activity[user_id] = self.history.activity(self.now - timedelta(days=31), self.now, user_id)
+        return self._activity[user_id]
+
+    def machine(self, s: SignIn, begin: datetime | None = None) -> str:
+        """What the sign-in was made on when its place is not the person's, in words ('' when it is the person's
+        place): a virtual desktop, a machine in a cloud data centre or one reached by remote desktop, the machine
+        that asked for a device code (machines.py). ``begin``: when its run of activity began, if known."""
+        return self.machines.label(s, begin)
+
+    def on_virtual_host(self, s: SignIn, begin: datetime | None = None) -> bool:
+        """Sign-in made on a machine whose place is not the person's (see ``machine``): the country and city are
+        those of the machine - a data centre, an office the person reaches remotely, the computer that asked for a
+        device code - not of the person."""
+        return bool(self.machine(s, begin))
+
+    def device_code_flow(self, s: SignIn) -> bool:
+        """The device-code sign-in itself or a token it issued (machines.Machines.device_code): one event, judged by
+        the device_code rule."""
+        return self.machines.device_code(s)
+
+    def countries(self, user_id: str, before: datetime, interactive_only: bool) -> Counter:
+        """The countries the account signed in from before ``before``, and how often (SignInHistory.user_countries) -
+        not counting what was done on machines whose place is not the person's (``machine``)."""
+        found = self.history.user_countries(user_id, before, interactive_only)
+        found.subtract(self.machines.signins(user_id, before, interactive_only))
+        return +found  # (what is left with a count)
+
+    def profile_countries(self, user_id: str, before: datetime) -> set[str]:
+        """The countries of all the account's successful sign-ins (the 30-day profile), the same way."""
+        return self.history.user_profile(user_id, "country", before) - self.machines.countries(user_id, before)
+
+    def first_in_country(self, user_id: str, country: str) -> datetime | None:
+        """When the account was first in a country, the same way (None: never)."""
+        return self.machines.first_in_country(user_id, country)
 
     def trusted(self, s: SignIn) -> bool:
         """Sign-in from a corporate/VPN network: its geolocation says nothing about the user."""
@@ -913,7 +958,7 @@ def new_country(rc: RuleContext) -> list[Finding]:
         if allowed and s.country not in allowed:
             base, why = 55, f"{s.country} is not on the list of allowed countries"
         else:
-            baseline = rc.history.user_countries(s.user_id, s.created, interactive_only)
+            baseline = rc.countries(s.user_id, s.created, interactive_only)
             if sum(baseline.values()) < min_baseline or s.country in baseline:
                 continue
             usual = ", ".join(c for c, _ in baseline.most_common(5))
@@ -948,9 +993,9 @@ def _device_elsewhere(rc: RuleContext, s: SignIn, first: datetime, last: datetim
     """The same device active in another country at a time it cannot have been in both: at or after its first
     sign-in here, or so shortly before that no journey covers the distance. (Its activity there, and when.)"""
     max_kmh = float(rc.cfg("impossible_travel").get("max_speed_kmh", 900))
-    for o, _begin, end in ((o, b, e) for o, b, e, _n in rc.history.activity(first - timedelta(hours=24), last + timedelta(hours=1), s.user_id)):
-        if o.device_id != s.device_id or not o.country or o.country == s.country:
-            continue
+    for o, begin, end in ((o, b, e) for o, b, e, _n in rc.history.activity(first - timedelta(hours=24), last + timedelta(hours=1), s.user_id)):
+        if o.device_id != s.device_id or not o.country or o.country == s.country or rc.on_virtual_host(o, begin):
+            continue  # (a device-code sign-in carries the approving device's id at the address of another machine)
         if end >= first:
             return o, end
         hours = max((first - end).total_seconds() / 3600, 1 / 60)
@@ -1015,13 +1060,14 @@ def new_country_background(rc: RuleContext) -> list[Finding]:
     for (user_id, country), items in groups.items():
         first = min(items, key=lambda x: x.created)
         if user_id not in known:
-            before = first.created - timedelta(hours=1)
-            seen = {x.country for x, _b, _e, _n in rc.history.activity(rc.now - timedelta(days=30), before, user_id) if x.country}
-            known[user_id] = (rc.history.user_countries(user_id, before, False), seen)
+            before, since = first.created - timedelta(hours=1), rc.now - timedelta(days=30)
+            seen = {x.country for x, b, e, _n in rc.runs(user_id)  # (the runs overlapping the 30 days before)
+                    if b <= before and e >= since and x.country and not rc.on_virtual_host(x, b)}
+            known[user_id] = (rc.countries(user_id, before, False), seen)
         baseline, active_in = known[user_id]
         if sum(baseline.values()) < min_baseline or country in baseline or country in active_in:
             continue
-        if country in rc.history.user_countries(user_id, rc.now, True):
+        if country in rc.countries(user_id, rc.now, True):
             continue  # signed in by hand from there as well: that is new_country's alert
         usual = ", ".join(c for c, _ in baseline.most_common(5))
         why = f"First activity from {country} (usually {usual}), in the background only"
@@ -1056,7 +1102,7 @@ def _back_at_home(rc: RuleContext, already: set[str]) -> list[Finding]:
     out, seen = [], set()
     for s in rc.new:
         if not (s.success and not s.interactive and s.user_id and s.device_id and s.country) \
-                or presence.device_class(s) == presence.SERVICE or (s.user_id, s.device_id) in seen:
+                or presence.device_class(s) == presence.SERVICE or (s.user_id, s.device_id) in seen or rc.on_virtual_host(s):
             continue
         seen.add((s.user_id, s.device_id))
         other = _device_elsewhere(rc, s, s.created, s.created)
@@ -1064,13 +1110,13 @@ def _back_at_home(rc: RuleContext, already: set[str]) -> list[Finding]:
             continue
         o, when = other
         key = f"country-bg|{s.user_id}|{o.country}"
-        began = rc.history.first_use(s.user_id, "country", o.country)
-        home = rc.history.first_use(s.user_id, "country", s.country)
+        began = rc.first_in_country(s.user_id, o.country)
+        home = rc.first_in_country(s.user_id, s.country)
         if key in already or began is None or rc.now - began > watch or home is None or home >= began:
             continue  # only a country that is new for the account, left for one it was in before
-        if o.country in rc.history.user_countries(s.user_id, rc.now, True) or not rc.assessor.known_device(o):
+        if o.country in rc.countries(s.user_id, rc.now, True) or not rc.assessor.known_device(o):
             continue  # signed in by hand there (new_country's alert) / not a device that was judged to have travelled
-        usual = ", ".join(c for c, _ in rc.history.user_countries(s.user_id, began, False).most_common(5))
+        usual = ", ".join(c for c, _ in rc.countries(s.user_id, began, False).most_common(5))
         why = f"First activity from {o.country} (usually {usual}), in the background only"
         a = rc.assessor.assess(o, 25, why)
         a.factors.append(Factor(0, f"The same device is at home again ({s.location}, {timefmt.stamp(s.created)}) while it "
@@ -1156,6 +1202,38 @@ def pinned_accounts(rc: RuleContext) -> list[Finding]:
     return out
 
 
+APPROVER_WINDOW = timedelta(minutes=30)  # the approving device in use elsewhere this close to a device-code sign-in
+# The code was asked for somewhere else than where it was approved: what device-code phishing is (and also somebody
+# signing a remote machine in) - with nothing else in its favour such a sign-in is High (base 55 + this + an unknown
+# network), for an account without any role as well
+APPROVED_ELSEWHERE_POINTS = 15
+
+
+def _approver_elsewhere(rc: RuleContext, s: SignIn) -> SignIn | None:
+    """A device-code sign-in names the device that APPROVED the code, and the address of the machine that asked for
+    it. The approving device's own sign-ins or activity around that time from another network or country than that
+    address: it was somewhere else - then its identity says nothing about the machine that asked. (One of them.)"""
+    if not s.device_id:
+        return None
+    start, end = s.created - APPROVER_WINDOW, s.created + APPROVER_WINDOW
+    seen = rc.history.query(start, end, user_id=s.user_id, device_id=s.device_id, success=True)
+    seen += [o for o, _b, _e, _n in rc.history.activity(start, end, s.user_id) if o.device_id == s.device_id]
+    for o in sorted(seen, key=lambda o: abs((o.created - s.created).total_seconds())):
+        if o.auth_protocol.lower() == "devicecode" or o.transfer_method.lower() == "devicecodeflow":
+            continue  # (another approval of the same device carries another machine's address)
+        if (o.asn and s.asn and o.asn != s.asn) or (o.country and s.country and o.country != s.country):
+            return o
+    return None
+
+
+def _as_asked(s: SignIn) -> SignIn:
+    """The sign-in without what the approval brought - the approving device's identity and how the person signed in
+    there (MFA, methods): what is known of the machine that asked."""
+    return replace(s, device_id="", device_name="", trust_type="", compliant=False, managed=False,
+                   incoming_token="" if s.prt else s.incoming_token, auth_methods=[], password_ok=False,
+                   auth_requirement="", mfa_device_id="", mfa_device_os="")
+
+
 def device_code(rc: RuleContext) -> list[Finding]:
     allowed = UserMatcher(rc.cfg("device_code").get("allowed_users", []))
     groups: dict[tuple, list[SignIn]] = defaultdict(list)
@@ -1184,11 +1262,24 @@ def device_code(rc: RuleContext) -> list[Finding]:
                 return -10, "counts for little here: an admin account without MFA whose password sits in a script"
             return None
 
-        s, a = _best([(x, rc.assessor.assess(
-            x, base, why, floor=30, covers=covers, office=office(x),
-            floor_reason=("with a phished code the sign-in is always completed in the victim's own browser, on their "
-                          "own device and network - that cannot clear it" if protocol == "devicecode"
-                          else "a sign-in with the password alone stays worth knowing"))) for x in items])
+        def assess(x: SignIn) -> Assessment:
+            floor_reason = ("with a phished code the sign-in is always completed in the victim's own browser, on their "
+                            "own device and network - that cannot clear it" if protocol == "devicecode"
+                            else "a sign-in with the password alone stays worth knowing")
+            approver = _approver_elsewhere(rc, x) if protocol == "devicecode" else None
+            if approver is None:
+                return rc.assessor.assess(x, base, why, floor=30, covers=covers, office=office(x), floor_reason=floor_reason)
+            net = (rc.trusted_label(approver) if rc.trusted(approver)
+                   else rc.assessor.asn_label(approver.asn) if approver.asn else "")
+            where = approver.location + (f" ({net})" if net else "")
+            said = Factor(APPROVED_ELSEWHERE_POINTS,
+                          f"Approved on {x.device_name or 'a registered device'}, in use from {where} at the same time: "
+                          f"the code was asked for from somewhere else - the approving device and how the person signed "
+                          f"in there (device, management, sign-in token, MFA) are not counted for the machine that asked")
+            return rc.assessor.assess(_as_asked(x), base, why, [said], floor=30, covers=covers + ("device_identity",),
+                                      office=office(x), floor_reason=floor_reason)
+
+        s, a = _best([(x, assess(x)) for x in items])
         out.append(_scored(
             a, key=f"devicecode|{user}|{day}" if protocol == "devicecode" else f"ropc|{user}|{day}",
             rule_id="device_code",
@@ -1214,24 +1305,30 @@ def session_theft(rc: RuleContext) -> list[Finding]:
     cfg = rc.cfg("session_theft")
     lookback = timedelta(hours=float(cfg.get("lookback_hours", 24)))
     max_kmh = float(rc.cfg("impossible_travel").get("max_speed_kmh", 900))
-    # Per session keep the closest-in-time cross-country/cross-device pair: it decides "simultaneous" vs "travel".
-    pairs: dict[str, tuple[float, SignIn, SignIn]] = {}
+    # Per session and day keep the closest-in-time cross-country/cross-device pair: it decides "simultaneous" vs
+    # "travel". A session can live for weeks: each day it is used from two places is a finding of that day.
+    pairs: dict[tuple[str, str], tuple[float, SignIn, SignIn]] = {}
     for s in rc.new:
-        # Microsoft back-end services (e.g. 'Olympus') use the session on the user's behalf: never a second device
-        if not (s.success and s.session_id and s.user_id and s.country) or rc.trusted(s) or s.ms_backend:
+        # Microsoft back-end services (e.g. 'Olympus') use the session on the user's behalf: never a second device.
+        # Nor are the tokens a device-code sign-in gave the machine that asked for it - that sign-in continuing,
+        # judged by the device_code rule (the approving device's session often carries them).
+        if not (s.success and s.session_id and s.user_id and s.country) or rc.trusted(s) or s.ms_backend \
+                or rc.device_code_flow(s):
             continue
         others = [o for o in rc.history.query(s.created - lookback, s.created + timedelta(minutes=5),
                                               session_id=s.session_id, success=True)
                   if o.id != s.id and o.country and o.country != s.country and not rc.trusted(o)
-                  and not o.ms_backend and (o.device_id or "") != (s.device_id or "")]
+                  and not o.ms_backend and (o.device_id or "") != (s.device_id or "") and not rc.device_code_flow(o)]
         if not others:
             continue
         o = min(others, key=lambda x: abs((x.created - s.created).total_seconds()))
         gap = abs((o.created - s.created).total_seconds())
-        if s.session_id not in pairs or gap < pairs[s.session_id][0]:
-            pairs[s.session_id] = (gap, s, o)
+        # the day of the pair is the day of its first sign-in: the same pair seen from either side has one day
+        key = (s.session_id, _day(min(s.created, o.created)))
+        if key not in pairs or gap < pairs[key][0]:
+            pairs[key] = (gap, s, o)
     out = []
-    for _gap, s, o in pairs.values():
+    for (_session, day), (_gap, s, o) in pairs.items():
         # Judge the odd one out: the side without device identity (a replayed cookie/token has none).
         suspect, peer = (o, s) if (s.device_id and not o.device_id) else (s, o)
         peer_dev = peer.device_name or ("a registered device" if peer.device_id else "no device identity")
@@ -1260,7 +1357,7 @@ def session_theft(rc: RuleContext) -> list[Finding]:
                 extra.append(Factor(-30, f"Travel between both places is plausible ({km:,.0f} km in {minutes / 60:,.1f} h)"))
         a = rc.assessor.assess(suspect, 45, "Session reused from a different country on a different device", extra)
         out.append(_scored(
-            a, key=f"session|{s.user_id}|{s.session_id}", rule_id="session_theft",
+            a, key=f"session|{s.user_id}|{s.session_id}|{day}", rule_id="session_theft",
             title=f"Possible session token theft: {s.who}",
             summary=(f"Session of {s.who} was used from {o.location} ({o.ip}) and {s.location} ({s.ip}), "
                      f"{minutes:,.0f} min apart, on different devices. Typical of stolen session cookies / tokens "
@@ -1302,8 +1399,8 @@ def password_not_completed(rc: RuleContext) -> list[Finding]:
             continue  # the user completed the sign-in from the same place: ordinary MFA prompt
         familiar_net = s.asn in rc.history.user_asns(s.user_id, s.created) if s.asn else False
         # countries of ALL the user's successful sign-ins (the phone's background sign-ins on holiday count)
-        familiar_cc = s.country in (set(rc.history.user_countries(s.user_id, s.created, True))
-                                    | rc.history.user_profile(s.user_id, "country", s.created))
+        familiar_cc = s.country in (set(rc.countries(s.user_id, s.created, True))
+                                    | rc.profile_countries(s.user_id, s.created))
         if familiar_net and familiar_cc:
             continue
         extra = []
@@ -1625,7 +1722,7 @@ def _pattern_deviations(rc: RuleContext, s: SignIn, before: datetime) -> list[Fa
     proto = (s.client_app or "").lower()
     if proto and proto not in h.user_profile(s.user_id, "proto", before):
         out.append(Factor(15, f"New protocol/client for this account: {s.client_app}"))
-    if s.country and s.country not in h.user_profile(s.user_id, "country", before):
+    if s.country and s.country not in rc.profile_countries(s.user_id, before):
         out.append(Factor(20, f"New country for this account: {s.country}"))
     return out
 
@@ -2019,11 +2116,12 @@ def aitm_replay(rc: RuleContext) -> list[Finding]:
     # 2) replay of a fresh-MFA session from another network
     pairs: dict[str, tuple[SignIn, SignIn]] = {}
     for r in rc.new:
-        if not (r.success and r.session_id and r.user_id and r.asn) or rc.trusted(r) or r.ms_backend:
-            continue
+        if not (r.success and r.session_id and r.user_id and r.asn) or rc.trusted(r) or r.ms_backend \
+                or rc.device_code_flow(r):
+            continue  # (a device-code sign-in and its tokens: one event, judged by the device_code rule)
         anchors = [o for o in rc.history.query(r.created - window, r.created, session_id=r.session_id, success=True)
                    if o.id != r.id and o.interactive and o.fresh_mfa and o.asn and o.asn != r.asn
-                   and o.ip != r.ip and not rc.trusted(o)]
+                   and o.ip != r.ip and not rc.trusted(o) and not rc.device_code_flow(o)]
         if not anchors:
             continue
         o = anchors[0]  # the MFA that created the session
@@ -2094,8 +2192,8 @@ def unfamiliar_signin(rc: RuleContext) -> list[Finding]:
             continue
         if s.client and s.client in h.user_clients(s.user_id, rc.assessor.familiar_before(s)):
             continue
-        if s.country and s.country not in (set(h.user_countries(s.user_id, s.created, True))
-                                           | h.user_profile(s.user_id, "country", s.created)):
+        if s.country and s.country not in (set(rc.countries(s.user_id, s.created, True))
+                                           | rc.profile_countries(s.user_id, s.created)):
             continue
         a = rc.assessor.assess(s, 30, "Signed in by hand from a network, address, device and client the account never "
                                       "used before")

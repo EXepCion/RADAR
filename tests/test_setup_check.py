@@ -129,6 +129,19 @@ class FakeApp:
     def open_link(self, url):
         self.links.append(url)
 
+    remind_disk = True
+
+    def disk_status(self):
+        from radar import disk
+
+        return disk.Status("C:", disk.ENCRYPTED, "BitLocker on")
+
+    def toggle_remind_disk(self):
+        pass
+
+    def open_disk_settings(self):
+        pass
+
 
 def test_setup_window_checks_the_choice_and_shows_each_step(root):
     from radar.ui import setup as ui

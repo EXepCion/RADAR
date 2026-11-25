@@ -40,6 +40,37 @@ def clock(dt: datetime | None) -> str:
     return stamp(dt, "%H:%M")
 
 
+def clock_bare(dt: datetime | None) -> str:
+    """Hour and minute WITHOUT the zone ('07:50') - only for a list whose heading names the zone once for all its
+    lines (see ``zone``); everywhere else a time carries its zone itself (``clock``)."""
+    return dt.astimezone().strftime("%H:%M") if dt is not None else ""
+
+
+def stamp_bare(dt: datetime | None) -> str:
+    """Day and time WITHOUT the zone ('16.11. 07:50') - only for a table whose column heading names the zone."""
+    return dt.astimezone().strftime(DAY) if dt is not None else ""
+
+
+WEEKDAY = "%a %H:%M"
+
+
+def weekday_bare(dt: datetime | None) -> str:
+    """The day of the week and the time WITHOUT the zone ('Sun 06:00') - only under a heading that names the zone,
+    and only where the days shown are fewer than seven (a weekday says which one it is)."""
+    return dt.astimezone().strftime(WEEKDAY) if dt is not None else ""
+
+
+def span(begin: datetime, end: datetime) -> str:
+    """From when until when, within a week, the zone once at its end: 'Sun 06:00 – 08:10 UTC+1', 'Sun 22:00 – Mon
+    01:10 UTC+1', 'Sun 06:00 UTC+1' for a moment - and each time with its own zone where the clocks changed between."""
+    a, b = begin.astimezone(), end.astimezone()
+    if zone(a) != zone(b):
+        return f"{a.strftime(WEEKDAY)} {zone(a)} – {b.strftime(WEEKDAY)} {zone(b)}"
+    if a.strftime(WEEKDAY) == b.strftime(WEEKDAY):
+        return f"{a.strftime(WEEKDAY)} {zone(a)}"
+    return f"{a.strftime(WEEKDAY)} – {b.strftime('%H:%M' if a.date() == b.date() else WEEKDAY)} {zone(b)}"
+
+
 def stamp_year(dt: datetime | None) -> str:
     """Date with the year, time and zone: '16.11.2026 07:50 UTC+1'."""
     return stamp(dt, DAY_YEAR)

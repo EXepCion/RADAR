@@ -94,6 +94,13 @@ SENSITIVE_APPS: dict[str, str] = {
     "d1ddf0e4-d672-4dae-b554-9d5bdfd93547": "Microsoft Intune PowerShell",
 }
 DEVICE_REGISTRATION_RESOURCE = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9"
+# What a remote desktop client signs in to right before it connects to a machine with the person's Entra account
+# (Remote Desktop, Windows App, Azure Bastion, Azure Virtual Desktop, Windows 365): Microsoft's own resources, the
+# same ids in every tenant
+REMOTE_DESKTOP_RESOURCES = {
+    "a4a365df-50f1-4397-bc59-1a1564b8bb9c": "Microsoft Remote Desktop",
+    "270efc09-cd0d-444b-a71f-39af4910ec45": "Windows Cloud Login",
+}
 # Microsoft Intune Enrollment: what a device signs in to while it is being enrolled (the same id in every tenant)
 ENROLMENT_RESOURCE = "d4ebce55-015a-49b5-a083-c84d1797ae8c"
 

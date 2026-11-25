@@ -16,6 +16,7 @@ from ..plugin_api import Severity
 from . import icons, theme
 from .details import DetailsWindow
 from .cardtable import CardTable
+from .parts import Hint
 from .theme import px
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -114,9 +115,11 @@ class ReminderWindow:
 
     def _build(self) -> None:
         top = self.top
-        self._f_title = tkfont.Font(root=self.root, font=theme.FONT_BOLD)
-        self._f_body = tkfont.Font(root=self.root, font=theme.FONT)
-        self._f_caption = tkfont.Font(root=self.root, font=theme.FONT_CAPTION)
+        # the named fonts themselves: a copy (Font(font=...)) gets its size in whole points - at some scalings a few
+        # per cent off what everything else is drawn in (see theme.underlined)
+        self._f_title = tkfont.nametofont(theme.FONT_BOLD, root=self.root)
+        self._f_body = tkfont.nametofont(theme.FONT, root=self.root)
+        self._f_caption = tkfont.nametofont(theme.FONT_CAPTION, root=self.root)
         title_h, body_h = self._f_title.metrics("linespace"), self._f_body.metrics("linespace")
         caption_h = self._f_caption.metrics("linespace")
         # Fixed height: 1 title line + 1 info line + SUMMARY_LINES summary lines (the list must not jump).
@@ -141,6 +144,9 @@ class ReminderWindow:
         self.h_summary = tk.Label(header, font=self._f_body, foreground=theme.color("text"), anchor="nw",
                                   justify="left", **flat)
         self.h_summary.grid(row=2, column=1, sticky="new", pady=(px(10), 0), padx=(0, px(16)))
+        # (each of the three has its fixed room: what is cut off there can be read by pointing at it)
+        for part, label in enumerate((self.h_title, self.h_when, self.h_summary)):
+            Hint((label,), lambda part=part, label=label: self._header_whole(part, label), wrap=px(520))
         header.columnconfigure(1, weight=1)
         self._text_width = px(520)
         self._header_text = ("", "", "")
@@ -225,6 +231,11 @@ class ReminderWindow:
         if len(rows) > 1:
             summary = f"{len(rows)} rows selected. " + summary
         self._set_header_text(alert.title, when, summary)
+
+    def _header_whole(self, part: int, label: tk.Label) -> str:
+        """The whole of a header text that is shown shortened ('' where all of it is shown)."""
+        whole = self._header_text[part] if part < len(self._header_text) else ""
+        return whole if str(label.cget("text")).endswith(ELLIPSIS) and not whole.endswith(ELLIPSIS) else ""
 
     def _set_header_text(self, title: str, when: str, summary: str) -> None:
         """Fit the texts into the fixed header: one line each for title/info, SUMMARY_LINES for the summary."""

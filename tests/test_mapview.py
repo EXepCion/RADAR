@@ -721,3 +721,55 @@ def test_map_page_has_radars_icon(tmp_path):
     assert src.icon("nonsense")[:4] == png[:4] and len(src.icon("256")) > len(png)
     page = (pathlib.Path(mapview.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
     assert 'rel="icon"' in page and 'href="icon.png?size=32"' in page
+
+
+# ----------------------------------------------- the browser profile of the map window is thrown away
+def test_the_profile_of_the_map_window_is_thrown_away_when_nobody_uses_it(tmp_path):
+    """Edge keeps its own bookkeeping in the profile folder - hundreds of megabytes of components, and the address of
+    what it showed. Nothing of that is needed twice: the folder is removed before a map window opens and after it
+    closed. A profile in use - a second map window is still open - is left exactly as it is."""
+    from radar.mapview import __main__ as mapview
+
+    profile = tmp_path / "mapview-profile"
+    (profile / "Default" / "Cache").mkdir(parents=True)
+    (profile / "Default" / "Preferences").write_text("{}")
+    (profile / "Local State").write_text("{}")
+    assert mapview.clear_profile(profile) is True
+    assert not profile.exists() and list(tmp_path.iterdir()) == []
+    assert mapview.clear_profile(profile) is True                      # nothing there: nothing to do
+
+    # in use: Windows does not let a folder go while a file in it is open
+    (profile / "Default").mkdir(parents=True)
+    kept = profile / "Default" / "History"
+    kept.write_text("x")
+    with open(kept, "rb"):
+        assert mapview.clear_profile(profile) is False
+    assert kept.read_text() == "x" and [p.name for p in tmp_path.iterdir()] == ["mapview-profile"]
+    assert mapview.clear_profile(profile) is True and not profile.exists()
+
+
+def test_what_an_earlier_clean_up_could_not_delete_is_swept_the_next_time(tmp_path):
+    from radar.mapview import __main__ as mapview
+
+    profile = tmp_path / "mapview-profile"
+    left = tmp_path / "mapview-profile.old-123"
+    (left / "Default").mkdir(parents=True)
+    (left / "Default" / "x").write_text("x")
+    other = tmp_path / "plugin-data"
+    other.mkdir()
+    assert mapview.clear_profile(profile) is True
+    assert [p.name for p in tmp_path.iterdir()] == ["plugin-data"]     # only what is the profile's
+
+
+def test_the_map_window_downloads_no_browser_components(tmp_path, monkeypatch):
+    from radar.mapview import __main__ as mapview
+
+    started = []
+    monkeypatch.setattr(mapview, "find_edge", lambda: "msedge.exe")
+    monkeypatch.setattr(mapview.subprocess, "Popen", lambda args, **kw: started.append(args) or "process")
+    profile = tmp_path / "mapview-profile"
+    (profile / "old").mkdir(parents=True)
+    assert mapview.open_window("http://127.0.0.1:1/t/", profile) == "process"
+    args = started[0]
+    assert f"--user-data-dir={profile}" in args and "--disable-component-update" in args
+    assert not (profile / "old").exists()                               # it starts from an empty profile

@@ -5,10 +5,10 @@ from ... import timefmt
 import dataclasses
 import json
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Iterator
 
 from ... import tenant_settings
-from ...graph import GraphError
+from ...graph import GraphError, page_cut
 from ...plugin_api import Finding, Plugin, PluginContext, Rule, StagedState
 from . import apps, enrolment, indicators, netintel, overview, registrations, rules
 from .accounts import AccountDirectory, sync_directory
@@ -24,6 +24,8 @@ EVENT_TYPES = ("interactiveUser", "nonInteractiveUser", "servicePrincipal", "man
 
 
 DATA_AS_OF = "data_as_of"  # state key: start of the last complete scan
+RULE_FAILURES = "rule_failures"  # state key: rule id -> scans in a row the rule failed in
+RULE_GIVE_UP = 3  # ... from this many on, a scan is complete without it (it is still tried, and the user is told)
 
 
 class SignInThreatsPlugin(Plugin):
@@ -135,7 +137,9 @@ class SignInThreatsPlugin(Plugin):
         "unjudged" and its bookmarks are held back (StagedState) until the findings are in the alert store
         (``ctx.when_delivered``). A scan that could not judge everything commits nothing - the next one reads
         from the same place and judges what waits, again and again until it works."""
-        staged = StagedState(ctx.state, direct=("asn_names",))  # (network names looked up are kept either way)
+        # (kept either way: network names looked up, and how often each rule failed - a scan that is not complete
+        # must still count, or a rule that always fails would hold every scan back for good)
+        staged = StagedState(ctx.state, direct=("asn_names", RULE_FAILURES))
         inner = dataclasses.replace(ctx, state=staged)  # (the same lists: incomplete, what waits for delivery)
         judged: list[str] = []
         apps_seen: list[tuple[str, float]] = []
@@ -208,15 +212,26 @@ class SignInThreatsPlugin(Plugin):
             rc.enrolments = settled.records
             rc.registrations = named.matches
             findings: list[Finding] = []
+            before = ctx.state.get(RULE_FAILURES)
+            failures = {k: int(v) for k, v in before.items() if ctx.rule_enabled(k)} if isinstance(before, dict) else {}
             for rule in RULES:
                 if not ctx.rule_enabled(rule.meta.id) or (rule.meta.id == "mfa_report" and report_off) \
                         or rule.meta.id == "hostile_reuse":
                     continue
                 try:
                     findings.extend(rule.evaluate(rc))
+                    failures.pop(rule.meta.id, None)
                 except Exception as exc:
                     ctx.log.exception("Rule %s failed", rule.meta.id)
-                    ctx.incomplete.append(f"the rule '{rule.meta.name}' ({rule.meta.id}) failed: {type(exc).__name__}: {exc}"[:200])
+                    failures[rule.meta.id] = failures.get(rule.meta.id, 0) + 1
+                    if failures[rule.meta.id] >= RULE_GIVE_UP:  # it failed in the scans before too: the rest goes on
+                        ctx.failing.append(f"the check '{rule.meta.name}' ({type(exc).__name__}: {exc})"[:200])
+                    else:
+                        ctx.incomplete.append(f"the rule '{rule.meta.name}' ({rule.meta.id}) failed: {type(exc).__name__}: {exc}"[:200])
+            if failures != (before if isinstance(before, dict) else {}):
+                ctx.state.set(RULE_FAILURES, failures)
+            if ctx.failing:
+                ctx.log.warning("Judged without what keeps failing: %s", "; ".join(ctx.failing)[:300])
             try:  # what these findings prove about attacker addresses is remembered and used from here on
                 marked = indicators.apply(rc, findings, reuse=ctx.rule_enabled("hostile_reuse"))
                 if marked:
@@ -255,13 +270,22 @@ class SignInThreatsPlugin(Plugin):
         if api == "beta":
             flt += " and signInEventTypes/any(t: t eq 'interactiveUser')"
         ctx.set_status(f"Extending baseline back to {want.astimezone():%d.%m.}...")
-        added = 0
+        added, oldest, cut = 0, None, False
         for page in ctx.graph.get_pages(f"/{api}/auditLogs/signIns", {"$filter": flt, "$top": "1000"},
                                         max_pages=int(ctx.settings.get("max_pages_per_run", 400))):
             ctx.check_cancelled()
-            added += len(history.add([SignIn.from_graph(r, "interactiveUser") for r in page]))
-        ctx.state.set("baseline_from:interactiveUser", want.isoformat())
-        ctx.log.info("Baseline extended back to %s: %d older interactive sign-ins added", graph_time(want), added)
+            rows = [SignIn.from_graph(r, "interactiveUser") for r in page]
+            added += len(history.add(rows))
+            for r in rows:
+                if oldest is None or r.created < oldest:
+                    oldest = r.created
+            cut = cut or page_cut(page)
+        # newest first: a read the page limit cut short is complete from its oldest sign-in on - the next scan goes on
+        # from there (the second it lies in is asked for again)
+        reached = (oldest + timedelta(seconds=1)) if cut and oldest is not None else want
+        ctx.state.set("baseline_from:interactiveUser", reached.isoformat())
+        ctx.log.info("Baseline extended back to %s: %d older interactive sign-ins added%s", graph_time(reached), added,
+                     f" (back to {graph_time(want)} in the scans after this one)" if reached != want else "")
 
     @staticmethod
     def _event_types(s: dict) -> list[str]:
@@ -301,7 +325,7 @@ class SignInThreatsPlugin(Plugin):
         ctx.set_status(f"Fetching {event_type} sign-ins since {timefmt.stamp(since)}...")
 
         newest = parse_time(checkpoint) if checkpoint else None
-        fetched, fresh = 0, []
+        fetched, fresh, oldest, cut = 0, [], None, False
         for page in ctx.graph.get_pages(f"/{api}/auditLogs/signIns", params,
                                         max_pages=int(s.get("max_pages_per_run", 400))):
             ctx.check_cancelled()
@@ -312,16 +336,31 @@ class SignInThreatsPlugin(Plugin):
             for r in rows:
                 if newest is None or r.created > newest:
                     newest = r.created
+                if oldest is None or r.created < oldest:
+                    oldest = r.created
+            cut = cut or page_cut(page)
             if fetched and fetched % 5000 < len(rows):
                 ctx.set_status(f"Fetching {event_type} sign-ins... {fetched:,}")
+        if cut and oldest is not None:
+            # Graph lists the newest first: what the page limit left unread lies between ``since`` and the oldest one
+            # read. It is owed, like the hours RADAR was not running, and read by the scans after this one. (Of a first
+            # run only what is to be judged: the baseline before it is completed by _extend_baseline - up to there.)
+            start = since if new_cutoff is None else max(since, new_cutoff)
+            if start < oldest:
+                self._note_backlog(ctx, event_type, start, oldest + timedelta(seconds=1), now,
+                                   why="more than one scan reads at once")
+                if new_cutoff is not None and interactive:
+                    ctx.state.set("baseline_from:interactiveUser", start.isoformat())
         ctx.state.set(key, (newest or now).isoformat())
         ctx.log.info("%s: fetched %d since %s, %d new", event_type, fetched, graph_time(since), len(fresh))
         return fetched, fresh
 
-    # ------------------------------------------------------- the hours RADAR was not running
-    def _note_backlog(self, ctx: PluginContext, event_type: str, start: datetime, end: datetime, now: datetime) -> None:
-        """RADAR was not running for longer than it reads at once: remember the time before as owed. The scans after
-        this one read it (``_work_backlog``), so the first scan after a night or a weekend stays quick."""
+    # ------------------------------------------------- sign-ins read afterwards (RADAR was off, or too many at once)
+    def _note_backlog(self, ctx: PluginContext, event_type: str, start: datetime, end: datetime, now: datetime,
+                      why: str = "while RADAR was not running") -> None:
+        """Sign-ins a scan did not read - RADAR was not running for longer than it reads at once, or there were more
+        than a scan reads (``why``): remember them as owed. The scans after this one read them (``_owed_pages``), so
+        a scan stays quick and nothing is left out."""
         days = float(ctx.settings.get("non_interactive_backlog_days", 7))
         start = max(start, now - timedelta(days=days))
         if days <= 0 or start >= end:
@@ -329,39 +368,43 @@ class SignInThreatsPlugin(Plugin):
             return
         key = f"backlog:{event_type}"
         ctx.state.set(key, list(ctx.state.get(key) or []) + [[start.isoformat(), end.isoformat()]])
-        ctx.log.info("%s sign-ins from %s to %s (while RADAR was not running) are read in the scans after this one",
-                     event_type, graph_time(start), graph_time(end))
+        ctx.log.info("%s sign-ins from %s to %s (%s) are read in the scans after this one",
+                     event_type, graph_time(start), graph_time(end), why)
 
-    def _work_backlog(self, ctx: PluginContext, history: SignInHistory, event_type: str,
-                      now: datetime) -> tuple[int, list[SignIn]]:
-        """Read a portion of the sign-ins owed from the time RADAR was not running: the newest gap first, within it
-        from its end backwards. What is read is kept and judged like any other new sign-in."""
+    def _owed_pages(self, ctx: PluginContext, event_type: str, now: datetime,
+                    api: str | None = None) -> Iterator[list[dict[str, Any]]]:
+        """The pages of a portion of the sign-ins owed from earlier scans (see _note_backlog): the newest gap first,
+        within it from its end backwards, ``backlog_pages_per_run`` pages per scan. What is still owed is noted once
+        the portion is read. ``api``: the Graph version to ask (default: the one the settings name)."""
         s = ctx.settings
         key = f"backlog:{event_type}"
-        pending = [list(p) for p in ctx.state.get(key) or [] if isinstance(p, (list, tuple)) and len(p) == 2]
+        owed = ctx.state.get(key)
+        if not owed:
+            return
+        api = api or ("beta" if str(s.get("api_version", "beta")).lower() == "beta" else "v1.0")
+        pending = [list(p) for p in owed if isinstance(p, (list, tuple)) and len(p) == 2]
         budget = max(1, int(s.get("backlog_pages_per_run", 30)))
         oldest_wanted = now - timedelta(days=float(s.get("non_interactive_backlog_days", 7)))
-        fetched, fresh = 0, []
         while pending and budget > 0:
             start, end = max(parse_time(pending[-1][0]), oldest_wanted), parse_time(pending[-1][1])
             if start >= end:
                 pending.pop()
                 continue
-            ctx.set_status(f"Reading {event_type} sign-ins from while RADAR was not running "
-                           f"({timefmt.stamp(start)} - {timefmt.stamp(end)})...")
-            flt = (f"createdDateTime ge {graph_time(start)} and createdDateTime le {graph_time(end)}"
-                   f" and signInEventTypes/any(t: t eq '{event_type}')")
+            ctx.set_status(f"Reading {event_type} sign-ins not read yet ({timefmt.stamp(start)} - {timefmt.stamp(end)})...")
+            flt = f"createdDateTime ge {graph_time(start)} and createdDateTime le {graph_time(end)}"
+            params = {"$filter": flt, "$top": "1000"}
+            if api == "beta":  # (v1.0 lists the interactive sign-ins only, newest first as well)
+                params.update({"$filter": flt + f" and signInEventTypes/any(t: t eq '{event_type}')",
+                               "$orderby": "createdDateTime desc"})
             pages, oldest = 0, None
-            for page in ctx.graph.get_pages("/beta/auditLogs/signIns",
-                                            {"$filter": flt, "$top": "1000", "$orderby": "createdDateTime desc"}):
+            for page in ctx.graph.get_pages(f"/{api}/auditLogs/signIns", params):
                 ctx.check_cancelled()
-                rows = [SignIn.from_graph(r, event_type) for r in page]
                 pages += 1
-                fetched += len(rows)
-                fresh.extend(history.add(rows, unjudged=True))
-                for r in rows:
-                    if oldest is None or r.created < oldest:
-                        oldest = r.created
+                for r in page:
+                    created = parse_time(r["createdDateTime"])
+                    if oldest is None or created < oldest:
+                        oldest = created
+                yield page
                 if pages >= budget:
                     break  # this scan's portion; the rest is read by the next one
             # the portion was used up: there may be more before the oldest one read (the second it lies in is
@@ -374,7 +417,18 @@ class SignInThreatsPlugin(Plugin):
                 break
             pending.pop()
         ctx.state.set(key, pending)
-        ctx.log.info("%s: %d sign-in(s) read from while RADAR was not running, %d new%s", event_type, fetched, len(fresh),
+
+    def _work_backlog(self, ctx: PluginContext, history: SignInHistory, event_type: str,
+                      now: datetime) -> tuple[int, list[SignIn]]:
+        """Read a portion of the sign-ins owed from earlier scans (see _owed_pages). What is read is kept and judged
+        like any other new sign-in."""
+        fetched, fresh = 0, []
+        for page in self._owed_pages(ctx, event_type, now):
+            rows = [SignIn.from_graph(r, event_type) for r in page]
+            fetched += len(rows)
+            fresh.extend(history.add(rows, unjudged=True))
+        pending = ctx.state.get(f"backlog:{event_type}")
+        ctx.log.info("%s: %d sign-in(s) read afterwards, %d new%s", event_type, fetched, len(fresh),
                      f"; still owed: {len(pending)} period(s)" if pending else "; nothing owed any more")
         return fetched, fresh
 
@@ -452,9 +506,17 @@ class SignInThreatsPlugin(Plugin):
                                                  max_pages=200))
             for page in pages:
                 rows.extend(apps.AppSignIn.from_graph(r) for r in page)
+            oldest = min((r.created for r in rows), default=None)
+            # what earlier scans left unread (a portion of it; see _note_backlog)
+            for page in self._owed_pages(ctx, "servicePrincipal", now, api="beta"):
+                rows.extend(apps.AppSignIn.from_graph(r) for r in page)
         except Exception as exc:
             ctx.log.warning("App sign-ins not readable: %s", exc)
             return []
+        if oldest is not None and any(page_cut(p) for p in pages) and since < oldest:
+            # newest first: what the page limit left unread lies before the oldest one read - owed to the next scans
+            self._note_backlog(ctx, "servicePrincipal", since, oldest + timedelta(seconds=1), now,
+                               why="more than one scan reads at once")
         # (ticked off as seen only when their findings are delivered - see run)
         fresh = store.new_rows(rows, remember=seen is None)
         if seen is not None:
@@ -843,7 +905,10 @@ class SignInThreatsPlugin(Plugin):
         try:
             ctx.set_status("Reading accounts, roles and MFA exclusions...")
             fresh = sync_directory(ctx.graph, now, groups)
-            fresh.save(path)
+            try:
+                fresh.save(path)
+            except OSError as exc:  # (the file stayed in use): what was read is used all the same
+                ctx.log.warning("Accounts read, but not saved (%s): this scan uses them, the next one reads them again", exc)
             return fresh
         except Exception as exc:  # e.g. throttling: keep working with the previous snapshot
             ctx.log.warning("Account sync failed (%s); using the snapshot from %s", exc, directory.synced_at)

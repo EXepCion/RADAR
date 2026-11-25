@@ -228,8 +228,9 @@ def resolve_kind(entity: Entity, action: str) -> str:
 
 
 def portal_url(action: str, info: dict) -> str:
-    """Entra portal deep link for a looked-up object (``info`` from radar.resolver), '' if none."""
-    oid, app_id = info.get("id", ""), info.get("appId", "")
+    """Entra portal deep link for a looked-up object (``info`` from radar.resolver), '' if none. (A directory object
+    may come without a name or id - Graph answers null: that is no text.)"""
+    oid, app_id = info.get("id") or "", info.get("appId") or ""
     user = PORTAL + "Microsoft_AAD_UsersAndTenants/UserProfileMenuBlade/~/{page}/userId/" + oid
     sp = PORTAL + "Microsoft_AAD_IAM/ManagedAppMenuBlade/~/{page}/objectId/" + oid + "/appId/" + app_id
     reg = PORTAL + "Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/{page}/appId/" + app_id
@@ -242,10 +243,10 @@ def portal_url(action: str, info: dict) -> str:
         "app_owners": reg.format(page="Owners"),
         "group": group.format(page="Overview"), "group_members": group.format(page="Members"),
         "device": (PORTAL + "Microsoft_AAD_Devices/DeviceDetailsMenuBlade/~/Properties/objectId/" + oid
-                   + "/deviceId/" + info.get("deviceId", "")),
+                   + "/deviceId/" + (info.get("deviceId") or "")),
         "policy": PORTAL + "Microsoft_AAD_ConditionalAccess/PolicyBlade/policyId/" + oid,
         "xtenant": XTENANT_URL,
-        "role_docs": f"{ROLE_DOCS}#{_slug(info.get('name', ''))}",
+        "role_docs": f"{ROLE_DOCS}#{_slug(info.get('name') or '')}",
     }
     needs = {"user": oid, "app": oid and app_id, "app_registration": app_id, "group": oid, "device": oid,
              "policy": oid}

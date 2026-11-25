@@ -190,6 +190,11 @@ class PluginManager:
         ctx = self._contexts.get(plugin_id)
         return list(ctx.incomplete) if ctx is not None else []
 
+    def failing(self, plugin_id: str) -> list[str]:
+        """What keeps failing and was left out of the plugin's last run ([]: nothing)."""
+        ctx = self._contexts.get(plugin_id)
+        return list(ctx.failing) if ctx is not None else []
+
     # ---------------------------------------------------------------- run
     def build_context(self, plugin_id: str, defer: bool = False) -> PluginContext:
         rt = self.runtimes[plugin_id]
@@ -219,6 +224,7 @@ class PluginManager:
         rt.running = True
         rt.last_run = datetime.now(timezone.utc)
         self._contexts.pop(plugin_id, None)
+        ctx = None
         try:
             ctx = self.build_context(plugin_id, defer)
             findings = list(rt.plugin.run(ctx) or [])
@@ -232,3 +238,8 @@ class PluginManager:
             raise
         finally:
             rt.running = False
+            # what the run asked of Microsoft Graph (also when it failed: a run that was told "too many requests"
+            # says how many it had made)
+            used = ctx.graph.usage() if ctx is not None and hasattr(ctx.graph, "usage") else ""
+            if used:
+                logging.getLogger(__name__).info("%s: %s", plugin_id, used)

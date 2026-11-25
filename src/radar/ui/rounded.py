@@ -24,6 +24,11 @@ def background_of(widget: tk.Misc) -> str:
         return theme.color("window")
 
 
+def tone(colour: str) -> str:
+    """A palette role as its colour; a colour ('#rrggbb' - something on its way between two roles) as it is."""
+    return colour if colour.startswith("#") else theme.color(colour)
+
+
 def round_points(x1: int, y1: int, x2: int, y2: int, r: int) -> list[float]:
     """The outline of a rectangle with round corners, as points for ``create_polygon``: real quarter circles (a
     radius of half the height makes a pill)."""
@@ -44,7 +49,7 @@ def _render(width: int, height: int, radius: int, fill: str, edge: str | None):
 
     scale = 4  # drawn four times as large and scaled down: that is what makes the curve smooth
     img = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
-    rgb = lambda role: theme._rgb(theme.role_color(role)) + (255,)  # noqa: E731
+    rgb = lambda role: theme._rgb(role if role.startswith("#") else theme.role_color(role)) + (255,)  # noqa: E731
     ImageDraw.Draw(img).rounded_rectangle(
         (0, 0, width * scale - 1, height * scale - 1), radius=radius * scale, fill=rgb(fill),
         outline=rgb(edge) if edge else None, width=scale if edge else 0)
@@ -56,8 +61,31 @@ def rounded_image(widget: tk.Misc, width: int, height: int, radius: int, fill: s
     One image per size and colours; it is redrawn in place when the theme switches."""
     width, height = max(2, int(width)), max(2, int(height))
     radius = max(0, min(int(radius), width // 2, height // 2))
-    return theme._themed(widget, ("round", width, height, radius, fill, edge),
-                         lambda: _render(width, height, radius, fill, edge))
+    key = ("round", width, height, radius, fill, edge)
+    if fill.startswith("#") or (edge or "").startswith("#"):
+        return _passing(widget, key, lambda: _render(width, height, radius, fill, edge))
+    return theme._themed(widget, key, lambda: _render(width, height, radius, fill, edge))
+
+
+PASSING = 300   # images in colours on the way between two roles that are kept (the newest; whoever shows one holds it)
+
+
+def _passing(widget: tk.Misc, key: tuple, render: Any):
+    """An image in a colour that is on its way between two palette roles (a fade): there are many of those and each
+    is on screen for a moment only, so only the newest are kept. A widget that shows one keeps hold of it itself."""
+    from collections import OrderedDict
+
+    from PIL import ImageTk
+
+    root = widget._root()
+    cache = root.__dict__.setdefault("_radar_passing", OrderedDict())
+    if key in cache:
+        cache.move_to_end(key)
+    else:
+        cache[key] = ImageTk.PhotoImage(render(), master=root)
+        while len(cache) > PASSING:
+            cache.popitem(last=False)
+    return cache[key]
 
 
 class Rounded(tk.Frame):
@@ -94,6 +122,16 @@ class Rounded(tk.Frame):
         self._edge = role
         self._outline()
 
+    def set_fill(self, fill: str, edge: str | None = None) -> None:
+        """What it is filled with (a palette role, or a colour on the way between two); the edge follows it unless
+        one is given."""
+        self._fill, self._edge = fill, edge or fill
+        try:
+            tk.Frame.configure(self, background=tone(fill))
+        except tk.TclError:
+            return
+        self._outline()
+
     def _outline(self) -> None:
         outer = self._outer
         if outer is None:
@@ -101,8 +139,8 @@ class Rounded(tk.Frame):
         try:
             w, h = outer.winfo_width(), outer.winfo_height()
             r = max(1, min(self._radius, w // 2, h // 2))
-            piece = rounded_image(outer, 2 * r, 2 * r, r, self._fill, self._edge)
-            fill, edge = theme.color(self._fill), theme.color(self._edge)
+            piece = self._piece = rounded_image(outer, 2 * r, 2 * r, r, self._fill, self._edge)
+            fill, edge = tone(self._fill), tone(self._edge)
             for item, (x, y) in zip(self._corners, ((0, 0), (w - 2 * r, 0), (0, h - 2 * r), (w - 2 * r, h - 2 * r))):
                 outer.coords(item, x, y)
                 outer.itemconfigure(item, image=piece)

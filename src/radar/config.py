@@ -44,6 +44,7 @@ CORE_DEFAULTS: dict[str, Any] = {
         "open_main_at_start": False,  # open the main window when RADAR starts (off: only the tray icon)
         "check_for_updates": True,   # once a day: is there a newer release on GitHub? (tells, never downloads)
         "update_notified": "",       # the version the notification was last shown for
+        "remind_disk_not_encrypted": True,  # a reminder when the disk RADAR keeps its data on is not encrypted (radar.disk)
         "allowed_user_plugins": [],  # files in the plugins folder that may be loaded (tray menu > Plugins asks)
         "data_tenant": "",           # the tenant the stored data belongs to (radar.tenant); set at the first sign-in
         "start_fresh_for": "",       # set by 'Start fresh for this tenant': carried out at the next start
@@ -69,13 +70,19 @@ def deep_fill(target: dict, defaults: dict) -> bool:
 
 
 class ConfigManager:
-    """Thread-safe access to config.json. Every setter persists immediately."""
+    """Thread-safe access to config.json. Every setter persists immediately.
 
-    def __init__(self, path: Path):
+    ``read_only``: for a second process (the live map). It reads the file and follows its changes, but never repairs,
+    moves or writes it - an invalid file (being edited) leaves it with the values it read last. Only the tray app
+    looks after the file."""
+
+    def __init__(self, path: Path, read_only: bool = False):
         self.path = Path(path)
+        self.read_only = read_only
         self._lock = threading.RLock()
         self._data: dict[str, Any] = {}
         self._mtime: int | None = None
+        self._plugin_defaults: dict[str, dict[str, Any]] = {}  # plugin id -> its section as declared (ensure_plugin)
         self.last_error: str | None = None
         self.load()
 
@@ -100,7 +107,9 @@ class ConfigManager:
                     self.last_error = f"config.json is invalid: {exc}"
                     log.error(self.last_error)
                     self._mtime = self._stat()
-                    if self._data:
+                    if self._data or self.read_only:
+                        if not self._data:  # a reader that never saw it valid: the defaults, in memory only
+                            self._data = copy.deepcopy(CORE_DEFAULTS)
                         return False  # keep running with the last good configuration
                     backup = self.path.with_name(f"config.invalid-{time.strftime('%Y%m%d-%H%M%S')}.json")  # not a shown time: a file name
                     try:
@@ -109,15 +118,35 @@ class ConfigManager:
                     except OSError:
                         pass
                     data = {}
-            changed = deep_fill(data, CORE_DEFAULTS)
+            changed = deep_fill(data, CORE_DEFAULTS) | self._fill_plugins(data)
             self._data = data
-            if changed or not self.path.exists():
+            if (changed or not self.path.exists()) and not self.read_only:
                 self._save_locked()
             else:
                 self._mtime = self._stat()
             return True
 
+    def _fill_plugins(self, data: dict[str, Any]) -> bool:
+        """The sections of the plugins that are loaded, completed from what they declare (see ensure_plugin). A file
+        edited by hand that lost them would otherwise switch scanning off - a plugin without its section counts as
+        disabled - until the next start, which puts them back anyway. Returns True if anything was added."""
+        if not self._plugin_defaults:
+            return False
+        changed = False
+        if not isinstance(data.get("plugins"), dict):
+            data["plugins"], changed = {}, True
+        for plugin_id, defaults in self._plugin_defaults.items():
+            entry = data["plugins"].get(plugin_id)
+            if not isinstance(entry, dict):
+                log.warning("config.json has no settings for the plugin '%s' any more: its defaults are put back "
+                            "(without them it would count as switched off until RADAR starts again)", plugin_id)
+                entry = data["plugins"][plugin_id] = {}
+            changed |= deep_fill(entry, defaults)
+        return changed
+
     def _save_locked(self) -> None:
+        if self.read_only:
+            return  # (a reader never writes)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -175,7 +204,10 @@ class ConfigManager:
             "settings": copy.deepcopy(plugin.default_settings),
         }
         with self._lock:
+            self._plugin_defaults[plugin.id] = defaults  # (a reload that finds the section gone puts it back)
             plugins = self._data.setdefault("plugins", {})
+            if not isinstance(plugins, dict):
+                plugins = self._data["plugins"] = {}
             entry = plugins.setdefault(plugin.id, {})
             if not isinstance(entry, dict):
                 entry = plugins[plugin.id] = {}

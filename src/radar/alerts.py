@@ -21,6 +21,12 @@ SYSTEM_PLUGIN = "core"
 
 ACTIVE, SNOOZED, DISMISSED, MUTED = "active", "snoozed", "dismissed", "muted"
 
+# Where RADAR writes an alert's status (and snooze) that it read a moment before, it writes it only if the status is
+# still what it read: a dismissal, snooze or reactivation by the user in between (the window's thread does not wait
+# for a scan) is never undone. Parameters: the status read, the status to write.
+STATUS_IF_UNCHANGED = "status=CASE WHEN status=? THEN ? ELSE status END"
+SNOOZE_IF_UNCHANGED = "snooze_until=CASE WHEN status=? THEN ? ELSE snooze_until END"
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -211,18 +217,24 @@ class AlertCenter:
                     status, snooze_until = ACTIVE, None
                     popped.append(old.id)
                     self._store.execute("UPDATE alerts SET seen_at=NULL WHERE id=?", (old.id,))
+                # the explanation of the highest score is kept: its title, summary, factors - and its fields, which
+                # name what the score is about (a lower finding's "Risk score 0/100" under a score of 100 contradicts it)
+                keep_new = score >= old.score
                 fields = dict(old.fields)
-                fields.update(f.fields)
+                if keep_new:
+                    fields.update(f.fields)
+                elif quiet_rules.NOTE_FIELD in f.fields:
+                    fields[quiet_rules.NOTE_FIELD] = f.fields[quiet_rules.NOTE_FIELD]
                 if off is None:
                     fields.pop(quiet_rules.NOTE_FIELD, None)  # no longer switched off (or worse than what was)
-                merged_subjects = sorted(set(old.subjects) | set(correlation.subjects_from(fields, f.subjects)))
+                merged_subjects = sorted(set(old.subjects) | set(correlation.subjects_from({**fields, **f.fields}, f.subjects)))
                 if merged_subjects != sorted(old.subjects):  # e.g. alerts created before a field was renamed
                     self._store.execute("UPDATE alerts SET subjects=? WHERE id=?", (json.dumps(merged_subjects), old.id))
                 occurred = old.occurred_at or f.occurred_at
-                keep_new = score >= old.score  # keep the explanation of the highest score
                 self._store.execute(
                     "UPDATE alerts SET severity=?, title=?, summary=?, recommendation=?, fields=?, evidence=?,"
-                    " links=?, occurred_at=?, last_seen=?, status=?, snooze_until=?, score=?, factors=? WHERE id=?",
+                    f" links=?, occurred_at=?, last_seen=?, {STATUS_IF_UNCHANGED}, {SNOOZE_IF_UNCHANGED}, score=?,"
+                    " factors=? WHERE id=?",
                     (int(new_sev), f.title if keep_new else old.title, (f.summary if keep_new else old.summary) or old.summary,
                      f.recommendation or old.recommendation,
                      json.dumps(fields),
@@ -230,7 +242,7 @@ class AlertCenter:
                      json.dumps(f.evidence[:MAX_EVIDENCE] if plugin_id == correlation.SUMMARY_PLUGIN and f.evidence
                                 else _merge_evidence(old.evidence, f.evidence)),
                      json.dumps([list(x) for x in (f.links or old.links)]), _iso(occurred), _iso(now),
-                     status, snooze_until, max(score, old.score),
+                     old.status, status, old.status, snooze_until, max(score, old.score),
                      json.dumps([list(x) for x in (f.factors if keep_new else old.factors)]), old.id),
                 )
                 self._supersede(f, old.id)
@@ -238,7 +250,8 @@ class AlertCenter:
                 popped.extend(self._correlate_around(alert_id))
             for alert_id in touched:
                 popped.extend(self._respond_around(alert_id))  # back on screen: a response did not end it
-        return [a for a in (self.get(i) for i in dict.fromkeys(popped)) if a]
+            # (what the user dismissed or snoozed meanwhile does not pop up)
+            return [a for a in (self.get(i) for i in dict.fromkeys(popped)) if a and a.status == ACTIVE]
 
     def _supersede(self, f: Finding, by_id: int) -> None:
         """The open alerts a finding takes the place of leave the reminders (they stay in the history)."""
@@ -249,8 +262,8 @@ class AlertCenter:
                 continue
             fields = json.loads(row["fields"])
             fields["Merged into"] = f.title
-            self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=?",
-                                (MUTED, json.dumps(fields), row["id"]))
+            self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=? AND status IN (?,?)",
+                                (MUTED, json.dumps(fields), row["id"], ACTIVE, SNOOZED))
 
     def name_zones(self) -> int:
         """Alerts stored before RADAR named the time zone: every clock time in their texts gets its zone (they were
@@ -299,9 +312,9 @@ class AlertCenter:
                     fields = dict(alert.fields)
                     fields["Reassessed"] = ("These steps no longer make a chain: a step was dismissed with the chain "
                                             "in view, was judged anew, or turned out not to connect the accounts.")
-                    self._store.execute("UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=?",
-                                        (MUTED, json.dumps(fields), alert.id))
-                    retired += 1
+                    retired += self._store.execute(
+                        "UPDATE alerts SET status=?, snooze_until=NULL, fields=? WHERE id=? AND status IN (?,?)",
+                        (MUTED, json.dumps(fields), alert.id, ACTIVE, SNOOZED))
                 elif _score(f) < alert.score:
                     self.replace_assessment(f, min_severity)
                     retired += int((self.get(alert.id) or alert).status == MUTED)
@@ -342,8 +355,8 @@ class AlertCenter:
             for row in rows:
                 fields = json.loads(row["fields"])
                 fields["Closed"] = f"by RADAR on {now.astimezone():%d.%m.%Y}: Low, seen, and unchanged for {days} days"
-                closed += self._store.execute("UPDATE alerts SET status=?, dismissed_at=?, fields=? WHERE id=?",
-                                              (DISMISSED, _iso(now), json.dumps(fields), row["id"]))
+                closed += self._store.execute("UPDATE alerts SET status=?, dismissed_at=?, fields=? WHERE id=? AND status=?",
+                                              (DISMISSED, _iso(now), json.dumps(fields), row["id"], ACTIVE))
         return closed
 
     # ----------------------------------------------------------- responses
@@ -457,10 +470,12 @@ class AlertCenter:
         factors = own + added
         woke = bool(continued) and not was_continuing and wake and alert.status in (DISMISSED, SNOOZED)
         if score != alert.score or factors != list(alert.factors) or fields != alert.fields or woke:
+            back = (int(woke), alert.status)  # (only from the status it was read in: see STATUS_IF_UNCHANGED)
             self._store.execute(
-                "UPDATE alerts SET score=?, factors=?, fields=?, status=CASE WHEN ? THEN ? ELSE status END, "
-                "snooze_until=CASE WHEN ? THEN NULL ELSE snooze_until END, seen_at=CASE WHEN ? THEN NULL ELSE seen_at END WHERE id=?",
-                (score, json.dumps([list(x) for x in factors]), json.dumps(fields), int(woke), ACTIVE, int(woke), int(woke), alert_id))
+                "UPDATE alerts SET score=?, factors=?, fields=?, snooze_until=CASE WHEN ? AND status=? THEN NULL ELSE "
+                "snooze_until END, seen_at=CASE WHEN ? AND status=? THEN NULL ELSE seen_at END, "
+                "status=CASE WHEN ? AND status=? THEN ? ELSE status END WHERE id=?",
+                (score, json.dumps([list(x) for x in factors]), json.dumps(fields), *back, *back, *back, ACTIVE, alert_id))
         return bool(added), woke
 
     # -------------------------------------------------------- correlation
@@ -469,7 +484,7 @@ class AlertCenter:
         with self._lock:
             ids = [r["id"] for r in self._store.query("SELECT id FROM alerts WHERE signal<>''")]
             activated = [i for i in ids if self._correlate_signal(i)]
-        return [a for a in (self.get(i) for i in activated) if a]
+            return [a for a in (self.get(i) for i in activated) if a and a.status == ACTIVE]
 
     def _alerts_naming(self, field: str, value: str, exclude_id: int) -> list[Alert]:
         """The alerts whose field of that name has exactly this value."""
@@ -527,10 +542,11 @@ class AlertCenter:
             fields = dict(sig.fields)
             fields.pop("Correlated with", None)
             self._store.execute(
-                "UPDATE alerts SET score=?, severity=?, factors=?, fields=?, status=?, snooze_until=CASE WHEN ? THEN NULL "
-                "ELSE snooze_until END WHERE id=?",
+                f"UPDATE alerts SET score=?, severity=?, factors=?, fields=?, {STATUS_IF_UNCHANGED}, snooze_until=CASE "
+                "WHEN ? AND status=? THEN NULL ELSE snooze_until END WHERE id=?",
                 (own_score, int(_severity_for(own_score)), json.dumps([list(x) for x in own]), json.dumps(fields),
-                 MUTED if sig.status in (ACTIVE, SNOOZED) else sig.status, int(sig.status == SNOOZED), sig.id))
+                 sig.status, MUTED if sig.status in (ACTIVE, SNOOZED) else sig.status,
+                 int(sig.status == SNOOZED), sig.status, sig.id))
             return False
         factors = list(own)
         reasons = [r for _, r in factors]
@@ -556,10 +572,10 @@ class AlertCenter:
         if score == sig.score and factors == [tuple(x) for x in sig.factors] and fields == sig.fields and not activate:
             return False
         self._store.execute(
-            "UPDATE alerts SET score=?, severity=?, factors=?, fields=?, status=?, seen_at=CASE WHEN ? THEN NULL "
-            "ELSE seen_at END WHERE id=?",
+            f"UPDATE alerts SET score=?, severity=?, factors=?, fields=?, {STATUS_IF_UNCHANGED}, seen_at=CASE WHEN ? "
+            "AND status=? THEN NULL ELSE seen_at END WHERE id=?",
             (score, int(_severity_for(score)), json.dumps([list(x) for x in factors]), json.dumps(fields),
-             ACTIVE if activate else sig.status, int(activate), sig.id))
+             sig.status, ACTIVE if activate else sig.status, int(activate), sig.status, sig.id))
         return activate
 
     def replace_assessment(self, f: Finding, min_severity: Severity = Severity.LOW) -> tuple[Alert, Alert] | None:
@@ -568,37 +584,39 @@ class AlertCenter:
         Unlike :meth:`ingest` this may LOWER the rating (used after tuning). Returns (before, after) or None.
         An alert that drops below ``min_severity`` is muted (it stays in the history, no reminder).
         """
-        row = self._store.query_one("SELECT * FROM alerts WHERE key=? AND status IN (?,?)", (f.key, ACTIVE, SNOOZED))
-        if row is None:
-            return None
-        before = Alert.from_row(row)
-        sev = Severity.parse(f.severity)
-        status = before.status if sev >= min_severity else MUTED
-        fields = dict(before.fields)
-        fields.update(f.fields)
-        evidence = before.evidence
-        if f.evidence:
-            # An old row inside the time span the new evidence covers, but left out, was excluded on purpose
-            # (e.g. the user's own MFA prompt). Older rows, rows without a timestamp and non-interactive rows
-            # (purged from the local history after a few hours) are kept.
-            new_sigs = {_evidence_sig(r) for r in f.evidence}
-            times = [r["_created"] for r in f.evidence if r.get("_created")]
-            lo, hi = (min(times), max(times)) if times else ("", "")
-            drop = {_evidence_sig(r) for r in before.evidence
-                    if lo and lo <= (r.get("_created") or "") <= hi and r.get("Type") != "Non-interactive"
-                    and _evidence_sig(r) not in new_sigs}
-            evidence = _merge_evidence(before.evidence, f.evidence, drop)
-            if before.plugin_id == correlation.SUMMARY_PLUGIN:
-                evidence = f.evidence[:MAX_EVIDENCE]  # a summary lists what it is made of now
-        self._store.execute(
-            "UPDATE alerts SET severity=?, score=?, factors=?, title=?, summary=?, recommendation=?, fields=?, status=?, "
-            "evidence=?, snooze_until=CASE WHEN ?='muted' THEN NULL ELSE snooze_until END WHERE id=?",
-            (int(sev), _score(f), json.dumps([list(x) for x in f.factors]), f.title, f.summary or before.summary,
-             f.recommendation or before.recommendation, json.dumps(fields), status, json.dumps(evidence), status,
-             before.id))
-        self._supersede(f, before.id)
-        self._apply_responses(before.id)
-        return before, self.get(before.id)
+        with self._lock:
+            row = self._store.query_one("SELECT * FROM alerts WHERE key=? AND status IN (?,?)", (f.key, ACTIVE, SNOOZED))
+            if row is None:
+                return None
+            before = Alert.from_row(row)
+            sev = Severity.parse(f.severity)
+            status = before.status if sev >= min_severity else MUTED
+            fields = dict(before.fields)
+            fields.update(f.fields)
+            evidence = before.evidence
+            if f.evidence:
+                # An old row inside the time span the new evidence covers, but left out, was excluded on purpose
+                # (e.g. the user's own MFA prompt). Older rows, rows without a timestamp and non-interactive rows
+                # (purged from the local history after a few hours) are kept.
+                new_sigs = {_evidence_sig(r) for r in f.evidence}
+                times = [r["_created"] for r in f.evidence if r.get("_created")]
+                lo, hi = (min(times), max(times)) if times else ("", "")
+                drop = {_evidence_sig(r) for r in before.evidence
+                        if lo and lo <= (r.get("_created") or "") <= hi and r.get("Type") != "Non-interactive"
+                        and _evidence_sig(r) not in new_sigs}
+                evidence = _merge_evidence(before.evidence, f.evidence, drop)
+                if before.plugin_id == correlation.SUMMARY_PLUGIN:
+                    evidence = f.evidence[:MAX_EVIDENCE]  # a summary lists what it is made of now
+            self._store.execute(
+                f"UPDATE alerts SET severity=?, score=?, factors=?, title=?, summary=?, recommendation=?, fields=?, "
+                f"{STATUS_IF_UNCHANGED}, evidence=?, snooze_until=CASE WHEN ?='muted' AND status=? THEN NULL ELSE "
+                "snooze_until END WHERE id=?",
+                (int(sev), _score(f), json.dumps([list(x) for x in f.factors]), f.title, f.summary or before.summary,
+                 f.recommendation or before.recommendation, json.dumps(fields), before.status, status,
+                 json.dumps(evidence), status, before.status, before.id))
+            self._supersede(f, before.id)
+            self._apply_responses(before.id)
+            return before, self.get(before.id)
 
     def any_open(self, keys: Iterable[str]) -> bool:
         """Is one of these alerts still a reminder?"""

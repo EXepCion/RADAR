@@ -228,10 +228,17 @@ def activity_points(history: SignInHistory, start: datetime, end: datetime, user
     """The activity record as sign-ins: for every run of activity one at its begin, one per hour while it lasted
     and one at its end (same device, address and place). They stand in for the background sign-ins the app has
     purged, so that "active until 18:51" is true also for days whose background sign-ins are gone."""
+    return points_of(history.activity(start, end, user_id), start, end)
+
+
+def points_of(runs: Any, start: datetime, end: datetime, hourly: bool = True) -> list[SignIn]:
+    """Runs of activity (as ``SignInHistory.activity`` gives them) as sign-ins between ``start`` and ``end``: one at
+    each run's begin and one at its end - and, with ``hourly``, one per hour in between. Only the begin and the end
+    are times a sign-in was made; the hours between stand for the sign-ins of the run that are no longer stored."""
     out = []
-    for s, first, last, _n in history.activity(start, end, user_id):
+    for s, first, last, _n in runs:
         stamps, at = [first], first + timedelta(hours=1)
-        while at < last:
+        while hourly and at < last:
             stamps.append(at)
             at += timedelta(hours=1)
         if last > first:
